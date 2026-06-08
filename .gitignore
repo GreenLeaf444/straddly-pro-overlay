@@ -1,0 +1,8 @@
+# Never commit captured data / secrets
+*.json
+*-dump.json
+straddly-probe.json
+API-MAP.md
+tools/
+mockups/
+*.local
