@@ -32,4 +32,20 @@ Plus an always-on header: total MTM, open/closed, NIFTY spot, greeks, margin, ta
 - Found a bug or have feedback? Use the **✉ Send feedback** link in the panel footer.
 
 ---
+
+# Backoffice Analytics Pro (companion)
+
+A post-trade **performance dashboard** that overlays on the Straddly backoffice (`backoffices.pro`) —
+turns your trade journal into institutional-grade analytics.
+
+**Install:** Tampermonkey → click
+**[backoffice-pro.user.js](https://raw.githubusercontent.com/GreenLeaf444/straddly-pro-overlay/main/backoffice-pro.user.js)**
+→ Install → open **backoffices.pro** → Reports → set a wide date range.
+
+**Tabs:** Overview (win rate · profit factor · expectancy · payoff · R/MaxDD · Sortino · Sharpe · return-on-capital) ·
+Equity (curve + drawdown) · Daily (bars + calendar heatmap + monthly) · Trades (by type / 0DTE / weekday + histogram) ·
+Edge (rolling expectancy · tail risk: skew/kurtosis/CVaR · premium-capture) · Costs (cost-drag) · Monte Carlo (forward projection) · Sizing (Kelly).
+Hover any chart for date + value tooltips. Same privacy — nothing leaves your browser.
+
+---
 *Not affiliated with Straddly. Use at your own risk — this is a personal tool shared with friends.*
