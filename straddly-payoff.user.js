@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Minimal overlay for the Straddly trade page — live position payoff + basic greeks + risk metrics. Shadow-DOM isolated + self-healing.
+// @version      1.3
+// @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
 // @match        https://*.straddly.com/*
@@ -25,36 +25,60 @@
   const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
 
   // ══ STORE ═══════════════════════════════════════════════════════════════════
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, lastUpdate: 0, req: { positions: null, touchline: null }, _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, lastUpdate: 0, auth: '', dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store;
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], 15, 30, 0), strike: +m[5], type: m[6] }; }
+  // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
   function ingest(url, body){ if (!url || !body) return; let j; try { j = JSON.parse(body); } catch (e) { return; } const d = j && j.data !== undefined ? j.data : j; try {
-    if (/\/Position\/Get-PositionsByUserId/i.test(url) && Array.isArray(d)) { Store.positions = d; recomputeSpot(); Store._emit(); return; }
-    if (/\/Touchline\/Get-Touchlines/i.test(url) && Array.isArray(d)) { d.forEach(q => { if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; if (q.symbol) Store.ltpBySym[q.symbol] = q.ltp; }); recomputeSpot(); Store._emit(); return; }
-    if (/\/Orders\/Get-MarginusedByID/i.test(url) && Array.isArray(d) && d.length) { Store.margin = d[0]; Store._emit(); return; }
+    if (/\/(data\/)?[Tt]ouchline/i.test(url) && Array.isArray(d)) { d.forEach(q => { if (q && q.symbol){ if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; Store.ltpBySym[q.symbol] = q.ltp; } }); recomputeSpot(); Store._emit(); return; }
     if (/user\/getuserdetails/i.test(url) && d && d.id) { Store.user = d; Store._emit(); return; }
-    if (/\/Watchlist\/Get-Watchlist/i.test(url) && Array.isArray(d)) { d.forEach(c => { if (c.symbol) Store.chain[c.symbol] = { strike: c.strike, type: c.optionType, lotSize: c.lotSize, symbolId: c.symbolId, underlying: c.underlying }; }); Store._emit(); return; }
+    if (/\/(Orders\/Get-MarginusedByID|user\/getMargin)/i.test(url) && Array.isArray(d) && d.length) { Store.margin = d[0]; Store._emit(); return; }
   } catch (e) {} }
+  const IDX = { NIFTY: 'NIFTY', BANKNIFTY: 'NIFTY BANK', SENSEX: 'SENSEX' };
   function detectUnderlying(){ for (const p of Store.positions){ const s = parseSymbol(p.symbol); if (s) return s.underlying; } return 'NIFTY'; }
   function paritySpot(under){ const byK = {}; for (const sym in Store.ltpBySym){ const p = parseSymbol(sym), l = Store.ltpBySym[sym]; if (!p || p.type === 'SD' || !(l > 0)) continue; if (under && p.underlying !== under) continue; const o = byK[p.strike] = byK[p.strike] || { exp: p.expiry }; o[p.type] = l; } const rows = []; for (const k in byK){ const r = byK[k]; if (r.CE > 0 && r.PE > 0) rows.push({ k: +k, diff: Math.abs(r.CE - r.PE), cp: r.CE - r.PE, exp: r.exp }); } if (!rows.length) return 0; rows.sort((a, b) => a.diff - b.diff); const top = rows.slice(0, 3), rr = 0.065, now = Date.now(); let s = 0; top.forEach(x => { const T = Math.max((x.exp - now) / (365 * 864e5), 1e-5); s += x.k * Math.exp(-rr * T) + x.cp; }); return s / top.length; }
   const _idx = { under: null, valEl: null, last: 0 };
   function indexSpotDOM(under){ const numIn = el => { const m = (el && el.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/); if (!m) return 0; const v = parseFloat(m[1].replace(/,/g, '')); return (v > 1000 && v < 200000) ? v : 0; }; try { if (_idx.under === under && _idx.valEl && document.contains(_idx.valEl)){ const v = numIn(_idx.valEl); if (v) return v; } if (Date.now() - _idx.last < 1500) return 0; _idx.last = Date.now(); const wants = under === 'BANKNIFTY' ? ['BANKNIFTY','BANK NIFTY','NIFTY BANK'] : [under, 'SPOT']; const leaves = document.querySelectorAll('span,div,b,strong,td,th,p'); for (let i = 0; i < leaves.length; i++){ const el = leaves[i]; if (el.childElementCount !== 0) continue; const t = el.textContent.trim().toUpperCase().replace(':', ''); if (wants.indexOf(t) < 0) continue; const probes = [el.nextElementSibling, el.previousElementSibling].concat(el.parentElement ? Array.from(el.parentElement.children) : []); for (const c of probes){ if (!c || c === el) continue; const v = numIn(c); if (v){ _idx.under = under; _idx.valEl = c; return v; } } } } catch (e) {} return 0; }
-  function recomputeSpot(){ try { const under = detectUnderlying(), par = paritySpot(under), dom = indexSpotDOM(under); if (dom > 0 && (!par || Math.abs(dom - par) / par < 0.05)) { Store.spot = dom; return; } if (par > 0) { Store.spot = par; return; } if (dom > 0) { Store.spot = dom; return; } const m = (document.body ? document.body.innerText : '').match(/\b(\d{2},\d{3}(?:\.\d{1,2})?)\b/); if (m) Store.spot = parseFloat(m[1].replace(/,/g, '')); } catch (e) {} }
+  function recomputeSpot(){ try { const under = detectUnderlying(); const idx = Store.ltpBySym[IDX[under] || under]; if (idx > 0){ Store.spot = idx; return; } const par = paritySpot(under); if (par > 0){ Store.spot = par; return; } const dom = indexSpotDOM(under); if (dom > 0){ Store.spot = dom; return; } const m = (document.body ? document.body.innerText : '').match(/\b(\d{2},\d{3}(?:\.\d{1,2})?)\b/); if (m) Store.spot = parseFloat(m[1].replace(/,/g, '')); } catch (e) {} }
+  // ── scrape open positions from the page table (CloudFront build streams positions via socket, not REST) ──
+  const MON = { JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12' };
+  const INSTR_RE = /(NIFTY BANK|BANKNIFTY|SENSEX|NIFTY)\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{4,6})\s*(CE|PE|SD)/i;
+  function scrapePositions(){
+    const rows = [...document.querySelectorAll('tr, mat-row, [role="row"]')], out = []; const yr = new Date().getFullYear();
+    rows.forEach(tr => {
+      const cells = [...tr.querySelectorAll('td, mat-cell, [role="cell"], th')]; if (cells.length < 4) return;
+      let ii = -1, m = null; for (let i = 0; i < cells.length; i++){ const mm = cells[i].textContent.match(INSTR_RE); if (mm){ ii = i; m = mm; break; } }
+      if (ii < 0) return;
+      const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
+      const nums = cells.slice(ii + 1).map(c => { const t = c.textContent.replace(/[₹,\s]/g, ''); return /^-?\d+(\.\d+)?$/.test(t) ? parseFloat(t) : null; }).filter(v => v !== null);
+      if (nums.length < 3) return;
+      const qty = Math.round(nums[0]); if (!qty) return;
+      const avg = nums[1], ltp = nums[2], pnl = nums[nums.length - 1];
+      const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, ''), mo = MON[m[2].toUpperCase()], strike = +m[3], type = m[4].toUpperCase();
+      const sym = und + (yr % 100) + mo + day + strike + type;
+      out.push({ status: 'OPEN', symbol: sym, symbolId: null, optionType: type, strikePrice: strike, quantity: qty, avgSellPrice: qty < 0 ? avg : 0, avgBuyPrice: qty > 0 ? avg : 0, bepPrice: avg, ltp: ltp, _pnl: pnl, expiryDate: new Date(yr, +mo - 1, +day, 15, 30, 0).toISOString() });
+    });
+    // de-dupe by symbol (a straddle may appear twice)
+    const seen = {}, uniq = []; out.forEach(p => { if (!seen[p.symbol]){ seen[p.symbol] = 1; uniq.push(p); } });
+    if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
+    Store.dbg = 'pos ' + uniq.length + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
+    return uniq.length;
+  }
+  // self-fetch the new touchline for the index (spot) + position symbols (fresh ltp), using captured auth
+  function selfTouch(){
+    if (!Store.auth || !origFetch) return; const under = detectUnderlying(); const syms = [IDX[under] || under]; Store.positions.forEach(p => { if (p.symbol && syms.indexOf(p.symbol) < 0) syms.push(p.symbol); });
+    origFetch(location.origin + '/api/data/touchline', { method: 'POST', headers: { authorization: Store.auth, 'content-type': 'application/json' }, body: JSON.stringify(syms), credentials: 'include' }).then(x => x.text()).then(t => ingest(location.origin + '/api/data/touchline', t)).catch(() => {});
+  }
 
   // ══ INTERCEPTOR ═════════════════════════════════════════════════════════════
   const origFetch = window.fetch;
-  const TOUCH_RE = /\/Touchline\/Get-Touchlines/i, POS_RE = /\/Position\/Get-PositionsByUserId/i;
-  const pickAuth = h => { const o = {}; if (!h) return o; const g = k => (h.get ? h.get(k) : h[k] || h[k.toLowerCase()]); ['authorization','content-type','accept'].forEach(k => { const v = g(k); if (v) o[k] = v; }); return o; };
-  if (origFetch) window.fetch = function (...a){ const url = (a[0] && a[0].url) || a[0], init = a[1] || {}, hd = pickAuth(init.headers || (a[0] && a[0].headers)); const p = origFetch.apply(this, a); try { if (typeof url === 'string'){ if (POS_RE.test(url) && hd.authorization) Store.req.positions = { url, method: init.method || 'GET', headers: hd }; if (TOUCH_RE.test(url) && hd.authorization) Store.req.touchline = { url, method: 'POST', headers: hd, body: init.body }; p.then(r => r.clone().text().then(t => ingest(url, t)).catch(()=>{})).catch(()=>{}); } } catch (e) {} return p; };
+  const captureAuth = h => { if (!h) return; try { const g = k => (h.get ? h.get(k) : h[k] || h[k.toLowerCase()]); const a = g('authorization'); if (a) Store.auth = a; } catch (e) {} };
+  if (origFetch) window.fetch = function (...a){ const url = (a[0] && a[0].url) || a[0], init = a[1] || {}; try { if (typeof url === 'string' && /\/api\//.test(url)) captureAuth(init.headers || (a[0] && a[0].headers)); } catch (e) {} const p = origFetch.apply(this, a); try { if (typeof url === 'string') p.then(r => r.clone().text().then(t => ingest(url, t)).catch(()=>{})).catch(()=>{}); } catch (e) {} return p; };
   const oO = XMLHttpRequest.prototype.open, oS = XMLHttpRequest.prototype.send, oH = XMLHttpRequest.prototype.setRequestHeader;
-  XMLHttpRequest.prototype.open = function (m, u){ this.__s = { method: m, url: String(u), headers: {} }; return oO.apply(this, arguments); };
-  XMLHttpRequest.prototype.setRequestHeader = function (k, v){ if (this.__s) this.__s.headers[k.toLowerCase()] = v; return oH.apply(this, arguments); };
-  XMLHttpRequest.prototype.send = function (body){ const d = this.__s; if (d){ const auth = {}; ['authorization','content-type','accept'].forEach(k => { if (d.headers[k]) auth[k] = d.headers[k]; }); if (POS_RE.test(d.url) && auth.authorization) Store.req.positions = { url: d.url, method: d.method || 'GET', headers: auth }; if (TOUCH_RE.test(d.url) && auth.authorization) Store.req.touchline = { url: d.url, method: 'POST', headers: auth, body }; this.addEventListener('load', () => { try { ingest(d.url, this.responseText); } catch (e) {} }); } return oS.apply(this, arguments); };
-  let pollFails = 0;
-  function poll(){ if (pollFails > 6 && pollFails++ % 10 !== 0) return; const r = Store.req; try {
-    if (r.positions && origFetch) origFetch(r.positions.url, { method: r.positions.method, headers: r.positions.headers, credentials: 'include' }).then(x => { pollFails = 0; return x.text(); }).then(t => ingest(r.positions.url, t)).catch(() => pollFails++);
-    if (r.touchline && origFetch){ const posSyms = []; Store.positions.forEach(p => { if (p.status !== 'OPEN' || !p.symbol) return; posSyms.push(p.symbol); if (p.optionType === 'SD'){ posSyms.push(p.symbol.replace(/SD$/, 'CE')); posSyms.push(p.symbol.replace(/SD$/, 'PE')); } }); let chain = []; try { chain = JSON.parse(r.touchline.body || '[]'); } catch (e) {} const seen = {}, syms = []; posSyms.concat(chain).forEach(s => { if (s && !seen[s]){ seen[s] = 1; syms.push(s); } }); if (syms.length) origFetch(r.touchline.url, { method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, r.touchline.headers), body: JSON.stringify(syms.slice(0, 200)), credentials: 'include' }).then(x => { pollFails = 0; return x.text(); }).then(t => ingest(r.touchline.url, t)).catch(() => pollFails++); }
-  } catch (e) {} }
+  XMLHttpRequest.prototype.open = function (m, u){ this.__s = { url: String(u) }; return oO.apply(this, arguments); };
+  XMLHttpRequest.prototype.setRequestHeader = function (k, v){ if (/^authorization$/i.test(k) && v) Store.auth = v; return oH.apply(this, arguments); };
+  XMLHttpRequest.prototype.send = function (body){ const d = this.__s; if (d) this.addEventListener('load', () => { try { ingest(d.url, this.responseText); } catch (e) {} }); return oS.apply(this, arguments); };
+  function poll(){ try { scrapePositions(); selfTouch(); } catch (e) {} }
 
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
   function liveLtp(p){ if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId]; if (p.symbol && Store.ltpBySym[p.symbol] != null) return Store.ltpBySym[p.symbol]; return p.ltp || 0; }
@@ -85,8 +109,11 @@
     SR = host.attachShadow({ mode: 'open' }); window._SPR = SR;
     const st = document.createElement('style'); st.textContent = `
       :host{all:initial;} *{box-sizing:border-box;margin:0;padding:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;}
-      /* fixed to the empty area below the positions tables (right of the option-chain sidebar) */
-      #spay{position:fixed;top:470px;left:400px;z-index:2147483646;width:500px;background:${C.panel};border:1px solid ${C.line};border-radius:16px;overflow:hidden;color:${C.text};box-shadow:0 24px 60px -24px rgba(0,0,0,.75);}
+      /* embedded in the page flow (below the positions tables) when an anchor is found; else fixed fallback */
+      :host(.embed){display:block;width:100%;}
+      #spay{position:fixed;top:120px;left:430px;z-index:2147483646;width:500px;background:${C.panel};border:1px solid ${C.line};border-radius:16px;overflow:hidden;color:${C.text};box-shadow:0 24px 60px -24px rgba(0,0,0,.75);}
+      :host(.embed) #spay{position:static;width:100%;max-width:620px;margin:14px 0;box-shadow:0 10px 30px -18px rgba(0,0,0,.55);}
+      .dbg{font-family:${MONO};font-size:9px;color:${C.muted};margin-left:auto;}
       .top{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid ${C.line};user-select:none;}
       .brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:12.5px;}
       .mk{width:20px;height:20px;border-radius:6px;background:linear-gradient(135deg,${C.accent},${C.accent2});display:grid;place-items:center;color:#04140d;font-weight:800;font-size:11px;}
@@ -112,7 +139,7 @@
     panel.innerHTML = `
       <div class="top" id="spay-top"><div class="brand"><span class="mk">S</span> Payoff &amp; Risk</div>
         <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
-      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span></div>
+      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span class="dbg" id="spay-dbg"></span></div>
       <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
         <div class="grk"><div><div class="gl">Δ Delta</div><div class="gv" id="g-d">—</div></div><div><div class="gl">Γ Gamma</div><div class="gv" id="g-g">—</div></div><div><div class="gl">Θ /hr</div><div class="gv" id="g-t">—</div></div><div><div class="gl">Vega</div><div class="gv" id="g-v">—</div></div></div>
         <div class="risk"><div class="rc"><div class="rl">Max loss (±3%)</div><div class="rv" id="r-ml" style="color:${C.dn}">—</div><div class="rs">worst in stress range</div></div>
@@ -120,9 +147,23 @@
           <div class="rc"><div class="rl">Margin used</div><div class="rv" id="r-mg">—</div><div class="rs" id="r-mgs"></div></div>
           <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl" style="color:${C.up}">—</div><div class="rs">θ if pinned here</div></div></div>
       </div>`;
-    SR.appendChild(panel); (document.body || document.documentElement).appendChild(host);
+    SR.appendChild(panel);
+    // embed into the page's own layout (below the positions tables) so it reads like a native section; else fixed fallback
+    const anchor = findAnchor();
+    if (anchor && anchor.parentElement){ host.classList.add('embed'); anchor.parentElement.insertBefore(host, anchor.nextSibling); }
+    else (document.body || document.documentElement).appendChild(host);
     let mini = false; $id('spay-min').onclick = () => { mini = !mini; $id('spay-cv').parentElement.style.display = mini ? 'none' : ''; };
     $id('spay-close').onclick = () => { host.remove(); SR = null; };
+  }
+  // find the container that holds the positions tables, to insert our panel right after it
+  function findAnchor(){
+    try {
+      let el = [...document.querySelectorAll('div,section,mat-card')].find(e => /Closed Positions/i.test(e.textContent) && e.textContent.length < 1200 && e.childElementCount >= 1);
+      if (!el) el = [...document.querySelectorAll('div,section')].find(e => /Total MTM/i.test(e.textContent) && e.textContent.length < 1500);
+      if (!el) return null;
+      let a = el; for (let i = 0; i < 3 && a.parentElement && a.parentElement.tagName !== 'BODY'; i++) a = a.parentElement;
+      return a;
+    } catch (e) { return null; }
   }
 
   // ══ PAYOFF CHART ════════════════════════════════════════════════════════════
@@ -170,6 +211,7 @@
     const allowed = allowedMargin(), used = marginUsed(), pctm = Math.min(100, allowed ? used / allowed * 100 : 0);
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
     const lv = $id('spay-live'); if (lv){ const on = Date.now() - Store.lastUpdate < 8000; lv.classList.toggle('on', on); set('spay-lt', on ? 'live' : (Store.lastUpdate ? 'stale' : 'connecting')); }
+    set('spay-dbg', Store.dbg || '');
     window.drawPayoff();
   };
 
