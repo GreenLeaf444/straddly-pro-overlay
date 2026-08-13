@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -220,7 +220,12 @@
     buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
     setInterval(() => { try { poll(); } catch (e) {} }, POLL_MS);
     setInterval(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
-    setInterval(() => { try { if (!document.getElementById('spay-host')){ SR = null; buildPanel(); window.refreshAll(); } } catch (e) {} }, WATCHDOG_MS);
+    setInterval(() => { try {
+      const host = document.getElementById('spay-host');
+      if (!host){ SR = null; buildPanel(); window.refreshAll(); return; }
+      // relocate into the content area once the Positions tab (its anchor) is present
+      if (!host.classList.contains('embed')){ const a = findAnchor(); if (a && a.parentElement){ host.classList.add('embed'); a.parentElement.insertBefore(host, a.nextSibling); } }
+    } catch (e) {} }, WATCHDOG_MS);
     setTimeout(() => { const cv = $id('spay-cv'); if (cv && !cv.__h){ cv.__h = 1; cv.style.cursor = 'crosshair'; cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { window.drawPayoff(); } catch (_) {} }); cv.addEventListener('mouseleave', () => { cv._cur = null; try { window.drawPayoff(); } catch (_) {} }); } poll(); window.refreshAll(); }, 700);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
