@@ -33,6 +33,22 @@ Plus an always-on header: total MTM, open/closed, NIFTY spot, greeks, margin, ta
 
 ---
 
+# Payoff & Risk (mini)
+
+A compact, fixed panel for the trade page — **position payoff diagram + greeks + risk metrics**, nothing else.
+Dark "terminal" styling with a dotted green/red payoff curve.
+
+**Install:** Tampermonkey → click
+**[straddly-payoff.user.js](https://raw.githubusercontent.com/GreenLeaf444/straddly-pro-overlay/main/straddly-payoff.user.js)**
+→ Install → open your Straddly trade page.
+
+Shows: payoff (BS-now, green profit / red loss) with breakeven band, net Δ/Γ/Θ/Vega, max-loss (stress),
+breakevens + distance, margin used, decay-left. Hover the chart for spot + P&L. Same privacy — nothing leaves your browser.
+
+> If your broker serves the trade page at a **new URL**, add it to the `@match` lines at the top of the script.
+
+---
+
 # Backoffice Analytics Pro (companion)
 
 A post-trade **performance dashboard** that overlays on the Straddly backoffice (`backoffices.pro`) —
