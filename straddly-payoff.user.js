@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -44,11 +44,12 @@
   const MON = { JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12' };
   const INSTR_RE = /(NIFTY BANK|BANKNIFTY|SENSEX|NIFTY)\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{4,6})\s*(CE|PE|SD)/i;
   function scrapePositions(){
-    const rows = [...document.querySelectorAll('tr, mat-row, [role="row"]')], out = []; const yr = new Date().getFullYear();
+    const rows = [...document.querySelectorAll('tr, mat-row, [role="row"]')], out = [], rects = []; const yr = new Date().getFullYear();
     rows.forEach(tr => {
       const cells = [...tr.querySelectorAll('td, mat-cell, [role="cell"], th')]; if (cells.length < 4) return;
       let ii = -1, m = null; for (let i = 0; i < cells.length; i++){ const mm = cells[i].textContent.match(INSTR_RE); if (mm){ ii = i; m = mm; break; } }
       if (ii < 0) return;
+      const rr = tr.getBoundingClientRect(); if (rr.width > 100 && rr.height > 4) rects.push(rr);
       const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
       const nums = cells.slice(ii + 1).map(c => { const t = c.textContent.replace(/[₹,\s]/g, ''); return /^-?\d+(\.\d+)?$/.test(t) ? parseFloat(t) : null; }).filter(v => v !== null);
       if (nums.length < 3) return;
@@ -61,6 +62,11 @@
     // de-dupe by symbol (a straddle may appear twice)
     const seen = {}, uniq = []; out.forEach(p => { if (!seen[p.symbol]){ seen[p.symbol] = 1; uniq.push(p); } });
     const onPosView = /Total MTM|Open Positions/i.test(document.body ? document.body.innerText : '');
+    if (rects.length){ // anchor the panel just below the actual position rows (small + near the top → always on-screen)
+      const sx = window.scrollX || window.pageXOffset || 0, sy = window.scrollY || window.pageYOffset || 0;
+      const left = Math.min(...rects.map(r => r.left)), right = Math.max(...rects.map(r => r.right)), bottom = Math.max(...rects.map(r => r.bottom));
+      Store.anchor = { left: left + sx, top: bottom + sy, width: right - left, at: Date.now() };
+    }
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
     else if (onPosView){ Store.positions = []; } // on the positions view with none open → genuinely flat
     // else: on another tab → keep last known positions (don't blank)
@@ -168,9 +174,16 @@
   }
   function positionPanel(){
     const host = document.getElementById('spay-host'); if (!host) return;
-    const r = anchorRect();
-    if (r){ host.style.position = 'absolute'; host.style.left = (r.left + window.scrollX) + 'px'; host.style.top = (r.bottom + window.scrollY + 14) + 'px'; host.style.width = Math.max(430, Math.min(680, r.width)) + 'px'; host.dataset.placed = '1'; }
-    else if (host.dataset.placed !== '1'){ host.style.position = 'fixed'; host.style.left = '430px'; host.style.top = '120px'; host.style.width = '500px'; }
+    const a = Store.anchor; // set from the actual position rows (page coords) → sits right below them, on-screen
+    if (a && Date.now() - a.at < 12000){
+      host.style.position = 'absolute';
+      host.style.left = Math.max(8, a.left) + 'px';
+      host.style.top = (a.top + 14) + 'px';
+      host.style.width = Math.max(430, Math.min(680, a.width || 460)) + 'px';
+      host.dataset.placed = '1';
+    } else if (host.dataset.placed !== '1'){ // no rows seen yet (e.g. another tab) → visible fixed fallback
+      host.style.position = 'fixed'; host.style.left = '430px'; host.style.top = '120px'; host.style.width = '500px';
+    }
   }
 
   // ══ PAYOFF CHART ════════════════════════════════════════════════════════════
