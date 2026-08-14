@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,14 +57,19 @@
       const avg = nums[1], ltp = nums[2], pnl = nums[nums.length - 1];
       const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, ''), mo = MON[m[2].toUpperCase()], strike = +m[3], type = m[4].toUpperCase();
       const sym = und + (yr % 100) + mo + day + strike + type;
-      out.push({ status: 'OPEN', symbol: sym, symbolId: null, optionType: type, strikePrice: strike, quantity: qty, avgSellPrice: qty < 0 ? avg : 0, avgBuyPrice: qty > 0 ? avg : 0, bepPrice: avg, ltp: ltp, _pnl: pnl, expiryDate: new Date(yr, +mo - 1, +day, 15, 30, 0).toISOString() });
+      out.push({ status: 'OPEN', symbol: sym, symbolId: null, optionType: type, strikePrice: strike, quantity: qty, avgSellPrice: qty < 0 ? avg : 0, avgBuyPrice: qty > 0 ? avg : 0, bepPrice: avg, ltp: ltp, _pnl: pnl, _scraped: true, expiryDate: new Date(yr, +mo - 1, +day, 15, 30, 0).toISOString() });
     });
     // de-dupe by symbol (a straddle may appear twice)
     const seen = {}, uniq = []; out.forEach(p => { if (!seen[p.symbol]){ seen[p.symbol] = 1; uniq.push(p); } });
     const onPosView = /Total MTM|Open Positions/i.test(document.body ? document.body.innerText : '');
-    if (rects.length){ // anchor the panel just below the actual position rows (small + near the top → always on-screen)
+    if (rects.length){ // anchor below the WHOLE positions block (open + closed tables) so we never cover it
       const sx = window.scrollX || window.pageXOffset || 0, sy = window.scrollY || window.pageYOffset || 0;
-      const left = Math.min(...rects.map(r => r.left)), right = Math.max(...rects.map(r => r.right)), bottom = Math.max(...rects.map(r => r.bottom));
+      const left = Math.min(...rects.map(r => r.left)), right = Math.max(...rects.map(r => r.right));
+      let bottom = Math.max(...rects.map(r => r.bottom));
+      try { for (let pass = 0; pass < 2; pass++) document.querySelectorAll('table, mat-table, [role="table"]').forEach(t => {
+        const r = t.getBoundingClientRect();
+        if (r.width > 200 && r.right > left - 60 && r.left < right + 60 && r.bottom > bottom && r.top < bottom + 900) bottom = r.bottom;
+      }); } catch (e) {}
       Store.anchor = { left: left + sx, top: bottom + sy, width: right - left, at: Date.now() };
     }
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
@@ -90,7 +95,8 @@
   function poll(){ try { scrapePositions(); selfTouch(); } catch (e) {} }
 
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
-  function liveLtp(p){ if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId]; if (p.symbol && Store.ltpBySym[p.symbol] != null) return Store.ltpBySym[p.symbol]; return p.ltp || 0; }
+  // scraped rows carry the portal's own live LTP → prefer it so our MTM always matches the screen exactly
+  function liveLtp(p){ if (p._scraped && p.ltp > 0) return p.ltp; if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId]; if (p.symbol && Store.ltpBySym[p.symbol] != null) return Store.ltpBySym[p.symbol]; return p.ltp || 0; }
   function posAvg(p){ if (p.bepPrice > 0) return p.bepPrice; if (p.quantity < 0) return p.avgSellPrice; if (p.quantity > 0) return p.avgBuyPrice; return p.avgSellPrice || p.avgBuyPrice || 0; }
   window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(15, 30, 0, 0); return { symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: (ltp - avg) * p.quantity, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
   function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: (c - cA) * p.qty })); out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: (pp - (p.avg - cA)) * p.qty })); }); return out; }
@@ -179,7 +185,7 @@
       host.style.position = 'absolute';
       host.style.left = Math.max(8, a.left) + 'px';
       host.style.top = (a.top + 14) + 'px';
-      host.style.width = Math.max(430, Math.min(680, a.width || 460)) + 'px';
+      host.style.width = Math.max(430, Math.min(980, a.width || 460)) + 'px';
       host.dataset.placed = '1';
     } else if (host.dataset.placed !== '1'){ // no rows seen yet (e.g. another tab) → visible fixed fallback
       host.style.position = 'fixed'; host.style.left = '430px'; host.style.top = '120px'; host.style.width = '500px';
