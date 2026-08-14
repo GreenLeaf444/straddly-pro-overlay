@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -157,12 +157,13 @@
   // locate the positions block on-screen, so we can float the panel right below it (in the empty space) without touching Angular's DOM
   function anchorRect(){
     try {
-      let el = [...document.querySelectorAll('div,section,mat-card,table')].find(e => /Closed Positions/i.test(e.textContent) && e.textContent.length < 2500);
-      if (!el) el = [...document.querySelectorAll('div,section,table')].find(e => /Total MTM/i.test(e.textContent) && e.textContent.length < 2500);
+      // tightest container holding BOTH position headings = the positions box (not the giant page wrapper)
+      let cands = [...document.querySelectorAll('div,section,mat-card')].filter(e => /Open Positions/i.test(e.textContent) && /Closed Positions/i.test(e.textContent) && e.textContent.length < 4000);
+      if (!cands.length) cands = [...document.querySelectorAll('div,section,mat-card,table')].filter(e => /Total MTM/i.test(e.textContent) && e.textContent.length < 3000);
+      const el = cands.sort((a, b) => a.textContent.length - b.textContent.length)[0];
       if (!el) return null;
-      let c = el; for (let i = 0; i < 3 && c.parentElement && c.parentElement.tagName !== 'BODY'; i++) c = c.parentElement;
-      const r = c.getBoundingClientRect();
-      return (r.width > 240 && r.bottom > 0) ? r : null;
+      const r = el.getBoundingClientRect();
+      return (r.width > 240 && r.height > 20 && r.height < window.innerHeight * 3) ? r : null;
     } catch (e) { return null; }
   }
   function positionPanel(){
