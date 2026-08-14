@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -60,9 +60,12 @@
     });
     // de-dupe by symbol (a straddle may appear twice)
     const seen = {}, uniq = []; out.forEach(p => { if (!seen[p.symbol]){ seen[p.symbol] = 1; uniq.push(p); } });
+    const onPosView = /Total MTM|Open Positions/i.test(document.body ? document.body.innerText : '');
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
-    Store.dbg = 'pos ' + uniq.length + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
-    return uniq.length;
+    else if (onPosView){ Store.positions = []; } // on the positions view with none open → genuinely flat
+    // else: on another tab → keep last known positions (don't blank)
+    Store.dbg = 'pos ' + Store.positions.length + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
+    return Store.positions.length;
   }
   // self-fetch the new touchline for the index (spot) + position symbols (fresh ltp), using captured auth
   function selfTouch(){
@@ -105,14 +108,12 @@
   function fitCanvas(id){ const cv = $id(id); if (!cv) return null; const w = Math.round(cv.getBoundingClientRect().width) || 420; cv.width = Math.max(w, 260); return cv; }
   function buildPanel(){
     if (document.getElementById('spay-host')) return;
-    const host = document.createElement('div'); host.id = 'spay-host'; host.style.cssText = 'all:initial;';
+    const host = document.createElement('div'); host.id = 'spay-host'; host.style.cssText = 'all:initial;position:absolute;z-index:2147483646;top:120px;left:430px;width:500px;';
     SR = host.attachShadow({ mode: 'open' }); window._SPR = SR;
     const st = document.createElement('style'); st.textContent = `
       :host{all:initial;} *{box-sizing:border-box;margin:0;padding:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;}
-      /* embedded in the page flow (below the positions tables) when an anchor is found; else fixed fallback */
-      :host(.embed){display:block;width:100%;}
-      #spay{position:fixed;top:120px;left:430px;z-index:2147483646;width:500px;background:${C.panel};border:1px solid ${C.line};border-radius:16px;overflow:hidden;color:${C.text};box-shadow:0 24px 60px -24px rgba(0,0,0,.75);}
-      :host(.embed) #spay{position:static;width:100%;max-width:620px;margin:14px 0;box-shadow:0 10px 30px -18px rgba(0,0,0,.55);}
+      /* host is positioned (absolute/fixed) by JS to sit in the empty space below the positions tables — never inside Angular's DOM */
+      #spay{position:static;width:100%;background:${C.panel};border:1px solid ${C.line};border-radius:16px;overflow:hidden;color:${C.text};box-shadow:0 14px 40px -20px rgba(0,0,0,.6);}
       .dbg{font-family:${MONO};font-size:9px;color:${C.muted};margin-left:auto;}
       .top{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid ${C.line};user-select:none;}
       .brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:12.5px;}
@@ -148,22 +149,27 @@
           <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl" style="color:${C.up}">—</div><div class="rs">θ if pinned here</div></div></div>
       </div>`;
     SR.appendChild(panel);
-    // embed into the page's own layout (below the positions tables) so it reads like a native section; else fixed fallback
-    const anchor = findAnchor();
-    if (anchor && anchor.parentElement){ host.classList.add('embed'); anchor.parentElement.insertBefore(host, anchor.nextSibling); }
-    else (document.body || document.documentElement).appendChild(host);
+    (document.body || document.documentElement).appendChild(host); // stays on body — Angular can't reconcile it away
+    positionPanel();
     let mini = false; $id('spay-min').onclick = () => { mini = !mini; $id('spay-cv').parentElement.style.display = mini ? 'none' : ''; };
     $id('spay-close').onclick = () => { host.remove(); SR = null; };
   }
-  // find the container that holds the positions tables, to insert our panel right after it
-  function findAnchor(){
+  // locate the positions block on-screen, so we can float the panel right below it (in the empty space) without touching Angular's DOM
+  function anchorRect(){
     try {
-      let el = [...document.querySelectorAll('div,section,mat-card')].find(e => /Closed Positions/i.test(e.textContent) && e.textContent.length < 1200 && e.childElementCount >= 1);
-      if (!el) el = [...document.querySelectorAll('div,section')].find(e => /Total MTM/i.test(e.textContent) && e.textContent.length < 1500);
+      let el = [...document.querySelectorAll('div,section,mat-card,table')].find(e => /Closed Positions/i.test(e.textContent) && e.textContent.length < 2500);
+      if (!el) el = [...document.querySelectorAll('div,section,table')].find(e => /Total MTM/i.test(e.textContent) && e.textContent.length < 2500);
       if (!el) return null;
-      let a = el; for (let i = 0; i < 3 && a.parentElement && a.parentElement.tagName !== 'BODY'; i++) a = a.parentElement;
-      return a;
+      let c = el; for (let i = 0; i < 3 && c.parentElement && c.parentElement.tagName !== 'BODY'; i++) c = c.parentElement;
+      const r = c.getBoundingClientRect();
+      return (r.width > 240 && r.bottom > 0) ? r : null;
     } catch (e) { return null; }
+  }
+  function positionPanel(){
+    const host = document.getElementById('spay-host'); if (!host) return;
+    const r = anchorRect();
+    if (r){ host.style.position = 'absolute'; host.style.left = (r.left + window.scrollX) + 'px'; host.style.top = (r.bottom + window.scrollY + 14) + 'px'; host.style.width = Math.max(430, Math.min(680, r.width)) + 'px'; host.dataset.placed = '1'; }
+    else if (host.dataset.placed !== '1'){ host.style.position = 'fixed'; host.style.left = '430px'; host.style.top = '120px'; host.style.width = '500px'; }
   }
 
   // ══ PAYOFF CHART ════════════════════════════════════════════════════════════
@@ -212,6 +218,7 @@
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
     const lv = $id('spay-live'); if (lv){ const on = Date.now() - Store.lastUpdate < 8000; lv.classList.toggle('on', on); set('spay-lt', on ? 'live' : (Store.lastUpdate ? 'stale' : 'connecting')); }
     set('spay-dbg', Store.dbg || '');
+    positionPanel();
     window.drawPayoff();
   };
 
@@ -221,11 +228,11 @@
     setInterval(() => { try { poll(); } catch (e) {} }, POLL_MS);
     setInterval(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
     setInterval(() => { try {
-      const host = document.getElementById('spay-host');
-      if (!host){ SR = null; buildPanel(); window.refreshAll(); return; }
-      // relocate into the content area once the Positions tab (its anchor) is present
-      if (!host.classList.contains('embed')){ const a = findAnchor(); if (a && a.parentElement){ host.classList.add('embed'); a.parentElement.insertBefore(host, a.nextSibling); } }
+      if (!document.getElementById('spay-host')){ SR = null; buildPanel(); window.refreshAll(); return; }
+      positionPanel();
     } catch (e) {} }, WATCHDOG_MS);
+    window.addEventListener('scroll', () => { try { positionPanel(); } catch (e) {} }, true);
+    window.addEventListener('resize', () => { try { positionPanel(); } catch (e) {} });
     setTimeout(() => { const cv = $id('spay-cv'); if (cv && !cv.__h){ cv.__h = 1; cv.style.cursor = 'crosshair'; cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { window.drawPayoff(); } catch (_) {} }); cv.addEventListener('mouseleave', () => { cv._cur = null; try { window.drawPayoff(); } catch (_) {} }); } poll(); window.refreshAll(); }, 700);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
