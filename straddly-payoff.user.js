@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -25,7 +25,7 @@
   const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
 
   // ══ STORE ═══════════════════════════════════════════════════════════════════
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', lastUpdate: 0, auth: '', dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', lastUpdate: 0, auth: '', dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store;
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], 15, 30, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
@@ -125,6 +125,32 @@
   XMLHttpRequest.prototype.send = function (body){ const d = this.__s; if (d) this.addEventListener('load', () => { try { ingest(d.url, this.responseText); } catch (e) {} }); return oS.apply(this, arguments); };
   function poll(){ try { scrapePositions(true); selfTouch(); } catch (e) {} } // full re-scan + fresh spot; the observer covers everything between
 
+  // ══ MTM / DELTA HISTORY ═════════════════════════════════════════════════════
+  // Can't be reconstructed after the fact, so we sample as we go and keep the day in localStorage.
+  const HIST_KEY = 'spay_hist_v1', HIST_MS = 3000, HIST_SAVE_MS = 15000, HIST_MAX = 8000;
+  function dayKey(){ const d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function histLoad(){
+    try { const raw = localStorage.getItem(HIST_KEY); if (!raw) return; const j = JSON.parse(raw);
+      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; }
+      else localStorage.removeItem(HIST_KEY); // new session day → start clean
+    } catch (e) {}
+  }
+  let _lastSave = 0;
+  function histSave(force){
+    if (!force && Date.now() - _lastSave < HIST_SAVE_MS) return; _lastSave = Date.now();
+    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist })); } catch (e) {}
+  }
+  function histPush(book, mtm, delta){
+    if (!book || !isFinite(mtm) || !isFinite(delta)) return;
+    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; }
+    const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
+    const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
+    a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1)]);
+    if (a.length > HIST_MAX) a.splice(0, a.length - HIST_MAX);
+    histSave(false);
+  }
+  const hhmm = t => { const d = new Date(t * 1000); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); };
+
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
   // scraped rows carry the portal's own live LTP → prefer it so our MTM always matches the screen exactly
   function liveLtp(p){ if (p._scraped && p.ltp > 0) return p.ltp; if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId]; if (p.symbol && Store.ltpBySym[p.symbol] != null) return Store.ltpBySym[p.symbol]; return p.ltp || 0; }
@@ -158,8 +184,8 @@
 
   // ══ SHADOW PANEL ════════════════════════════════════════════════════════════
   let SR = null; const $ = s => SR ? SR.querySelector(s) : null, $id = i => $('#' + i);
-  function fitCanvas(id){ const cv = $id(id); if (!cv) return null; const w = Math.round(cv.getBoundingClientRect().width) || 420; cv.width = Math.max(w, 260);
-    if (POP && !POP.closed) cv.height = Math.max(280, Math.min(560, Math.round((POP.innerHeight || 800) * 0.46)));
+  function fitCanvas(id, frac){ const cv = $id(id); if (!cv) return null; const w = Math.round(cv.getBoundingClientRect().width) || 420; cv.width = Math.max(w, 260);
+    if (POP && !POP.closed && frac) cv.height = Math.max(Math.round(150 * frac / 0.24), Math.min(560, Math.round((POP.innerHeight || 800) * frac)));
     return cv; }
   function panelCSS(){ return `
       :host{all:initial;} *{box-sizing:border-box;margin:0;padding:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;}
@@ -189,6 +215,11 @@
       .books button:hover{color:${C.text};border-color:${C.muted};}
       .books button.on{background:${C.accent};border-color:${C.accent};color:#04140d;}
       #spay-tot{font-family:${MONO};}
+      .mhdr{display:flex;align-items:center;gap:12px;margin:10px 0 3px;font-size:9.5px;color:${C.muted};font-family:${MONO};letter-spacing:.05em;}
+      .mhdr .k{display:flex;align-items:center;gap:5px;}
+      .mhdr .k:before{content:'';width:10px;height:3px;border-radius:2px;background:${C.accent};}
+      .mhdr .k2:before{background:${C.ce};}
+      .mhdr .mnow{margin-left:auto;color:${C.sub};}
       .brand{letter-spacing:.02em;}
       /* ── pop-out window: fills its own window, drops the floating-card chrome ── */
       body.pop{background:${C.bg};margin:0;padding:16px;}
@@ -209,6 +240,8 @@
       <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
       <div class="books" id="spay-books"></div>
       <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
+        <div class="mhdr"><span class="k k1">MTM ₹</span><span class="k k2">Δ net</span><span class="mnow" id="spay-mnow"></span></div>
+        <canvas id="spay-mtm-cv" height="150"></canvas>
         <div class="grk"><div><div class="gl">Δ Delta</div><div class="gv" id="g-d">—</div></div><div><div class="gl">Γ Gamma</div><div class="gv" id="g-g">—</div></div><div><div class="gl">Θ /hr</div><div class="gv" id="g-t">—</div></div><div><div class="gl">Vega</div><div class="gv" id="g-v">—</div></div></div>
         <div class="risk"><div class="rc"><div class="rl">Max loss (±3%)</div><div class="rv" id="r-ml" style="color:${C.dn}">—</div><div class="rs">worst in stress range</div></div>
           <div class="rc"><div class="rl">Breakevens</div><div class="rv" id="r-be">—</div><div class="rs" id="r-bes">safe zone</div></div>
@@ -231,10 +264,11 @@
     const mn = $id('spay-min'); if (mn) mn.onclick = () => { _mini = !_mini; const w = $id('spay-cv').parentElement; if (w) w.style.display = _mini ? 'none' : ''; };
     const cl = $id('spay-close'); if (cl) cl.onclick = () => { if (POP){ closePop(); return; } const h = document.getElementById('spay-host'); if (h) h.remove(); SR = null; };
     const po = $id('spay-pop'); if (po) po.onclick = () => { if (POP && !POP.closed) closePop(); else popOut(); };
-    const cv = $id('spay-cv');
-    if (cv && !cv.__h){ cv.__h = 1; cv.style.cursor = 'crosshair';
-      cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { window.drawPayoff(); } catch (_) {} });
-      cv.addEventListener('mouseleave', () => { cv._cur = null; try { window.drawPayoff(); } catch (_) {} }); }
+    [['spay-cv', () => window.drawPayoff()], ['spay-mtm-cv', () => window.drawMtm()]].forEach(([id, draw]) => {
+      const cv = $id(id); if (!cv || cv.__h) return; cv.__h = 1; cv.style.cursor = 'crosshair';
+      cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { draw(); } catch (_) {} });
+      cv.addEventListener('mouseleave', () => { cv._cur = null; try { draw(); } catch (_) {} });
+    });
   }
   // ── pop-out: the panel gets its OWN window (second monitor), still fed live by this tab ──
   function popOut(){
@@ -291,7 +325,7 @@
   // ══ PAYOFF CHART ════════════════════════════════════════════════════════════
   function smooth(ctx, p){ for (let i = 1; i < p.length; i++) ctx.lineTo(p[i].x, p[i].y); }
   window.drawPayoff = function (){
-    const cv = fitCanvas('spay-cv'); if (!cv) return; const ctx = cv.getContext('2d'), W = cv.width, H = cv.height; ctx.clearRect(0, 0, W, H);
+    const cv = fitCanvas('spay-cv', 0.38); if (!cv) return; const ctx = cv.getContext('2d'), W = cv.width, H = cv.height; ctx.clearRect(0, 0, W, H);
     const pos = window._bsLegs(), spot = window.getSpot();
     if (!pos.length || !spot){ ctx.fillStyle = C.muted; ctx.font = '12px ' + MONO; ctx.textAlign = 'center'; ctx.fillText('no open positions', W / 2, H / 2); return; }
     const K = window._getPosCtx(pos, spot), dte = K.dte;
@@ -323,6 +357,62 @@
     if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = 'rgba(5,6,7,.96)'; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
   };
 
+  // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
+  window.drawMtm = function (){
+    const cv = fitCanvas('spay-mtm-cv', 0.22); if (!cv) return;
+    const ctx = cv.getContext('2d'), W = cv.width, H = cv.height; ctx.clearRect(0, 0, W, H);
+    const a = Store.hist[activeBook()] || [];
+    if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '11px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording MTM…' : 'MTM curve starts recording now', W / 2, H / 2); return; }
+    const L = 52, R = 46, Tp = 10, B = 18, CW = W - L - R, CH = H - Tp - B;
+    const t0 = a[0][0], t1 = a[a.length - 1][0], span = Math.max(120, t1 - t0);
+    const X = t => L + ((t - t0) / span) * CW;
+    const ms = a.map(p => p[1]), ds = a.map(p => p[2]);
+    const mStep = niceStep(((Math.max(0, ...ms) - Math.min(0, ...ms)) || 1000) / 3);
+    const mMin = Math.floor(Math.min(0, ...ms) / mStep) * mStep, mMax = Math.ceil(Math.max(0, ...ms) / mStep) * mStep;
+    const Y = v => Tp + CH - ((v - mMin) / ((mMax - mMin) || 1)) * CH;
+    let dMin = Math.min(...ds), dMax = Math.max(...ds);
+    if (dMax - dMin < 1){ const c = (dMax + dMin) / 2; dMin = c - 1; dMax = c + 1; }
+    const dp = (dMax - dMin) * 0.18; dMin -= dp; dMax += dp;
+    const YD = v => Tp + CH - ((v - dMin) / ((dMax - dMin) || 1)) * CH;
+    ctx.font = '9px ' + MONO;
+    // left axis = money, right axis = delta
+    for (let v = mMin; v <= mMax + 1e-9; v += mStep){ const y = Y(v);
+      ctx.strokeStyle = Math.abs(v) < mStep * 0.01 ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+      ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L - 5, y + 3); }
+    [dMin, (dMin + dMax) / 2, dMax].forEach(v => { ctx.fillStyle = C.ce; ctx.textAlign = 'left'; ctx.fillText(v.toFixed(0), W - R + 5, YD(v) + 3); });
+    for (let i = 0; i <= 3; i++){ const t = t0 + (i / 3) * span, x = X(t);
+      ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke();
+      ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(hhmm(t), x, H - 5); }
+    // filled area, green above the zero line and red below it
+    const z = Math.max(Tp, Math.min(Tp + CH, Y(0)));
+    const area = () => { ctx.beginPath(); ctx.moveTo(X(a[0][0]), z); a.forEach(q => ctx.lineTo(X(q[0]), Y(q[1]))); ctx.lineTo(X(a[a.length - 1][0]), z); ctx.closePath(); };
+    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = 'rgba(74,222,128,.15)'; ctx.fill(); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = 'rgba(255,90,82,.15)'; ctx.fill(); ctx.restore();
+    // delta first (thin, behind), then MTM on top
+    ctx.strokeStyle = C.ce; ctx.lineWidth = 1.3; ctx.beginPath(); a.forEach((q, i) => { const x = X(q[0]), y = YD(q[2]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
+    ctx.lineWidth = 1.7;
+    for (let i = 1; i < a.length; i++){ const p0 = a[i - 1], p1 = a[i];
+      ctx.strokeStyle = (p0[1] >= 0 && p1[1] >= 0) ? C.up : (p0[1] < 0 && p1[1] < 0) ? C.dn : C.muted;
+      ctx.beginPath(); ctx.moveTo(X(p0[0]), Y(p0[1])); ctx.lineTo(X(p1[0]), Y(p1[1])); ctx.stroke(); }
+    const lastP = a[a.length - 1];
+    ctx.beginPath(); ctx.arc(X(lastP[0]), Y(lastP[1]), 3, 0, 7); ctx.fillStyle = lastP[1] >= 0 ? C.up : C.dn; ctx.fill();
+    // hover crosshair
+    if (cv._cur != null){
+      const tt = t0 + ((cv._cur - L) / CW) * span;
+      const nb = a.reduce((b, q) => Math.abs(q[0] - tt) < Math.abs(b[0] - tt) ? q : b, a[0]);
+      const cx = X(nb[0]);
+      ctx.strokeStyle = 'rgba(255,255,255,.28)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(cx, Y(nb[1]), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, YD(nb[2]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
+      const lbl = hhmm(nb[0]) + '  ' + money(nb[1]) + '  Δ' + nb[2];
+      ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14;
+      let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx);
+      ctx.fillStyle = 'rgba(5,6,7,.96)'; ctx.fillRect(tx, Tp + 2, tw, 18);
+      ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18);
+      ctx.fillStyle = nb[1] >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15);
+    }
+  };
+
   // ══ REFRESH ═════════════════════════════════════════════════════════════════
   // one payoff per underlying — NIFTY and BANKNIFTY are different books and must never share a spot
   function renderBooks(active){
@@ -347,7 +437,7 @@
     set('spay-mtm', pos.length ? money(mtm) : '—', col(mtm));
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'ALL ' + money(total); tot.style.color = col(total); } }
     if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? (dte * 24).toFixed(1) + 'h to expiry' : dte.toFixed(1) + 'd to expiry');
-      const G = window._netGreeks(pos, spot); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
+      const G = window._netGreeks(pos, spot); histPush(book, mtm, G.nD); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
       const be = window._breakevens(pos); if (be){ const inside = spot >= be.lower && spot <= be.upper, near = Math.min(Math.abs(be.upper - spot), Math.abs(spot - be.lower)); set('r-be', Math.round(be.lower).toLocaleString('en-IN') + '–' + Math.round(be.upper).toLocaleString('en-IN')); set('r-bes', inside ? near.toFixed(0) + ' pt to edge' : 'OUTSIDE', inside ? C.muted : C.dn); } else { set('r-be', '—'); set('r-bes', ''); }
       const decay = pos.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, spot - l.strike) : Math.max(0, l.strike - spot); return a + (l.ltp - it) * (-l.qty); }, 0); set('r-dl', money(decay), decay >= 0 ? C.up : C.dn);
@@ -360,7 +450,9 @@
     const age = Store.lastScrape ? Date.now() - Store.lastScrape : -1;
     set('spay-dbg', (Store.dbg || '') + (age >= 0 ? ' · ' + (age < 1000 ? age + 'ms' : (age / 1000).toFixed(1) + 's') : ''));
     positionPanel();
-    window.drawPayoff();
+    const mn = $id('spay-mnow');
+    if (mn){ const h = Store.hist[book] || []; mn.textContent = h.length ? h.length + ' pts · since ' + hhmm(h[0][0]) : ''; }
+    window.drawPayoff(); window.drawMtm();
   };
 
   // ══ BOOT + WATCHDOG ═════════════════════════════════════════════════════════
@@ -374,7 +466,7 @@
     add(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
   }
   function boot(){
-    buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
+    histLoad(); buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
     startTimers(window);
     setInterval(() => { try {
       if (POP && !POP.closed) return; // popped out — leave the host hidden

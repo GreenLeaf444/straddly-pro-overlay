@@ -51,6 +51,10 @@ breakevens + distance, margin used, decay-left. Hover the chart for spot + P&L. 
   Keep the portal tab open; it's the data source.
 - **Live sync** — mirrors the portal within ~1ms of it updating (MutationObserver, not polling). The small
   grey readout in the header shows how fresh the numbers are.
+- **MTM curve** — intraday P&L (₹, left axis, green above zero / red below) with **net delta** on the right
+  axis, so you can see position drift against the P&L that followed it. Hover for time + MTM + Δ.
+  Recorded per book every 3s and kept in `localStorage` for the trading day, so a reload doesn't lose the
+  morning. It starts empty and fills as the session runs — history can't be reconstructed retroactively.
 
 > If your broker serves the trade page at a **new URL**, add it to the `@match` lines at the top of the script.
 
