@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><title>Payoff and Risk - test suite</title>
+<style>
+ body{margin:0;padding:24px;background:#050607;color:#e9edf0;font:13px ui-monospace,Menlo,Consolas,monospace;}
+ h1{font-size:15px;margin:0 0 4px;} .sub{color:#697079;font-size:11px;margin-bottom:16px;}
+ .grp{margin:14px 0 6px;color:#4ade80;font-size:11px;letter-spacing:.08em;}
+ .t{padding:3px 0;border-bottom:1px solid #191c21;display:flex;gap:10px;}
+ .t .s{width:46px;font-weight:700;} .pass .s{color:#4ade80;} .fail .s{color:#ff5a52;}
+ .t .d{flex:1;} .t .m{color:#697079;}
+ #sum{margin-top:18px;padding:12px 14px;border-radius:8px;font-weight:700;}
+ .ok{background:rgba(74,222,128,.12);color:#4ade80;} .bad{background:rgba(255,90,82,.12);color:#ff5a52;}
+ #spay-host{display:none !important;}
+</style></head>
+<body>
+<h1>Payoff &amp; Risk - test suite</h1>
+<div class="sub">Pure-function tests over the pricing, parsing, risk and session logic. Open this file to re-run.</div>
+<div id="out"></div><div id="sum">running...</div>
+<script>document.write('<script src="../straddly-payoff.user.js?v='+Date.now()+'"><\/script>');</script>
+<script>
+(function(){
+  var out=document.getElementById('out'), pass=0, fail=0, failed=[];
+  function grp(n){ var d=document.createElement('div'); d.className='grp'; d.textContent=n; out.appendChild(d); }
+  function t(desc, fn){
+    var okv=false, msg='';
+    try { var r=fn(); okv = r===true || r===undefined; if(!okv) msg=String(r); }
+    catch(e){ okv=false; msg=(e && e.message) || String(e); }
+    okv?pass++:(fail++, failed.push(desc+' :: '+msg));
+    var d=document.createElement('div'); d.className='t '+(okv?'pass':'fail');
+    d.innerHTML='<span class="s">'+(okv?'PASS':'FAIL')+'</span><span class="d"></span><span class="m"></span>';
+    d.querySelector('.d').textContent=desc; d.querySelector('.m').textContent=msg; out.appendChild(d);
+  }
+  function near(a,b,tol,label){ if(Math.abs(a-b)<=tol) return true; return (label||'')+' got '+a+' want ~'+b+' (+/-'+tol+')'; }
+
+  function run(){
+    var BS=window.BS, F=window.SPAY._fn, S=window.SPAY, K=F.marketConsts;
+
+    grp('SECURITY');
+    t('bearer token is not reachable via window.SPAY', function(){
+      var hit=[]; (function scan(o,path,d){ if(!o||d>2) return;
+        Object.keys(o).forEach(function(k){ var v=o[k];
+          if(typeof v==='string' && /^bearer /i.test(v)) hit.push(path+'.'+k);
+          else if(v && typeof v==='object') scan(v,path+'.'+k,d+1); }); })(S,'SPAY',0);
+      return hit.length===0 || 'token exposed at '+hit.join(', ');
+    });
+    t('SPAY exposes no auth key at all', function(){ return !('auth' in S) || 'SPAY.auth still present'; });
+
+    grp('SESSION / EXPIRY');
+    t('session close is 15:40 (NSE+BSE, since 2026-08-03)', function(){
+      return (K.CLOSE_H===15 && K.CLOSE_M===40) || 'got '+K.CLOSE_H+':'+K.CLOSE_M; });
+    t('symbol expiry uses the 15:40 close', function(){
+      var p=F.parseSymbol('NIFTY26082024300CE');
+      return (p.expiry.getHours()===15 && p.expiry.getMinutes()===40) || 'got '+p.expiry; });
+    t('symbol parses underlying/strike/type', function(){
+      var p=F.parseSymbol('BANKNIFTY26082557800CE');
+      return (p.underlying==='BANKNIFTY' && p.strike===57800 && p.type==='CE') || JSON.stringify(p); });
+    function atIST(y,mo,d,h,mi){ return new Date(Date.UTC(y,mo-1,d,h,mi)-5.5*3600000); }
+    t('weekday mid-session is OPEN',        function(){ return F.marketState(atIST(2026,8,20,12,0))==='OPEN'; });
+    t('09:14 IST is CLOSED (pre-open)',     function(){ return F.marketState(atIST(2026,8,20,9,14))==='CLOSED'; });
+    t('09:15 IST is OPEN',                  function(){ return F.marketState(atIST(2026,8,20,9,15))==='OPEN'; });
+    t('15:40 IST is OPEN (last minute)',    function(){ return F.marketState(atIST(2026,8,20,15,40))==='OPEN'; });
+    t('15:41 IST is CLOSED',                function(){ return F.marketState(atIST(2026,8,20,15,41))==='CLOSED'; });
+    t('Saturday is CLOSED (frozen-feed trap)', function(){ return F.marketState(atIST(2026,8,22,12,0))==='CLOSED'; });
+    t('Sunday is CLOSED',                   function(){ return F.marketState(atIST(2026,8,23,12,0))==='CLOSED'; });
+
+    grp('BLACK-SCHOLES');
+    var S0=24000,T=7/365,r=.065,v=.14;
+    t('put-call parity holds', function(){
+      var c=BS.price(S0,24000,T,r,v,'CE'), p=BS.price(S0,24000,T,r,v,'PE');
+      return near(c-p, S0-24000*Math.exp(-r*T), 0.5, 'C-P'); });
+    t('call price rises with vol', function(){
+      return BS.price(S0,24200,T,r,.20,'CE') > BS.price(S0,24200,T,r,.10,'CE'); });
+    t('at expiry the price is intrinsic', function(){
+      return near(BS.price(24350,24000,0,r,v,'CE'), 350, 1e-9, 'intrinsic'); });
+    t('call delta in (0,1), put delta in (-1,0)', function(){
+      var c=BS.greeks(S0,24000,T,r,v,'CE',1).delta, p=BS.greeks(S0,24000,T,r,v,'PE',1).delta;
+      return (c>0&&c<1&&p>-1&&p<0) || 'CE '+c+' PE '+p; });
+    t('a short position flips the delta sign', function(){
+      return BS.greeks(S0,24000,T,r,v,'CE',-65).delta < 0; });
+
+    grp('IMPLIED VOL - must refuse bad marks');
+    t('round-trips a fair price', function(){
+      var px=BS.price(S0,24200,T,r,.135,'CE');
+      return near(BS.iv(S0,24200,T,r,px,'CE'), .135, .002, 'iv'); });
+    t('rejects a mark at or below intrinsic', function(){
+      var got=BS.iv(24350,24000,T,r,340,'CE'); return got===0 || 'got '+got; });
+    t('rejects an absurdly rich mark (not 500pct vol)', function(){
+      var got=BS.iv(S0,24200,T,r,9000,'CE'); return got===0 || 'got '+got; });
+    t('rejects zero and negative marks', function(){
+      return (BS.iv(S0,24200,T,r,0,'CE')===0 && BS.iv(S0,24200,T,r,-5,'CE')===0); });
+    t('never returns a vol outside the 1pct-300pct band', function(){
+      for(var m=0.05;m<3000;m*=1.7){ var got=BS.iv(S0,24200,T,r,m,'CE');
+        if(got!==0 && (got<K.IV_MIN||got>K.IV_MAX)) return 'mark '+m.toFixed(2)+' gave iv '+got; }
+      return true; });
+    t('a zero LTP falls back to the entry price rather than being rejected', function(){
+      var legs=[{strike:24000,type:'CE',qty:-65,avg:100,ltp:0,expiry:new Date(Date.now()+2*864e5)}];
+      var ctx=window._getPosCtx(legs,S0);
+      return (ctx.ivBad===0 && ctx.legIVs[0]>0) || 'ivBad='+ctx.ivBad+' iv='+ctx.legIVs[0]; });
+    t('an unsolvable leg is flagged in ivBad and borrows a sibling vol', function(){
+      var e=new Date(Date.now()+2*864e5);
+      var legs=[{strike:24000,type:'CE',qty:-65,avg:420,ltp:420,expiry:e},   // below intrinsic at spot 24500
+                {strike:24600,type:'CE',qty:-65,avg:120,ltp:120,expiry:e}];  // solves normally
+      var ctx=window._getPosCtx(legs,24500);
+      return (ctx.ivBad===1 && ctx.legIVs[0]===ctx.ivFallback && ctx.legIVs[0]>0)
+        || 'ivBad='+ctx.ivBad+' ivs='+ctx.legIVs.join(',')+' fb='+ctx.ivFallback; });
+
+    grp('POSITION P&L');
+    var exp2=new Date(Date.now()+2*864e5);
+    function leg(strike,type,qty,avg,ltp){ return {strike:strike,type:type,qty:qty,avg:avg,ltp:ltp,expiry:exp2,under:'NIFTY',symbol:'X'+strike+type}; }
+    t('a SHORT leg profits when the option cheapens', function(){
+      var L=[leg(24300,'CE',-65,50,30)], c=window._getPosCtx(L,24000);
+      return window._bsPnl(L,24000,c,0) > 0; });
+    t('a LONG leg profits when the option richens (sign fix)', function(){
+      var L=[leg(24300,'CE',65,30,50)], c=window._getPosCtx(L,24000);
+      var lo=window._bsPnl(L,23500,c,0), hi=window._bsPnl(L,24800,c,0);
+      return hi>lo || 'low '+lo+' high '+hi; });
+    t('a short strangle peaks between the strikes', function(){
+      var L=[leg(24200,'PE',-65,40,40), leg(24300,'CE',-65,40,40)], c=window._getPosCtx(L,24250);
+      var mid=window._bsPnl(L,24250,c,0), lo=window._bsPnl(L,23600,c,0), hi=window._bsPnl(L,24900,c,0);
+      return (mid>lo && mid>hi) || 'mid '+mid+' lo '+lo+' hi '+hi; });
+    t('legs keep their OWN expiries in a mixed-expiry book', function(){
+      var n1=new Date(Date.now()+1*864e5), far=new Date(Date.now()+8*864e5);
+      var L=[{strike:24000,type:'CE',qty:-65,avg:50,ltp:50,expiry:n1},
+             {strike:24000,type:'CE',qty:-65,avg:90,ltp:90,expiry:far}];
+      var c=window._getPosCtx(L,24000);
+      return (Math.abs(c.legT[0]-c.legT[1])>1e-4 && c.dte<2) || 'legT '+c.legT.join(',')+' dte '+c.dte; });
+    t('breakevens straddle spot for a short strangle', function(){
+      var L=[leg(24200,'PE',-65,40,40), leg(24300,'CE',-65,40,40)];
+      S.positions=[]; S.spots={NIFTY:24250}; S.book='NIFTY';
+      var be=window._breakevens(L);
+      return (be && be.lower<24250 && be.upper>24250) || JSON.stringify(be); });
+
+    grp('REALISED P&L ON EXIT');
+    function setLegs(arr){ S.positions=arr.map(function(a){
+      return {status:'OPEN',symbol:a[0],optionType:a[0].slice(-2),strikePrice:a[1],quantity:a[2],
+              avgSellPrice:a[3],bepPrice:a[3],ltp:a[4],_scraped:true,
+              expiryDate:new Date(Date.now()+2*864e5).toISOString()}; }); }
+    t('a fully exited leg banks its last P&L', function(){
+      S.realised={}; S.prevLegs={}; S.posVisible=true;
+      setLegs([['NIFTY26082024200PE',24200,-20,50,40]]); F.reconcileRealised();
+      setLegs([]);                                       F.reconcileRealised();
+      return near(S.realised.NIFTY, 200, 1, 'realised'); });
+    t('a PARTIAL exit banks only the closed fraction', function(){
+      S.realised={}; S.prevLegs={}; S.posVisible=true;
+      setLegs([['NIFTY26082024200PE',24200,-20,50,40]]); F.reconcileRealised();
+      setLegs([['NIFTY26082024200PE',24200,-5,50,40]]);  F.reconcileRealised();
+      return near(S.realised.NIFTY, 150, 1, 'realised'); });
+    t('an untouched book banks nothing when the mark moves', function(){
+      S.realised={}; S.prevLegs={}; S.posVisible=true;
+      setLegs([['NIFTY26082024200PE',24200,-20,50,40]]); F.reconcileRealised();
+      setLegs([['NIFTY26082024200PE',24200,-20,50,35]]); F.reconcileRealised();
+      return near(S.realised.NIFTY||0, 0, 1e-9, 'realised'); });
+
+    grp('HISTORY');
+    t('samples are throttled, not written on every call', function(){
+      S.hist={}; S.histDay=F.dayKey();
+      for(var i=0;i<50;i++) F.histPush('NIFTY', 100+i, -5);
+      var n=(S.hist.NIFTY||[]).length;
+      return n===1 || 'wrote '+n+' samples in a tight loop'; });
+    t('a sample carries [t, mtm, delta, realised]', function(){
+      var s0=S.hist.NIFTY[0];
+      return (s0.length===4 && typeof s0[0]==='number') || JSON.stringify(s0); });
+    t('a new trading day resets the series and the booked total', function(){
+      S.histDay='2026-01-01'; S.hist={NIFTY:[[1,2,3,4]]}; S.realised={NIFTY:999};
+      F.histPush('NIFTY', 10, -1);
+      return (S.histDay===F.dayKey() && S.hist.NIFTY.length===1 && !S.realised.NIFTY)
+        || ('day '+S.histDay+' pts '+S.hist.NIFTY.length+' realised '+S.realised.NIFTY); });
+
+    var sum=document.getElementById('sum');
+    sum.className = fail ? 'bad' : 'ok';
+    sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
+    window.__RESULT={pass:pass, fail:fail, failed:failed};
+  }
+  (function wait(){ if(window.BS && window.SPAY && window.SPAY._fn) return run(); setTimeout(wait,40); })();
+})();
+</script>
+</body></html>

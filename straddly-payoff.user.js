@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      3.0
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -22,15 +22,27 @@
   const POLL_MS = 2000, UI_REFRESH_MS = 700, WATCHDOG_MS = 2500, SYNC_MS = 60, DEFAULT_ALLOWED_MARGIN = 114113.08;
   // "TradingAlgo" vibe — near-black, bright terminal green, orange-red, mono numbers
   const C = { bg:'#050607', panel:'#0a0b0d', card:'#101216', line:'#191c21', line2:'#24282e', text:'#e9edf0', muted:'#697079', sub:'#9aa3af', accent:'#4ade80', accent2:'#22c55e', up:'#4ade80', dn:'#ff5a52', warn:'#fbbf24', ce:'#38bdf8', pe:'#ff5a52', sd:'#a78bfa' };
+  // Exchange session. NSE F&O and BSE both close 15:40 IST (moved from 15:30 on 2026-08-03).
+  // Time-to-expiry is derived from this, so a wrong value distorts theta/gamma badly on expiry day.
+  const OPEN_H = 9, OPEN_M = 15, CLOSE_H = 15, CLOSE_M = 40;
+  const IV_MIN = 0.01, IV_MAX = 3.0; // a solved vol outside 1%–300% is a bad mark, not a real vol
+  const HOLIDAYS = []; // optional 'YYYY-MM-DD' trading holidays; the frozen-feed check below covers the rest
   const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
 
   // ══ STORE ═══════════════════════════════════════════════════════════════════
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, auth: '', dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
-  window.SPAY = Store;
-  function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], 15, 30, 0), strike: +m[5], type: m[6] }; }
+  // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
+  // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
+  let AUTH = '';
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
+  window.SPAY._fn = { parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+  function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
   function ingest(url, body){ if (!url || !body) return; let j; try { j = JSON.parse(body); } catch (e) { return; } const d = j && j.data !== undefined ? j.data : j; try {
-    if (/\/(data\/)?[Tt]ouchline/i.test(url) && Array.isArray(d)) { d.forEach(q => { if (q && q.symbol){ if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; Store.ltpBySym[q.symbol] = q.ltp; } }); recomputeSpot(); Store._emit(); return; }
+    if (/\/(data\/)?[Tt]ouchline/i.test(url) && Array.isArray(d)) {
+      const mine = {}; Store.positions.forEach(p => { if (p.symbol) mine[p.symbol] = 1; });
+      d.forEach(q => { if (q && q.symbol){ if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; Store.ltpBySym[q.symbol] = q.ltp; if (mine[q.symbol] && q.ltp > 0) Store.markAt = Date.now(); } });
+      recomputeSpot(); Store._emit(); return; }
     if (/user\/getuserdetails/i.test(url) && d && d.id) { Store.user = d; Store._emit(); return; }
     if (/\/(Orders\/Get-MarginusedByID|user\/getMargin)/i.test(url) && Array.isArray(d) && d.length) { Store.margin = d[0]; Store._emit(); return; }
   } catch (e) {} }
@@ -39,6 +51,16 @@
   function paritySpot(under){ const byK = {}; for (const sym in Store.ltpBySym){ const p = parseSymbol(sym), l = Store.ltpBySym[sym]; if (!p || p.type === 'SD' || !(l > 0)) continue; if (under && p.underlying !== under) continue; const o = byK[p.strike] = byK[p.strike] || { exp: p.expiry }; o[p.type] = l; } const rows = []; for (const k in byK){ const r = byK[k]; if (r.CE > 0 && r.PE > 0) rows.push({ k: +k, diff: Math.abs(r.CE - r.PE), cp: r.CE - r.PE, exp: r.exp }); } if (!rows.length) return 0; rows.sort((a, b) => a.diff - b.diff); const top = rows.slice(0, 3), rr = 0.065, now = Date.now(); let s = 0; top.forEach(x => { const T = Math.max((x.exp - now) / (365 * 864e5), 1e-5); s += x.k * Math.exp(-rr * T) + x.cp; }); return s / top.length; }
   const _idx = { under: null, valEl: null, last: 0 };
   function indexSpotDOM(under){ const numIn = el => { const m = (el && el.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/); if (!m) return 0; const v = parseFloat(m[1].replace(/,/g, '')); return (v > 1000 && v < 200000) ? v : 0; }; try { if (_idx.under === under && _idx.valEl && document.contains(_idx.valEl)){ const v = numIn(_idx.valEl); if (v) return v; } if (Date.now() - _idx.last < 1500) return 0; _idx.last = Date.now(); const wants = under === 'BANKNIFTY' ? ['BANKNIFTY','BANK NIFTY','NIFTY BANK'] : [under, 'SPOT']; const leaves = document.querySelectorAll('span,div,b,strong,td,th,p'); for (let i = 0; i < leaves.length; i++){ const el = leaves[i]; if (el.childElementCount !== 0) continue; const t = el.textContent.trim().toUpperCase().replace(':', ''); if (wants.indexOf(t) < 0) continue; const probes = [el.nextElementSibling, el.previousElementSibling].concat(el.parentElement ? Array.from(el.parentElement.children) : []); for (const c of probes){ if (!c || c === el) continue; const v = numIn(c); if (v){ _idx.under = under; _idx.valEl = c; return v; } } } } catch (e) {} return 0; }
+  // A closed exchange serves a FROZEN feed, not an empty one — a flat, plausible-looking tape.
+  // So we check the clock (in IST, regardless of the machine's timezone) AND whether marks are actually moving.
+  function istNow(d){ d = d || new Date(); return new Date(d.getTime() + d.getTimezoneOffset() * 60000 + 5.5 * 3600000); }
+  function marketState(now){
+    const d = istNow(now), dow = d.getDay(), mins = d.getHours() * 60 + d.getMinutes();
+    const iso = d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+    if (dow === 0 || dow === 6 || HOLIDAYS.indexOf(iso) >= 0) return 'CLOSED';
+    if (mins < OPEN_H * 60 + OPEN_M || mins > CLOSE_H * 60 + CLOSE_M) return 'CLOSED';
+    return 'OPEN';
+  }
   // ── multi-book: a screen can hold NIFTY + BANKNIFTY + SENSEX at once. Each needs its OWN spot and its OWN payoff. ──
   function underlyings(){ const u = []; Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x && u.indexOf(x.underlying) < 0) u.push(x.underlying); }); return u; }
   function activeBook(){ const u = underlyings(); if (!u.length) return 'NIFTY'; if (Store.book && u.indexOf(Store.book) >= 0) return Store.book; const cnt = {}; Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x) cnt[x.underlying] = (cnt[x.underlying] || 0) + 1; }); return u.slice().sort((a, b) => cnt[b] - cnt[a])[0]; }
@@ -86,7 +108,7 @@
       const avg = nums[1], ltp = nums[2], pnl = nums[nums.length - 1];
       const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, ''), mo = MON[m[2].toUpperCase()], strike = +m[3], type = m[4].toUpperCase();
       const sym = und + (yr % 100) + mo + day + strike + type;
-      out.push({ status: 'OPEN', symbol: sym, symbolId: null, optionType: type, strikePrice: strike, quantity: qty, avgSellPrice: qty < 0 ? avg : 0, avgBuyPrice: qty > 0 ? avg : 0, bepPrice: avg, ltp: ltp, _pnl: pnl, _scraped: true, expiryDate: new Date(yr, +mo - 1, +day, 15, 30, 0).toISOString() });
+      out.push({ status: 'OPEN', symbol: sym, symbolId: null, optionType: type, strikePrice: strike, quantity: qty, avgSellPrice: qty < 0 ? avg : 0, avgBuyPrice: qty > 0 ? avg : 0, bepPrice: avg, ltp: ltp, _pnl: pnl, _scraped: true, expiryDate: new Date(yr, +mo - 1, +day, CLOSE_H, CLOSE_M, 0).toISOString() });
     });
     // de-dupe by symbol (a straddle may appear twice)
     const seen = {}, uniq = []; out.forEach(p => { if (!seen[p.symbol]){ seen[p.symbol] = 1; uniq.push(p); } });
@@ -108,9 +130,9 @@
     if (Store.posVisible || onPosView) reconcileRealised();
     // else: on another tab → keep last known positions (don't blank)
     watchTables(tables);
-    Store.lastScrape = Date.now();
+    if (Store.posVisible) Store.markAt = Date.now(); // NOT on every attempt — only on a real read
     const qn = Store.positions.filter(p => Store.ltpBySym[p.symbol] > 0).length;
-    Store.dbg = 'pos ' + Store.positions.length + (Store.posVisible ? '' : ' · q' + qn + '/' + Store.positions.length) + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
+    Store.dbg = 'pos ' + Store.positions.length + (Store.posVisible ? '' : ' · q' + qn + '/' + Store.positions.length) + (function(){ const v = Store.spots[activeBook()] || Store.spot; return v ? ' · spot ' + Math.round(v) : ' · spot ?'; })() + (AUTH ? ' · auth✓' : ' · auth✗');
     return Store.positions.length;
   }
   // When a leg is exited its open P&L vanishes from the book — bank it, so the day curve stays continuous
@@ -132,17 +154,17 @@
   }
   // self-fetch the new touchline for the index (spot) + position symbols (fresh ltp), using captured auth
   function selfTouch(){
-    if (!Store.auth || !origFetch) return; const us = underlyings(); if (!us.length) us.push('NIFTY'); const syms = us.map(u => IDX[u] || u); Store.positions.forEach(p => { if (p.symbol && syms.indexOf(p.symbol) < 0) syms.push(p.symbol); });
-    origFetch(location.origin + '/api/data/touchline', { method: 'POST', headers: { authorization: Store.auth, 'content-type': 'application/json' }, body: JSON.stringify(syms), credentials: 'include' }).then(x => x.text()).then(t => ingest(location.origin + '/api/data/touchline', t)).catch(() => {});
+    if (!AUTH || !origFetch) return; const us = underlyings(); if (!us.length) us.push('NIFTY'); const syms = us.map(u => IDX[u] || u); Store.positions.forEach(p => { if (p.symbol && syms.indexOf(p.symbol) < 0) syms.push(p.symbol); });
+    origFetch(location.origin + '/api/data/touchline', { method: 'POST', headers: { authorization: AUTH, 'content-type': 'application/json' }, body: JSON.stringify(syms), credentials: 'include' }).then(x => x.text()).then(t => ingest(location.origin + '/api/data/touchline', t)).catch(() => {});
   }
 
   // ══ INTERCEPTOR ═════════════════════════════════════════════════════════════
   const origFetch = window.fetch;
-  const captureAuth = h => { if (!h) return; try { const g = k => (h.get ? h.get(k) : h[k] || h[k.toLowerCase()]); const a = g('authorization'); if (a) Store.auth = a; } catch (e) {} };
+  const captureAuth = h => { if (!h) return; try { const g = k => (h.get ? h.get(k) : h[k] || h[k.toLowerCase()]); const a = g('authorization'); if (a) AUTH = a; } catch (e) {} };
   if (origFetch) window.fetch = function (...a){ const url = (a[0] && a[0].url) || a[0], init = a[1] || {}; try { if (typeof url === 'string' && /\/api\//.test(url)) captureAuth(init.headers || (a[0] && a[0].headers)); } catch (e) {} const p = origFetch.apply(this, a); try { if (typeof url === 'string') p.then(r => r.clone().text().then(t => ingest(url, t)).catch(()=>{})).catch(()=>{}); } catch (e) {} return p; };
   const oO = XMLHttpRequest.prototype.open, oS = XMLHttpRequest.prototype.send, oH = XMLHttpRequest.prototype.setRequestHeader;
   XMLHttpRequest.prototype.open = function (m, u){ this.__s = { url: String(u) }; return oO.apply(this, arguments); };
-  XMLHttpRequest.prototype.setRequestHeader = function (k, v){ if (/^authorization$/i.test(k) && v) Store.auth = v; return oH.apply(this, arguments); };
+  XMLHttpRequest.prototype.setRequestHeader = function (k, v){ if (/^authorization$/i.test(k) && v) AUTH = v; return oH.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function (body){ const d = this.__s; if (d) this.addEventListener('load', () => { try { ingest(d.url, this.responseText); } catch (e) {} }); return oS.apply(this, arguments); };
   function poll(){ try { scrapePositions(true); selfTouch(); } catch (e) {} } // full re-scan + fresh spot; the observer covers everything between
 
@@ -182,7 +204,7 @@
     return p.ltp || 0;
   }
   function posAvg(p){ if (p.bepPrice > 0) return p.bepPrice; if (p.quantity < 0) return p.avgSellPrice; if (p.quantity > 0) return p.avgBuyPrice; return p.avgSellPrice || p.avgBuyPrice || 0; }
-  window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(15, 30, 0, 0); const _s = parseSymbol(p.symbol); return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: (ltp - avg) * p.quantity, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
+  window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(CLOSE_H, CLOSE_M, 0, 0); const _s = parseSymbol(p.symbol); return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: (ltp - avg) * p.quantity, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
   function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: (c - cA) * p.qty })); out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: (pp - (p.avg - cA)) * p.qty })); }); return out; }
   window._allLegs = () => expandLegs(window.parseOpenPos());
   window._bsLegs = () => { const b = activeBook(); return window._allLegs().filter(l => l.under === b); };
@@ -191,12 +213,15 @@
   window._bookMTM = () => window._bsLegs().reduce((s, p) => s + p.pnl, 0);
   const allowedMargin = () => (Store.user && Store.user.marginAllowed) || (Store.margin && Store.margin.allowedMargin) || DEFAULT_ALLOWED_MARGIN;
   const marginUsed = () => (Store.margin && Store.margin.totalMarginUsed) || 0;
-  window.BS = { norm(x){const a1=.254829592,a2=-.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=.3275911;const s=x<0?-1:1;x=Math.abs(x)/Math.sqrt(2);const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return .5*(1+s*y);}, d1(S,K,T,r,v){return(Math.log(S/K)+(r+.5*v*v)*T)/(v*Math.sqrt(T));}, price(S,K,T,r,v,t){if(T<=0)return t==='CE'?Math.max(0,S-K):Math.max(0,K-S);const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T);return t==='CE'?S*this.norm(d1)-K*Math.exp(-r*T)*this.norm(d2):K*Math.exp(-r*T)*this.norm(-d2)-S*this.norm(-d1);}, iv(S,K,T,r,mkt,t){if(T<=0||mkt<=0)return 0;let v=.3;for(let i=0;i<100;i++){const p=this.price(S,K,T,r,v,t),d1=this.d1(S,K,T,r,v),vega=S*Math.sqrt(T)*Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),diff=p-mkt;if(Math.abs(diff)<.001)break;if(vega<1e-10)break;v-=diff/vega;if(v<.001)v=.001;if(v>5)v=5;}return v;}, greeks(S,K,T,r,v,t,qty){if(T<=0||v<=0)return{delta:0,gamma:0,theta:0,vega:0};const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T),nd1=Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),sg=qty<0?-1:1,aq=Math.abs(qty);const delta=t==='CE'?this.norm(d1):this.norm(d1)-1;const gamma=nd1/(S*v*Math.sqrt(T));const theta=t==='CE'?(-S*nd1*v/(2*Math.sqrt(T))-r*K*Math.exp(-r*T)*this.norm(d2))/365:(-S*nd1*v/(2*Math.sqrt(T))+r*K*Math.exp(-r*T)*this.norm(-d2))/365;const vega=S*nd1*Math.sqrt(T)/100;return{delta:sg*delta*aq,gamma:sg*gamma*aq,theta:sg*theta*aq,vega:sg*vega*aq};} };
+  window.BS = { norm(x){const a1=.254829592,a2=-.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=.3275911;const s=x<0?-1:1;x=Math.abs(x)/Math.sqrt(2);const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return .5*(1+s*y);}, d1(S,K,T,r,v){return(Math.log(S/K)+(r+.5*v*v)*T)/(v*Math.sqrt(T));}, price(S,K,T,r,v,t){if(T<=0)return t==='CE'?Math.max(0,S-K):Math.max(0,K-S);const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T);return t==='CE'?S*this.norm(d1)-K*Math.exp(-r*T)*this.norm(d2):K*Math.exp(-r*T)*this.norm(-d2)-S*this.norm(-d1);}, iv(S,K,T,r,mkt,t){if(!(T>0)||!(mkt>0)||!(S>0)||!(K>0))return 0;const intr=t==='CE'?Math.max(0,S-K*Math.exp(-r*T)):Math.max(0,K*Math.exp(-r*T)-S);if(mkt<=intr+1e-6)return 0;let v=.3;for(let i=0;i<100;i++){const p=this.price(S,K,T,r,v,t),d1=this.d1(S,K,T,r,v),vega=S*Math.sqrt(T)*Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),diff=p-mkt;if(Math.abs(diff)<.001)break;if(vega<1e-10)break;v-=diff/vega;if(!isFinite(v))return 0;if(v<.001)v=.001;if(v>5)v=5;}if(!isFinite(v)||v<IV_MIN||v>IV_MAX)return 0;if(Math.abs(this.price(S,K,T,r,v,t)-mkt)>Math.max(.05,mkt*.02))return 0;return v;}, greeks(S,K,T,r,v,t,qty){if(T<=0||v<=0)return{delta:0,gamma:0,theta:0,vega:0};const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T),nd1=Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),sg=qty<0?-1:1,aq=Math.abs(qty);const delta=t==='CE'?this.norm(d1):this.norm(d1)-1;const gamma=nd1/(S*v*Math.sqrt(T));const theta=t==='CE'?(-S*nd1*v/(2*Math.sqrt(T))-r*K*Math.exp(-r*T)*this.norm(d2))/365:(-S*nd1*v/(2*Math.sqrt(T))+r*K*Math.exp(-r*T)*this.norm(-d2))/365;const vega=S*nd1*Math.sqrt(T)/100;return{delta:sg*delta*aq,gamma:sg*gamma*aq,theta:sg*theta*aq,vega:sg*vega*aq};} };
   window._getPosCtx = function (pos, spot){ const now = new Date();
     const legT = pos.map(p => { let d = 7; if (p.expiry instanceof Date && !isNaN(p.expiry)) d = Math.max(0.001, (p.expiry - now) / 864e5); return Math.max(d / 365, 0.0001); });
     const dte = legT.length ? Math.min(...legT) * 365 : 7, T = Math.max(dte / 365, 0.0001), r = 0.065;
-    const legIVs = pos.map((p, j) => window.BS.iv(spot, p.strike, legT[j], r, p.ltp || p.avg, p.type) || 0.15);
-    return { T, r, dte, legIVs, legT }; };
+    const raw = pos.map((p, j) => window.BS.iv(spot, p.strike, legT[j], r, p.ltp || p.avg, p.type));
+    const ok = raw.filter(v => v > 0).sort((a, b) => a - b);
+    const fb = ok.length ? ok[Math.floor(ok.length / 2)] : 0.15; // fall back to the median leg that DID solve
+    const legIVs = raw.map(v => v > 0 ? v : fb), ivBad = raw.length - ok.length;
+    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb }; };
   window._bsPnl = function (pos, s2, K, ivD){ ivD = ivD || 0; const legT = K.legT || pos.map(() => K.T);
     return pos.reduce((a, p, j) => { const iv = Math.max(0.01, (K.legIVs[j] || 0.15) + ivD); return a + (window.BS.price(s2, p.strike, legT[j], K.r, iv, p.type) - p.avg) * p.qty; }, 0); };
   window._netGreeks = function (pos, spot){ const K = window._getPosCtx(pos, spot); let nD=0,nG=0,nT=0,nV=0;
@@ -204,6 +229,7 @@
     return Object.assign({ nD, nG, nT, nV }, K); };
   window._breakevens = function (legs){ legs = legs || window._bsLegs(); const spot = window.getSpot(); if (!legs.length || !spot) return null; const ks = legs.map(l => l.strike), lo = Math.min(...ks, spot) * 0.9, hi = Math.max(...ks, spot) * 1.1, N = 800; const E = s => legs.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, s - l.strike) : Math.max(0, l.strike - s); return a + (it - l.avg) * l.qty; }, 0); const cr = []; let prev = E(lo), ps = lo; for (let i = 1; i <= N; i++){ const s = lo + (i / N) * (hi - lo), v = E(s); if ((prev >= 0) !== (v >= 0)) cr.push(ps + (-prev / (v - prev)) * (s - ps)); prev = v; ps = s; } return cr.length ? { lower: Math.min(...cr), upper: Math.max(...cr) } : null; };
 
+  const fmtAge = ms => ms < 1000 ? ms + 'ms' : ms < 60000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms / 60000) + 'm';
   const money = v => (v >= 0 ? '+' : '−') + '₹' + Math.abs(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
   const moneyK = v => { const a = Math.abs(v), t = a >= 1000 ? (a / 1000).toFixed(a >= 9950 ? 0 : 1).replace(/\.0$/, '') + 'K' : Math.round(a); return (v >= 0 ? '+' : '−') + '₹' + t; };
   const niceStep = x => { if (!(x > 0)) return 1000; const p = Math.pow(10, Math.floor(Math.log10(x))), f = x / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * p; };
@@ -225,6 +251,9 @@
       .live{display:flex;align-items:center;gap:6px;font-size:11px;color:${C.muted};}
       .live .d{width:7px;height:7px;border-radius:50%;background:${C.dn};transition:.3s;}
       .live.on .d{background:${C.accent};box-shadow:0 0 0 3px rgba(52,211,153,.18);}.live.on{color:${C.accent};}
+      .live.warn .d{background:${C.warn};box-shadow:0 0 0 3px rgba(251,191,36,.16);}.live.warn{color:${C.warn};}
+      .live.bad .d{background:${C.dn};box-shadow:0 0 0 3px rgba(255,90,82,.18);}.live.bad{color:${C.dn};}
+      .live.shut .d{background:${C.muted};}.live.shut{color:${C.muted};}
       .ic{background:transparent;border:none;color:${C.muted};font-size:15px;cursor:pointer;padding:0 3px;}.ic:hover{color:${C.text};}
       .sub{display:flex;gap:12px;padding:9px 14px 4px;font-size:12px;color:${C.sub};}.sub b{color:${C.text};}
       .wrap{padding:6px 12px 12px;}
@@ -241,7 +270,8 @@
       .books button{font-family:${MONO};font-size:10.5px;font-weight:700;letter-spacing:.04em;padding:4px 11px;border-radius:7px;border:1px solid ${C.line2};background:transparent;color:${C.muted};cursor:pointer;}
       .books button:hover{color:${C.text};border-color:${C.muted};}
       .books button.on{background:${C.accent};border-color:${C.accent};color:#04140d;}
-      #spay-tot,#spay-real{font-family:${MONO};}
+      #spay-tot,#spay-real,#spay-iv{font-family:${MONO};}
+      #spay-iv{color:${C.warn};cursor:help;}
       .mhdr{display:flex;align-items:center;gap:12px;margin:10px 0 3px;font-size:9.5px;color:${C.muted};font-family:${MONO};letter-spacing:.05em;}
       .mhdr .k{display:flex;align-items:center;gap:5px;}
       .mhdr .k:before{content:'';width:10px;height:3px;border-radius:2px;background:${C.accent};}
@@ -264,7 +294,7 @@
   function panelHTML(){ return `
       <div class="top" id="spay-top"><div class="brand"><span class="mk">S</span> Payoff &amp; Risk</div>
         <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic pop" id="spay-pop" title="Open in its own window">⤡</button><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
-      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-real" style="display:none"></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
+      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span><span id="spay-real" style="display:none"></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
       <div class="books" id="spay-books"></div>
       <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
         <div class="mhdr"><span class="k k1">Day P&amp;L ₹</span><span class="k k2">Δ net</span><span class="mnow" id="spay-mnow"></span></div>
@@ -466,7 +496,13 @@
   }
   // Sample EVERY book, not just the visible one — a book you're not looking at must not go dark.
   let _histTick = 0;
+  let _markSig = '';
+  function noteTicks(){
+    const sig = window._allLegs().map(l => l.symbol + ':' + l.ltp).join('|');
+    if (sig && sig !== _markSig){ _markSig = sig; Store.tickAt = Date.now(); }
+  }
   function recordAllBooks(){
+    if (marketState() !== 'OPEN') return; // don't pad the curve with a flat after-hours tail
     if (Date.now() - _histTick < HIST_MS - 250) return; _histTick = Date.now();
     const all = window._allLegs();
     underlyings().forEach(u => {
@@ -486,6 +522,8 @@
     if (rl){ rl.style.display = rv ? '' : 'none'; if (rv){ rl.textContent = 'booked ' + money(rv); rl.style.color = col(rv); } }
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'ALL ' + money(total); tot.style.color = col(total); } }
     if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? (dte * 24).toFixed(1) + 'h to expiry' : dte.toFixed(1) + 'd to expiry');
+      const iw = $id('spay-iv');
+      if (iw){ iw.style.display = K.ivBad ? '' : 'none'; if (K.ivBad) iw.textContent = '⚠ ' + K.ivBad + ' leg IV est'; }
       const G = window._netGreeks(pos, spot); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
       const be = window._breakevens(pos); if (be){ const inside = spot >= be.lower && spot <= be.upper, near = Math.min(Math.abs(be.upper - spot), Math.abs(spot - be.lower)); set('r-be', Math.round(be.lower).toLocaleString('en-IN') + '–' + Math.round(be.upper).toLocaleString('en-IN')); set('r-bes', inside ? near.toFixed(0) + ' pt to edge' : 'OUTSIDE', inside ? C.muted : C.dn); } else { set('r-be', '—'); set('r-bes', ''); }
@@ -493,12 +531,25 @@
     } else { ['g-d','g-g','g-t','g-v','r-ml','r-be','r-dl'].forEach(id => set(id, '—', C.muted)); set('spay-dte', ''); }
     const allowed = allowedMargin(), used = marginUsed(), pctm = Math.min(100, allowed ? used / allowed * 100 : 0);
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
-    const lv = $id('spay-live'); if (lv){ const on = Date.now() - Store.lastUpdate < 8000; lv.classList.toggle('on', on); set('spay-lt', on ? 'live' : (Store.lastUpdate ? 'stale' : 'connecting')); }
-    recordAllBooks();
+    // Status must describe OUR MARKS, not our network activity. Four honest states, worst-case wins.
+    const lv = $id('spay-live');
+    if (lv){
+      const mkt = marketState(), age = Store.markAt ? Date.now() - Store.markAt : -1;
+      const frozen = Store.tickAt ? Date.now() - Store.tickAt : -1;
+      let txt, cls;
+      if (mkt === 'CLOSED'){ txt = 'closed'; cls = 'shut'; }
+      else if (age < 0){ txt = 'connecting'; cls = 'shut'; }
+      else if (age > 30000){ txt = 'STALE ' + fmtAge(age); cls = 'bad'; }
+      else if (frozen > 180000){ txt = 'FROZEN ' + fmtAge(frozen); cls = 'warn'; } // open, but no mark has moved
+      else if (age > 5000){ txt = 'delayed ' + fmtAge(age); cls = 'warn'; }
+      else { txt = 'live'; cls = 'on'; }
+      lv.className = 'live ' + cls; set('spay-lt', txt);
+    }
+    noteTicks(); recordAllBooks();
     renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.textContent = on ? '⇲' : '⤡'; pb.title = on ? 'Dock back into the page' : 'Open in its own window'; }
-    const age = Store.lastScrape ? Date.now() - Store.lastScrape : -1;
-    set('spay-dbg', (Store.dbg || '') + (age >= 0 ? ' · ' + (age < 1000 ? age + 'ms' : (age / 1000).toFixed(1) + 's') : ''));
+    const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
+    set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
     positionPanel();
     const mn = $id('spay-mnow');
     if (mn){ const h = Store.hist[book] || []; mn.textContent = h.length ? h.length + ' pts · since ' + hhmm(h[0][0]) : ''; }

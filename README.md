@@ -58,6 +58,17 @@ breakevens + distance, margin used, decay-left. Hover the chart for spot + P&L. 
   The curve is **day P&L = open MTM + booked**, so exiting a leg doesn't drop a step in it; the header shows
   `booked ₹x` once anything is closed. Keeps recording on the Orders/Baskets tabs via its own quote poll.
 
+**Status is honest.** The badge describes *your marks*, not network activity: `live` (fresh),
+`delayed 12s`, `STALE 2m`, `FROZEN 4m` (market open but nothing is moving — a closed exchange serves a
+frozen feed, not an empty one), or `closed` outside 09:15–15:40 IST. If a leg's mark won't solve to a
+believable implied vol, the header says `⚠ 1 leg IV est` rather than quietly inventing greeks.
+
+**Your session token never leaves the closure** it's captured in — it is deliberately kept off the
+`window.SPAY` debug object so nothing else running on the broker's page can read it.
+
+**Tests:** open [`tests.html`](tests.html) next to the script to re-run the suite (pricing, implied vol,
+P&L signs, mixed expiries, realised-on-exit, session hours, day rollover).
+
 > If your broker serves the trade page at a **new URL**, add it to the `@match` lines at the top of the script.
 
 ---
