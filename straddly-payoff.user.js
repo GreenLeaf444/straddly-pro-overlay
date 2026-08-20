@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk, embedded natively. Reads positions from the page + self-fetches touchline for spot.
+// @version      2.1
+// @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
 // @match        https://*.straddly.com/*
@@ -131,12 +131,10 @@
 
   // ══ SHADOW PANEL ════════════════════════════════════════════════════════════
   let SR = null; const $ = s => SR ? SR.querySelector(s) : null, $id = i => $('#' + i);
-  function fitCanvas(id){ const cv = $id(id); if (!cv) return null; const w = Math.round(cv.getBoundingClientRect().width) || 420; cv.width = Math.max(w, 260); return cv; }
-  function buildPanel(){
-    if (document.getElementById('spay-host')) return;
-    const host = document.createElement('div'); host.id = 'spay-host'; host.style.cssText = 'all:initial;position:absolute;z-index:2147483646;top:120px;left:430px;width:500px;';
-    SR = host.attachShadow({ mode: 'open' }); window._SPR = SR;
-    const st = document.createElement('style'); st.textContent = `
+  function fitCanvas(id){ const cv = $id(id); if (!cv) return null; const w = Math.round(cv.getBoundingClientRect().width) || 420; cv.width = Math.max(w, 260);
+    if (POP && !POP.closed) cv.height = Math.max(280, Math.min(560, Math.round((POP.innerHeight || 800) * 0.46)));
+    return cv; }
+  function panelCSS(){ return `
       :host{all:initial;} *{box-sizing:border-box;margin:0;padding:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;}
       /* host is positioned (absolute/fixed) by JS to sit in the empty space below the positions tables — never inside Angular's DOM */
       #spay{position:static;width:100%;background:${C.panel};border:1px solid ${C.line};border-radius:16px;overflow:hidden;color:${C.text};box-shadow:0 14px 40px -20px rgba(0,0,0,.6);}
@@ -165,12 +163,22 @@
       .books button.on{background:${C.accent};border-color:${C.accent};color:#04140d;}
       #spay-tot{font-family:${MONO};}
       .brand{letter-spacing:.02em;}
-    `;
-    SR.appendChild(st);
-    const panel = document.createElement('div'); panel.id = 'spay';
-    panel.innerHTML = `
+      /* ── pop-out window: fills its own window, drops the floating-card chrome ── */
+      body.pop{background:${C.bg};margin:0;padding:16px;}
+      body.pop #spay{max-width:1180px;margin:0 auto;border-radius:12px;box-shadow:none;}
+      #spay-legs{display:none;}
+      body.pop #spay-legs{display:block;margin-top:8px;background:${C.card};border-radius:10px;overflow:hidden;}
+      #spay-legs table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:11.5px;}
+      #spay-legs th{text-align:right;color:${C.muted};font-weight:600;font-size:9.5px;letter-spacing:.06em;padding:7px 12px;border-bottom:1px solid ${C.line};}
+      #spay-legs td{text-align:right;padding:7px 12px;border-bottom:1px solid ${C.line};color:${C.sub};}
+      #spay-legs th:first-child,#spay-legs td:first-child{text-align:left;color:${C.text};}
+      #spay-legs tr:last-child td{border-bottom:none;}
+      .ic.pop{font-size:12px;font-weight:700;font-family:${MONO};border:1px solid ${C.line2};border-radius:6px;padding:2px 8px;line-height:1.5;}
+      .ic.pop:hover{border-color:${C.accent};color:${C.accent};}
+    `; }
+  function panelHTML(){ return `
       <div class="top" id="spay-top"><div class="brand"><span class="mk">S</span> Payoff &amp; Risk</div>
-        <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
+        <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic pop" id="spay-pop" title="Open in its own window">⤡</button><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
       <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
       <div class="books" id="spay-books"></div>
       <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
@@ -179,13 +187,53 @@
           <div class="rc"><div class="rl">Breakevens</div><div class="rv" id="r-be">—</div><div class="rs" id="r-bes">safe zone</div></div>
           <div class="rc"><div class="rl">Margin used</div><div class="rv" id="r-mg">—</div><div class="rs" id="r-mgs"></div></div>
           <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl" style="color:${C.up}">—</div><div class="rs">θ if pinned here</div></div></div>
-      </div>`;
-    SR.appendChild(panel);
+      </div>
+        <div id="spay-legs"></div>`; }
+
+  let POP = null, _mini = false;
+  function buildPanel(){
+    if (document.getElementById('spay-host')) return;
+    const host = document.createElement('div'); host.id = 'spay-host'; host.style.cssText = 'all:initial;position:absolute;z-index:2147483646;top:120px;left:430px;width:500px;';
+    SR = host.attachShadow({ mode: 'open' }); window._SPR = SR;
+    const st = document.createElement('style'); st.textContent = panelCSS(); SR.appendChild(st);
+    const panel = document.createElement('div'); panel.id = 'spay'; panel.innerHTML = panelHTML(); SR.appendChild(panel);
     (document.body || document.documentElement).appendChild(host); // stays on body — Angular can't reconcile it away
-    positionPanel();
-    let mini = false; $id('spay-min').onclick = () => { mini = !mini; $id('spay-cv').parentElement.style.display = mini ? 'none' : ''; };
-    $id('spay-close').onclick = () => { host.remove(); SR = null; };
+    positionPanel(); wirePanel();
   }
+  function wirePanel(){
+    const mn = $id('spay-min'); if (mn) mn.onclick = () => { _mini = !_mini; const w = $id('spay-cv').parentElement; if (w) w.style.display = _mini ? 'none' : ''; };
+    const cl = $id('spay-close'); if (cl) cl.onclick = () => { if (POP){ closePop(); return; } const h = document.getElementById('spay-host'); if (h) h.remove(); SR = null; };
+    const po = $id('spay-pop'); if (po) po.onclick = () => { if (POP && !POP.closed) closePop(); else popOut(); };
+    const cv = $id('spay-cv');
+    if (cv && !cv.__h){ cv.__h = 1; cv.style.cursor = 'crosshair';
+      cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { window.drawPayoff(); } catch (_) {} });
+      cv.addEventListener('mouseleave', () => { cv._cur = null; try { window.drawPayoff(); } catch (_) {} }); }
+  }
+  // ── pop-out: the panel gets its OWN window (second monitor), still fed live by this tab ──
+  function popOut(){
+    let w = null;
+    try { w = window.open('', 'straddly_payoff', 'width=1060,height=840,menubar=no,toolbar=no,location=no'); } catch (e) {}
+    if (!w){ const b = $id('spay-pop'); if (b){ b.textContent = 'pop-ups blocked'; b.style.color = C.warn; setTimeout(() => { b.textContent = '⤡'; b.style.color = ''; }, 3500); } return; }
+    try {
+      w.document.open();
+      w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Payoff & Risk — Straddly</title><style>' + panelCSS() + '</style></head><body class="pop"><div id="spay">' + panelHTML() + '</div></body></html>');
+      w.document.close();
+      POP = w; SR = w.document; window._SPR = SR;
+      const host = document.getElementById('spay-host'); if (host) host.style.display = 'none';
+      wirePanel();
+      w.addEventListener('resize', () => { try { window.refreshAll(); } catch (e) {} });
+      const t = setInterval(() => { if (!POP || POP.closed){ clearInterval(t); dockBack(); } }, 700);
+      window.refreshAll();
+    } catch (e) { dockBack(); }
+  }
+  function dockBack(){
+    POP = null;
+    const host = document.getElementById('spay-host');
+    if (host && host.shadowRoot){ SR = host.shadowRoot; host.style.display = ''; } else { SR = null; buildPanel(); }
+    window._SPR = SR; wirePanel(); positionPanel();
+    try { window.refreshAll(); } catch (e) {}
+  }
+  function closePop(){ const w = POP; POP = null; try { if (w && !w.closed) w.close(); } catch (e) {} dockBack(); }
   // locate the positions block on-screen, so we can float the panel right below it (in the empty space) without touching Angular's DOM
   function anchorRect(){
     try {
@@ -199,6 +247,7 @@
     } catch (e) { return null; }
   }
   function positionPanel(){
+    if (POP && !POP.closed) return; // panel is in its own window — nothing to place here
     const host = document.getElementById('spay-host'); if (!host) return;
     const a = Store.anchor; // set from the actual position rows (page coords) → sits right below them, on-screen
     if (a && Date.now() - a.at < 12000){
@@ -256,6 +305,12 @@
     el.innerHTML = u.map(x => '<button data-u="' + x + '"' + (x === active ? ' class="on"' : '') + '>' + x + '</button>').join('');
     [...el.querySelectorAll('button')].forEach(b => { b.onclick = () => { Store.book = b.dataset.u; recomputeSpot(); window.refreshAll(); }; });
   }
+  function renderLegs(){
+    const el = $id('spay-legs'); if (!el) return;
+    const legs = window._bsLegs(); if (!legs.length){ if (el.innerHTML) el.innerHTML = ''; return; }
+    const rows = legs.map(l => { const v = (l.ltp - l.avg) * l.qty; return '<tr><td>' + l.under + ' ' + l.strike + ' ' + l.type + '</td><td>' + l.qty + '</td><td>' + l.avg.toFixed(2) + '</td><td>' + l.ltp.toFixed(2) + '</td><td style="color:' + col(v) + '">' + money(v) + '</td></tr>'; }).join('');
+    el.innerHTML = '<table><thead><tr><th>Leg</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  }
   window.refreshAll = function (){
     if (!SR || !$id('spay')) return;
     const set = (id, v, c) => { const e = $id(id); if (!e) return; e.textContent = v; if (c) e.style.color = c; };
@@ -273,6 +328,8 @@
     const allowed = allowedMargin(), used = marginUsed(), pctm = Math.min(100, allowed ? used / allowed * 100 : 0);
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
     const lv = $id('spay-live'); if (lv){ const on = Date.now() - Store.lastUpdate < 8000; lv.classList.toggle('on', on); set('spay-lt', on ? 'live' : (Store.lastUpdate ? 'stale' : 'connecting')); }
+    renderLegs();
+    const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.textContent = on ? '⇲' : '⤡'; pb.title = on ? 'Dock back into the page' : 'Open in its own window'; }
     set('spay-dbg', Store.dbg || '');
     positionPanel();
     window.drawPayoff();
@@ -284,12 +341,13 @@
     setInterval(() => { try { poll(); } catch (e) {} }, POLL_MS);
     setInterval(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
     setInterval(() => { try {
+      if (POP && !POP.closed) return; // popped out — leave the host hidden
       if (!document.getElementById('spay-host')){ SR = null; buildPanel(); window.refreshAll(); return; }
       positionPanel();
     } catch (e) {} }, WATCHDOG_MS);
     window.addEventListener('scroll', () => { try { positionPanel(); } catch (e) {} }, true);
     window.addEventListener('resize', () => { try { positionPanel(); } catch (e) {} });
-    setTimeout(() => { const cv = $id('spay-cv'); if (cv && !cv.__h){ cv.__h = 1; cv.style.cursor = 'crosshair'; cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { window.drawPayoff(); } catch (_) {} }); cv.addEventListener('mouseleave', () => { cv._cur = null; try { window.drawPayoff(); } catch (_) {} }); } poll(); window.refreshAll(); }, 700);
+    setTimeout(() => { wirePanel(); poll(); window.refreshAll(); }, 700);
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();
