@@ -55,6 +55,8 @@ breakevens + distance, margin used, decay-left. Hover the chart for spot + P&L. 
   axis, so you can see position drift against the P&L that followed it. Hover for time + MTM + Δ.
   Recorded per book every 3s and kept in `localStorage` for the trading day, so a reload doesn't lose the
   morning. It starts empty and fills as the session runs — history can't be reconstructed retroactively.
+  The curve is **day P&L = open MTM + booked**, so exiting a leg doesn't drop a step in it; the header shows
+  `booked ₹x` once anything is closed. Keeps recording on the Orders/Baskets tabs via its own quote poll.
 
 > If your broker serves the trade page at a **new URL**, add it to the `@match` lines at the top of the script.
 

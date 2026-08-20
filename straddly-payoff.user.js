@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -25,7 +25,7 @@
   const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
 
   // ══ STORE ═══════════════════════════════════════════════════════════════════
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', lastUpdate: 0, auth: '', dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, auth: '', dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store;
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], 15, 30, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
@@ -101,13 +101,34 @@
       }); } catch (e) {}
       Store.anchor = { left: left + sx, top: bottom + sy, width: right - left, at: Date.now() };
     }
+    Store.posVisible = uniq.length > 0;
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
     else if (onPosView){ Store.positions = []; } // on the positions view with none open → genuinely flat
+    // never diff while the table is simply absent (Orders/Baskets) — that would bank every leg as "exited"
+    if (Store.posVisible || onPosView) reconcileRealised();
     // else: on another tab → keep last known positions (don't blank)
     watchTables(tables);
     Store.lastScrape = Date.now();
-    Store.dbg = 'pos ' + Store.positions.length + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
+    const qn = Store.positions.filter(p => Store.ltpBySym[p.symbol] > 0).length;
+    Store.dbg = 'pos ' + Store.positions.length + (Store.posVisible ? '' : ' · q' + qn + '/' + Store.positions.length) + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
     return Store.positions.length;
+  }
+  // When a leg is exited its open P&L vanishes from the book — bank it, so the day curve stays continuous
+  // instead of dropping a step. Only ever runs on a genuine Positions-tab read (see posVisible).
+  function reconcileRealised(){
+    const cur = {};
+    window.parseOpenPos().forEach(p => { (cur[p.under] = cur[p.under] || {})[p.symbol] = { qty: p.qty, pnl: p.pnl }; });
+    const books = {}; Object.keys(Store.prevLegs).forEach(b => { books[b] = 1; }); Object.keys(cur).forEach(b => { books[b] = 1; });
+    Object.keys(books).forEach(b => {
+      const prev = Store.prevLegs[b] || {}, now = cur[b] || {};
+      Object.keys(prev).forEach(sym => {
+        const o = prev[sym], nw = now[sym];
+        if (!nw){ Store.realised[b] = (Store.realised[b] || 0) + o.pnl; return; }            // fully exited
+        const shut = Math.abs(o.qty) - Math.abs(nw.qty);
+        if (shut > 0 && Math.abs(o.qty) > 0) Store.realised[b] = (Store.realised[b] || 0) + o.pnl * (shut / Math.abs(o.qty)); // partial
+      });
+    });
+    Store.prevLegs = cur;
   }
   // self-fetch the new touchline for the index (spot) + position symbols (fresh ltp), using captured auth
   function selfTouch(){
@@ -127,33 +148,39 @@
 
   // ══ MTM / DELTA HISTORY ═════════════════════════════════════════════════════
   // Can't be reconstructed after the fact, so we sample as we go and keep the day in localStorage.
-  const HIST_KEY = 'spay_hist_v1', HIST_MS = 3000, HIST_SAVE_MS = 15000, HIST_MAX = 8000;
+  const HIST_KEY = 'spay_hist_v2', HIST_MS = 3000, HIST_SAVE_MS = 15000, HIST_MAX = 8000;
   function dayKey(){ const d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
   function histLoad(){
     try { const raw = localStorage.getItem(HIST_KEY); if (!raw) return; const j = JSON.parse(raw);
-      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; }
+      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; Store.realised = j.r || {}; }
       else localStorage.removeItem(HIST_KEY); // new session day → start clean
     } catch (e) {}
   }
   let _lastSave = 0;
   function histSave(force){
     if (!force && Date.now() - _lastSave < HIST_SAVE_MS) return; _lastSave = Date.now();
-    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist })); } catch (e) {}
+    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist, r: Store.realised })); } catch (e) {}
   }
   function histPush(book, mtm, delta){
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
-    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; }
+    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
     const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
-    a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1)]);
+    a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(Store.realised[book] || 0)]);
     if (a.length > HIST_MAX) a.splice(0, a.length - HIST_MAX);
     histSave(false);
   }
   const hhmm = t => { const d = new Date(t * 1000); return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2); };
 
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
-  // scraped rows carry the portal's own live LTP → prefer it so our MTM always matches the screen exactly
-  function liveLtp(p){ if (p._scraped && p.ltp > 0) return p.ltp; if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId]; if (p.symbol && Store.ltpBySym[p.symbol] != null) return Store.ltpBySym[p.symbol]; return p.ltp || 0; }
+  // On the Positions tab, mirror the portal's own LTP column exactly. On Orders/Baskets that table is GONE and its
+  // last values are frozen — so prefer the quote from our own touchline poll, which keeps running regardless of tab.
+  function liveLtp(p){
+    if (Store.posVisible && p._scraped && p.ltp > 0) return p.ltp;
+    if (p.symbol && Store.ltpBySym[p.symbol] > 0) return Store.ltpBySym[p.symbol];
+    if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId];
+    return p.ltp || 0;
+  }
   function posAvg(p){ if (p.bepPrice > 0) return p.bepPrice; if (p.quantity < 0) return p.avgSellPrice; if (p.quantity > 0) return p.avgBuyPrice; return p.avgSellPrice || p.avgBuyPrice || 0; }
   window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(15, 30, 0, 0); const _s = parseSymbol(p.symbol); return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: (ltp - avg) * p.quantity, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
   function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: (c - cA) * p.qty })); out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: (pp - (p.avg - cA)) * p.qty })); }); return out; }
@@ -214,7 +241,7 @@
       .books button{font-family:${MONO};font-size:10.5px;font-weight:700;letter-spacing:.04em;padding:4px 11px;border-radius:7px;border:1px solid ${C.line2};background:transparent;color:${C.muted};cursor:pointer;}
       .books button:hover{color:${C.text};border-color:${C.muted};}
       .books button.on{background:${C.accent};border-color:${C.accent};color:#04140d;}
-      #spay-tot{font-family:${MONO};}
+      #spay-tot,#spay-real{font-family:${MONO};}
       .mhdr{display:flex;align-items:center;gap:12px;margin:10px 0 3px;font-size:9.5px;color:${C.muted};font-family:${MONO};letter-spacing:.05em;}
       .mhdr .k{display:flex;align-items:center;gap:5px;}
       .mhdr .k:before{content:'';width:10px;height:3px;border-radius:2px;background:${C.accent};}
@@ -237,10 +264,10 @@
   function panelHTML(){ return `
       <div class="top" id="spay-top"><div class="brand"><span class="mk">S</span> Payoff &amp; Risk</div>
         <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic pop" id="spay-pop" title="Open in its own window">⤡</button><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
-      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
+      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-real" style="display:none"></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
       <div class="books" id="spay-books"></div>
       <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
-        <div class="mhdr"><span class="k k1">MTM ₹</span><span class="k k2">Δ net</span><span class="mnow" id="spay-mnow"></span></div>
+        <div class="mhdr"><span class="k k1">Day P&amp;L ₹</span><span class="k k2">Δ net</span><span class="mnow" id="spay-mnow"></span></div>
         <canvas id="spay-mtm-cv" height="150"></canvas>
         <div class="grk"><div><div class="gl">Δ Delta</div><div class="gv" id="g-d">—</div></div><div><div class="gl">Γ Gamma</div><div class="gv" id="g-g">—</div></div><div><div class="gl">Θ /hr</div><div class="gv" id="g-t">—</div></div><div><div class="gl">Vega</div><div class="gv" id="g-v">—</div></div></div>
         <div class="risk"><div class="rc"><div class="rl">Max loss (±3%)</div><div class="rv" id="r-ml" style="color:${C.dn}">—</div><div class="rs">worst in stress range</div></div>
@@ -366,7 +393,7 @@
     const L = 52, R = 46, Tp = 10, B = 18, CW = W - L - R, CH = H - Tp - B;
     const t0 = a[0][0], t1 = a[a.length - 1][0], span = Math.max(120, t1 - t0);
     const X = t => L + ((t - t0) / span) * CW;
-    const ms = a.map(p => p[1]), ds = a.map(p => p[2]);
+    const ms = a.map(p => p[1] + (p[3] || 0)), ds = a.map(p => p[2]); // open + realised = day P&L
     const mStep = niceStep(((Math.max(0, ...ms) - Math.min(0, ...ms)) || 1000) / 3);
     const mMin = Math.floor(Math.min(0, ...ms) / mStep) * mStep, mMax = Math.ceil(Math.max(0, ...ms) / mStep) * mStep;
     const Y = v => Tp + CH - ((v - mMin) / ((mMax - mMin) || 1)) * CH;
@@ -385,31 +412,31 @@
       ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(hhmm(t), x, H - 5); }
     // filled area, green above the zero line and red below it
     const z = Math.max(Tp, Math.min(Tp + CH, Y(0)));
-    const area = () => { ctx.beginPath(); ctx.moveTo(X(a[0][0]), z); a.forEach(q => ctx.lineTo(X(q[0]), Y(q[1]))); ctx.lineTo(X(a[a.length - 1][0]), z); ctx.closePath(); };
+    const area = () => { ctx.beginPath(); ctx.moveTo(X(a[0][0]), z); a.forEach((q, i) => ctx.lineTo(X(q[0]), Y(ms[i]))); ctx.lineTo(X(a[a.length - 1][0]), z); ctx.closePath(); };
     ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = 'rgba(74,222,128,.15)'; ctx.fill(); ctx.restore();
     ctx.save(); ctx.beginPath(); ctx.rect(L, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = 'rgba(255,90,82,.15)'; ctx.fill(); ctx.restore();
     // delta first (thin, behind), then MTM on top
     ctx.strokeStyle = C.ce; ctx.lineWidth = 1.3; ctx.beginPath(); a.forEach((q, i) => { const x = X(q[0]), y = YD(q[2]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
     ctx.lineWidth = 1.7;
-    for (let i = 1; i < a.length; i++){ const p0 = a[i - 1], p1 = a[i];
-      ctx.strokeStyle = (p0[1] >= 0 && p1[1] >= 0) ? C.up : (p0[1] < 0 && p1[1] < 0) ? C.dn : C.muted;
-      ctx.beginPath(); ctx.moveTo(X(p0[0]), Y(p0[1])); ctx.lineTo(X(p1[0]), Y(p1[1])); ctx.stroke(); }
-    const lastP = a[a.length - 1];
-    ctx.beginPath(); ctx.arc(X(lastP[0]), Y(lastP[1]), 3, 0, 7); ctx.fillStyle = lastP[1] >= 0 ? C.up : C.dn; ctx.fill();
+    for (let i = 1; i < a.length; i++){
+      ctx.strokeStyle = (ms[i - 1] >= 0 && ms[i] >= 0) ? C.up : (ms[i - 1] < 0 && ms[i] < 0) ? C.dn : C.muted;
+      ctx.beginPath(); ctx.moveTo(X(a[i - 1][0]), Y(ms[i - 1])); ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.stroke(); }
+    const lastV = ms[ms.length - 1];
+    ctx.beginPath(); ctx.arc(X(a[a.length - 1][0]), Y(lastV), 3, 0, 7); ctx.fillStyle = lastV >= 0 ? C.up : C.dn; ctx.fill();
     // hover crosshair
     if (cv._cur != null){
       const tt = t0 + ((cv._cur - L) / CW) * span;
-      const nb = a.reduce((b, q) => Math.abs(q[0] - tt) < Math.abs(b[0] - tt) ? q : b, a[0]);
-      const cx = X(nb[0]);
+      let ni = 0; for (let i = 1; i < a.length; i++) if (Math.abs(a[i][0] - tt) < Math.abs(a[ni][0] - tt)) ni = i;
+      const nb = a[ni], nv = ms[ni], cx = X(nb[0]);
       ctx.strokeStyle = 'rgba(255,255,255,.28)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
-      ctx.beginPath(); ctx.arc(cx, Y(nb[1]), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, Y(nv), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
       ctx.beginPath(); ctx.arc(cx, YD(nb[2]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
-      const lbl = hhmm(nb[0]) + '  ' + money(nb[1]) + '  Δ' + nb[2];
+      const lbl = hhmm(nb[0]) + '  ' + money(nv) + (nb[3] ? '  (R ' + money(nb[3]) + ')' : '') + '  Δ' + nb[2];
       ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14;
       let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx);
       ctx.fillStyle = 'rgba(5,6,7,.96)'; ctx.fillRect(tx, Tp + 2, tw, 18);
       ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18);
-      ctx.fillStyle = nb[1] >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15);
+      ctx.fillStyle = nv >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15);
     }
   };
 
@@ -435,6 +462,8 @@
     renderBooks(book);
     set('spay-spot', book + ' ' + (spot ? spot.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '—'));
     set('spay-mtm', pos.length ? money(mtm) : '—', col(mtm));
+    const rl = $id('spay-real'); const rv = Store.realised[book] || 0;
+    if (rl){ rl.style.display = rv ? '' : 'none'; if (rv){ rl.textContent = 'booked ' + money(rv); rl.style.color = col(rv); } }
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'ALL ' + money(total); tot.style.color = col(total); } }
     if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? (dte * 24).toFixed(1) + 'h to expiry' : dte.toFixed(1) + 'd to expiry');
       const G = window._netGreeks(pos, spot); histPush(book, mtm, G.nD); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
