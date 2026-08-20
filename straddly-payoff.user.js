@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
+// @version      2.2
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -19,7 +19,7 @@
 */
 (function () {
   'use strict';
-  const POLL_MS = 3000, UI_REFRESH_MS = 1500, WATCHDOG_MS = 2500, DEFAULT_ALLOWED_MARGIN = 114113.08;
+  const POLL_MS = 2000, UI_REFRESH_MS = 700, WATCHDOG_MS = 2500, SYNC_MS = 60, DEFAULT_ALLOWED_MARGIN = 114113.08;
   // "TradingAlgo" vibe — near-black, bright terminal green, orange-red, mono numbers
   const C = { bg:'#050607', panel:'#0a0b0d', card:'#101216', line:'#191c21', line2:'#24282e', text:'#e9edf0', muted:'#697079', sub:'#9aa3af', accent:'#4ade80', accent2:'#22c55e', up:'#4ade80', dn:'#ff5a52', warn:'#fbbf24', ce:'#38bdf8', pe:'#ff5a52', sd:'#a78bfa' };
   const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
@@ -47,13 +47,38 @@
   // ── scrape open positions from the page table (CloudFront build streams positions via socket, not REST) ──
   const MON = { JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12' };
   const INSTR_RE = /(NIFTY BANK|BANKNIFTY|SENSEX|NIFTY)\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{4,6})\s*(CE|PE|SD)/i;
-  function scrapePositions(){
-    const rows = [...document.querySelectorAll('tr, mat-row, [role="row"]')], out = [], rects = []; const yr = new Date().getFullYear();
+  // MutationObserver beats polling on two counts: it fires the moment the portal writes a new LTP/P&L,
+  // and it keeps firing when the portal tab is in the BACKGROUND (timers there get throttled to ~1s by Chrome).
+  const OBS = { tables: [], mo: null, last: 0, dirty: false, hits: 0, syncs: 0 }; window.__SPAY_OBS = OBS;
+  function syncNow(){ OBS.syncs++; OBS.last = Date.now(); OBS.dirty = false; try { scrapePositions(); window.refreshAll(); } catch (e) {} }
+  function onPortalMutate(){
+    OBS.hits++;
+    const gap = Date.now() - OBS.last;
+    if (gap >= SYNC_MS){ syncNow(); return; }          // run inline — never wait on a throttled timer
+    if (OBS.dirty) return; OBS.dirty = true;
+    const w = (POP && !POP.closed) ? POP : window;      // a visible pop-out isn't throttled; the hidden opener is
+    w.setTimeout(() => { if (OBS.dirty) syncNow(); }, SYNC_MS - gap);
+  }
+  function watchTables(tables){
+    if (!tables.length) return;
+    const same = tables.length === OBS.tables.length && tables.every((t, i) => OBS.tables[i] === t && document.contains(t));
+    if (same) return;
+    if (OBS.mo) OBS.mo.disconnect();
+    OBS.mo = new MutationObserver(onPortalMutate);
+    tables.forEach(t => { try { OBS.mo.observe(t, { subtree: true, childList: true, characterData: true }); } catch (e) {} });
+    OBS.tables = tables.slice();
+  }
+  function scrapePositions(full){
+    const live = OBS.tables.length && OBS.tables.every(t => document.contains(t));
+    const scope = (!full && live) ? OBS.tables : [document];   // scoped re-reads are cheap enough to run per tick
+    const rows = []; scope.forEach(sc => { rows.push(...sc.querySelectorAll('tr, mat-row, [role="row"]')); });
+    const out = [], rects = [], tables = []; const yr = new Date().getFullYear();
     rows.forEach(tr => {
       const cells = [...tr.querySelectorAll('td, mat-cell, [role="cell"], th')]; if (cells.length < 4) return;
       let ii = -1, m = null; for (let i = 0; i < cells.length; i++){ const mm = cells[i].textContent.match(INSTR_RE); if (mm){ ii = i; m = mm; break; } }
       if (ii < 0) return;
       const rr = tr.getBoundingClientRect(); if (rr.width > 100 && rr.height > 4) rects.push(rr);
+      const tbl = (tr.closest && tr.closest('table, mat-table, [role="table"]')) || tr.parentElement; if (tbl && tables.indexOf(tbl) < 0) tables.push(tbl);
       const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
       const nums = cells.slice(ii + 1).map(c => { const t = c.textContent.replace(/[₹,\s]/g, ''); return /^-?\d+(\.\d+)?$/.test(t) ? parseFloat(t) : null; }).filter(v => v !== null);
       if (nums.length < 3) return;
@@ -79,6 +104,8 @@
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
     else if (onPosView){ Store.positions = []; } // on the positions view with none open → genuinely flat
     // else: on another tab → keep last known positions (don't blank)
+    watchTables(tables);
+    Store.lastScrape = Date.now();
     Store.dbg = 'pos ' + Store.positions.length + (Store.spot ? ' · spot ' + Math.round(Store.spot) : ' · spot ?') + (Store.auth ? ' · auth✓' : ' · auth✗');
     return Store.positions.length;
   }
@@ -96,7 +123,7 @@
   XMLHttpRequest.prototype.open = function (m, u){ this.__s = { url: String(u) }; return oO.apply(this, arguments); };
   XMLHttpRequest.prototype.setRequestHeader = function (k, v){ if (/^authorization$/i.test(k) && v) Store.auth = v; return oH.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function (body){ const d = this.__s; if (d) this.addEventListener('load', () => { try { ingest(d.url, this.responseText); } catch (e) {} }); return oS.apply(this, arguments); };
-  function poll(){ try { scrapePositions(); selfTouch(); } catch (e) {} }
+  function poll(){ try { scrapePositions(true); selfTouch(); } catch (e) {} } // full re-scan + fresh spot; the observer covers everything between
 
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
   // scraped rows carry the portal's own live LTP → prefer it so our MTM always matches the screen exactly
@@ -218,7 +245,7 @@
       w.document.open();
       w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Payoff & Risk — Straddly</title><style>' + panelCSS() + '</style></head><body class="pop"><div id="spay">' + panelHTML() + '</div></body></html>');
       w.document.close();
-      POP = w; SR = w.document; window._SPR = SR;
+      POP = w; SR = w.document; window._SPR = SR; startTimers(w);
       const host = document.getElementById('spay-host'); if (host) host.style.display = 'none';
       wirePanel();
       w.addEventListener('resize', () => { try { window.refreshAll(); } catch (e) {} });
@@ -230,7 +257,7 @@
     POP = null;
     const host = document.getElementById('spay-host');
     if (host && host.shadowRoot){ SR = host.shadowRoot; host.style.display = ''; } else { SR = null; buildPanel(); }
-    window._SPR = SR; wirePanel(); positionPanel();
+    window._SPR = SR; startTimers(window); wirePanel(); positionPanel();
     try { window.refreshAll(); } catch (e) {}
   }
   function closePop(){ const w = POP; POP = null; try { if (w && !w.closed) w.close(); } catch (e) {} dockBack(); }
@@ -330,16 +357,25 @@
     const lv = $id('spay-live'); if (lv){ const on = Date.now() - Store.lastUpdate < 8000; lv.classList.toggle('on', on); set('spay-lt', on ? 'live' : (Store.lastUpdate ? 'stale' : 'connecting')); }
     renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.textContent = on ? '⇲' : '⤡'; pb.title = on ? 'Dock back into the page' : 'Open in its own window'; }
-    set('spay-dbg', Store.dbg || '');
+    const age = Store.lastScrape ? Date.now() - Store.lastScrape : -1;
+    set('spay-dbg', (Store.dbg || '') + (age >= 0 ? ' · ' + (age < 1000 ? age + 'ms' : (age / 1000).toFixed(1) + 's') : ''));
     positionPanel();
     window.drawPayoff();
   };
 
   // ══ BOOT + WATCHDOG ═════════════════════════════════════════════════════════
+  // Chrome throttles timers in a hidden tab (~1s, then ~1/min). When popped out, the portal tab IS hidden —
+  // so host the clocks in the pop-out window, which is the visible one.
+  let _tm = [];
+  function startTimers(w){
+    _tm.forEach(t => { try { t.w.clearInterval(t.id); } catch (e) {} }); _tm = [];
+    const add = (fn, ms) => { try { _tm.push({ w, id: w.setInterval(fn, ms) }); } catch (e) {} };
+    add(() => { try { poll(); } catch (e) {} }, POLL_MS);
+    add(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
+  }
   function boot(){
     buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
-    setInterval(() => { try { poll(); } catch (e) {} }, POLL_MS);
-    setInterval(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
+    startTimers(window);
     setInterval(() => { try {
       if (POP && !POP.closed) return; // popped out — leave the host hidden
       if (!document.getElementById('spay-host')){ SR = null; buildPanel(); window.refreshAll(); return; }

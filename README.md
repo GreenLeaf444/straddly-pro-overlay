@@ -45,6 +45,13 @@ Dark "terminal" styling with a dotted green/red payoff curve.
 Shows: payoff (BS-now, green profit / red loss) with breakeven band, net Δ/Γ/Θ/Vega, max-loss (stress),
 breakevens + distance, margin used, decay-left. Hover the chart for spot + P&L. Same privacy — nothing leaves your browser.
 
+- **Multi-book** — NIFTY / BANKNIFTY / SENSEX each get their own tab, own spot, own payoff. Header shows the
+  selected book's MTM plus an **ALL** total.
+- **Pop out (⤡)** — opens the dashboard in its own window for a second monitor, with a per-leg table.
+  Keep the portal tab open; it's the data source.
+- **Live sync** — mirrors the portal within ~1ms of it updating (MutationObserver, not polling). The small
+  grey readout in the header shows how fresh the numbers are.
+
 > If your broker serves the trade page at a **new URL**, add it to the `@match` lines at the top of the script.
 
 ---
