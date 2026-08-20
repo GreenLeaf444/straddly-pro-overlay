@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -385,47 +385,55 @@
   };
 
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
+  const MIN_SPAN = 1800, GAP_S = 45, Y_FLOOR = 1000; // 30-min minimum frame; don't draw across recording gaps
   window.drawMtm = function (){
     const cv = fitCanvas('spay-mtm-cv', 0.22); if (!cv) return;
     const ctx = cv.getContext('2d'), W = cv.width, H = cv.height; ctx.clearRect(0, 0, W, H);
     const a = Store.hist[activeBook()] || [];
-    if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '11px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording MTM…' : 'MTM curve starts recording now', W / 2, H / 2); return; }
-    const L = 52, R = 46, Tp = 10, B = 18, CW = W - L - R, CH = H - Tp - B;
-    const t0 = a[0][0], t1 = a[a.length - 1][0], span = Math.max(120, t1 - t0);
-    const X = t => L + ((t - t0) / span) * CW;
+    if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '11px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording…' : 'day P&L starts recording now', W / 2, H / 2); return; }
+    const L2 = 52, R = 46, Tp = 10, B = 18, CW = W - L2 - R, CH = H - Tp - B;
+    // left-anchored, minimum 30-minute frame so the curve grows into a stable window instead of rescaling every tick
+    const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
+    const X = t => L2 + ((t - t0) / span) * CW;
     const ms = a.map(p => p[1] + (p[3] || 0)), ds = a.map(p => p[2]); // open + realised = day P&L
-    const mStep = niceStep(((Math.max(0, ...ms) - Math.min(0, ...ms)) || 1000) / 3);
-    const mMin = Math.floor(Math.min(0, ...ms) / mStep) * mStep, mMax = Math.ceil(Math.max(0, ...ms) / mStep) * mStep;
+    let lo = Math.min(0, ...ms), hi = Math.max(0, ...ms);
+    if (hi - lo < Y_FLOOR){ const c = (hi + lo) / 2; lo = c - Y_FLOOR / 2; hi = c + Y_FLOOR / 2; } // don't zoom into tick noise
+    const mStep = niceStep(((hi - lo) || 1000) / 3);
+    const mMin = Math.floor(lo / mStep) * mStep, mMax = Math.ceil(hi / mStep) * mStep;
     const Y = v => Tp + CH - ((v - mMin) / ((mMax - mMin) || 1)) * CH;
     let dMin = Math.min(...ds), dMax = Math.max(...ds);
     if (dMax - dMin < 1){ const c = (dMax + dMin) / 2; dMin = c - 1; dMax = c + 1; }
     const dp = (dMax - dMin) * 0.18; dMin -= dp; dMax += dp;
     const YD = v => Tp + CH - ((v - dMin) / ((dMax - dMin) || 1)) * CH;
     ctx.font = '9px ' + MONO;
-    // left axis = money, right axis = delta
     for (let v = mMin; v <= mMax + 1e-9; v += mStep){ const y = Y(v);
-      ctx.strokeStyle = Math.abs(v) < mStep * 0.01 ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
-      ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L - 5, y + 3); }
+      ctx.strokeStyle = Math.abs(v) < mStep * 0.01 ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L2, y); ctx.lineTo(W - R, y); ctx.stroke();
+      ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L2 - 5, y + 3); }
     [dMin, (dMin + dMax) / 2, dMax].forEach(v => { ctx.fillStyle = C.ce; ctx.textAlign = 'left'; ctx.fillText(v.toFixed(0), W - R + 5, YD(v) + 3); });
     for (let i = 0; i <= 3; i++){ const t = t0 + (i / 3) * span, x = X(t);
       ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke();
       ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(hhmm(t), x, H - 5); }
-    // filled area, green above the zero line and red below it
+    // split into contiguous runs — a jump means we weren't recording (other book / tab closed / reload)
+    const runs = []; let st = 0;
+    for (let i = 1; i < a.length; i++) if (a[i][0] - a[i - 1][0] > GAP_S){ runs.push([st, i - 1]); st = i; }
+    runs.push([st, a.length - 1]);
     const z = Math.max(Tp, Math.min(Tp + CH, Y(0)));
-    const area = () => { ctx.beginPath(); ctx.moveTo(X(a[0][0]), z); a.forEach((q, i) => ctx.lineTo(X(q[0]), Y(ms[i]))); ctx.lineTo(X(a[a.length - 1][0]), z); ctx.closePath(); };
-    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = 'rgba(74,222,128,.15)'; ctx.fill(); ctx.restore();
-    ctx.save(); ctx.beginPath(); ctx.rect(L, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = 'rgba(255,90,82,.15)'; ctx.fill(); ctx.restore();
-    // delta first (thin, behind), then MTM on top
-    ctx.strokeStyle = C.ce; ctx.lineWidth = 1.3; ctx.beginPath(); a.forEach((q, i) => { const x = X(q[0]), y = YD(q[2]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
-    ctx.lineWidth = 1.7;
-    for (let i = 1; i < a.length; i++){
-      ctx.strokeStyle = (ms[i - 1] >= 0 && ms[i] >= 0) ? C.up : (ms[i - 1] < 0 && ms[i] < 0) ? C.dn : C.muted;
-      ctx.beginPath(); ctx.moveTo(X(a[i - 1][0]), Y(ms[i - 1])); ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.stroke(); }
+    runs.forEach(([s0, s1]) => {
+      if (s1 <= s0) return;
+      const area = () => { ctx.beginPath(); ctx.moveTo(X(a[s0][0]), z); for (let i = s0; i <= s1; i++) ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.lineTo(X(a[s1][0]), z); ctx.closePath(); };
+      ctx.save(); ctx.beginPath(); ctx.rect(L2, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = 'rgba(74,222,128,.15)'; ctx.fill(); ctx.restore();
+      ctx.save(); ctx.beginPath(); ctx.rect(L2, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = 'rgba(255,90,82,.15)'; ctx.fill(); ctx.restore();
+      ctx.strokeStyle = C.ce; ctx.lineWidth = 1.3; ctx.beginPath();
+      for (let i = s0; i <= s1; i++){ const x = X(a[i][0]), y = YD(ds[i]); i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke(); ctx.lineWidth = 1.7;
+      for (let i = s0 + 1; i <= s1; i++){
+        ctx.strokeStyle = (ms[i - 1] >= 0 && ms[i] >= 0) ? C.up : (ms[i - 1] < 0 && ms[i] < 0) ? C.dn : C.muted;
+        ctx.beginPath(); ctx.moveTo(X(a[i - 1][0]), Y(ms[i - 1])); ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.stroke(); }
+    });
     const lastV = ms[ms.length - 1];
     ctx.beginPath(); ctx.arc(X(a[a.length - 1][0]), Y(lastV), 3, 0, 7); ctx.fillStyle = lastV >= 0 ? C.up : C.dn; ctx.fill();
-    // hover crosshair
     if (cv._cur != null){
-      const tt = t0 + ((cv._cur - L) / CW) * span;
+      const tt = t0 + ((cv._cur - L2) / CW) * span;
       let ni = 0; for (let i = 1; i < a.length; i++) if (Math.abs(a[i][0] - tt) < Math.abs(a[ni][0] - tt)) ni = i;
       const nb = a[ni], nv = ms[ni], cx = X(nb[0]);
       ctx.strokeStyle = 'rgba(255,255,255,.28)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
@@ -439,6 +447,7 @@
       ctx.fillStyle = nv >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15);
     }
   };
+
 
   // ══ REFRESH ═════════════════════════════════════════════════════════════════
   // one payoff per underlying — NIFTY and BANKNIFTY are different books and must never share a spot
@@ -455,6 +464,17 @@
     const rows = legs.map(l => { const v = (l.ltp - l.avg) * l.qty; return '<tr><td>' + l.under + ' ' + l.strike + ' ' + l.type + '</td><td>' + l.qty + '</td><td>' + l.avg.toFixed(2) + '</td><td>' + l.ltp.toFixed(2) + '</td><td style="color:' + col(v) + '">' + money(v) + '</td></tr>'; }).join('');
     el.innerHTML = '<table><thead><tr><th>Leg</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
+  // Sample EVERY book, not just the visible one — a book you're not looking at must not go dark.
+  let _histTick = 0;
+  function recordAllBooks(){
+    if (Date.now() - _histTick < HIST_MS - 250) return; _histTick = Date.now();
+    const all = window._allLegs();
+    underlyings().forEach(u => {
+      const lg = all.filter(l => l.under === u); if (!lg.length) return;
+      const sp = Store.spots[u] || spotFor(u); if (!sp) return;
+      try { histPush(u, lg.reduce((s, p) => s + p.pnl, 0), window._netGreeks(lg, sp).nD); } catch (e) {}
+    });
+  }
   window.refreshAll = function (){
     if (!SR || !$id('spay')) return;
     const set = (id, v, c) => { const e = $id(id); if (!e) return; e.textContent = v; if (c) e.style.color = c; };
@@ -466,7 +486,7 @@
     if (rl){ rl.style.display = rv ? '' : 'none'; if (rv){ rl.textContent = 'booked ' + money(rv); rl.style.color = col(rv); } }
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'ALL ' + money(total); tot.style.color = col(total); } }
     if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? (dte * 24).toFixed(1) + 'h to expiry' : dte.toFixed(1) + 'd to expiry');
-      const G = window._netGreeks(pos, spot); histPush(book, mtm, G.nD); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
+      const G = window._netGreeks(pos, spot); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
       const be = window._breakevens(pos); if (be){ const inside = spot >= be.lower && spot <= be.upper, near = Math.min(Math.abs(be.upper - spot), Math.abs(spot - be.lower)); set('r-be', Math.round(be.lower).toLocaleString('en-IN') + '–' + Math.round(be.upper).toLocaleString('en-IN')); set('r-bes', inside ? near.toFixed(0) + ' pt to edge' : 'OUTSIDE', inside ? C.muted : C.dn); } else { set('r-be', '—'); set('r-bes', ''); }
       const decay = pos.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, spot - l.strike) : Math.max(0, l.strike - spot); return a + (l.ltp - it) * (-l.qty); }, 0); set('r-dl', money(decay), decay >= 0 ? C.up : C.dn);
@@ -474,6 +494,7 @@
     const allowed = allowedMargin(), used = marginUsed(), pctm = Math.min(100, allowed ? used / allowed * 100 : 0);
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
     const lv = $id('spay-live'); if (lv){ const on = Date.now() - Store.lastUpdate < 8000; lv.classList.toggle('on', on); set('spay-lt', on ? 'live' : (Store.lastUpdate ? 'stale' : 'connecting')); }
+    recordAllBooks();
     renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.textContent = on ? '⇲' : '⤡'; pb.title = on ? 'Dock back into the page' : 'Open in its own window'; }
     const age = Store.lastScrape ? Date.now() - Store.lastScrape : -1;
