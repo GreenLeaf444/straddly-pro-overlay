@@ -175,7 +175,7 @@
         {status:'OPEN',symbol:'NIFTY26082024200PE',optionType:'PE',strikePrice:lo+40,quantity:-20,avgSellPrice:40,bepPrice:40,ltp:40-dayPnl/40,_scraped:true,expiryDate:e.toISOString()},
         {status:'OPEN',symbol:'NIFTY26082024300CE',optionType:'CE',strikePrice:hi-40,quantity:-20,avgSellPrice:40,bepPrice:40,ltp:40-dayPnl/40,_scraped:true,expiryDate:e.toISOString()}];
       S.spots={NIFTY:spot}; S.book='NIFTY'; S.realised={}; S.posVisible=true;
-      S.markAt=Date.now(); S.tickAt=Date.now();   // healthy feed
+      S.markAt=Date.now(); S.tickAt=Date.now(); S.peak={};   // healthy feed, no high-water mark
     }
     t('nothing fires while the market is CLOSED', function(){
       armAll(); F.AL.on=true; F.AL.health=true; F.AL.be=40;
@@ -212,6 +212,31 @@
       openBook(0, 26000, 24100, 24400);
       F.evalAlerts('OPEN'); F.AL.on=true;
       return F.ALOG.length===0 || 'fired while off'; });
+
+    t('the leg cache self-invalidates outside a refresh frame', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082024200PE',optionType:'PE',strikePrice:24200,quantity:-20,
+                    avgSellPrice:50,bepPrice:50,ltp:40,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; var a=window._allLegs().length;
+      S.positions=[];                       // change positions WITHOUT calling refreshAll
+      var b=window._allLegs().length;
+      return (a===1 && b===0) || 'legs went '+a+' -> '+b+' (cache went stale)'; });
+    t('giveback fires when an open profit is handed back', function(){
+      armAll(); F.AL.on=true; F.AL.health=false; F.AL.be=0; F.AL.tgt=0; F.AL.stop=0; F.AL.dlt=0; F.AL.give=3000;
+      openBook(1500, 24250, 24100, 24400); S.peak={NIFTY:5000};
+      F.evalAlerts('OPEN');
+      var ok=F.ALOG.length===1 && /GIVING BACK/.test(F.ALOG[0].msg);
+      F.AL.give=0; return ok || 'log: '+JSON.stringify(F.ALOG.map(function(a){return a.msg;})); });
+    t('no giveback while sitting at the day high', function(){
+      armAll(); F.AL.health=false; F.AL.be=0; F.AL.tgt=0; F.AL.stop=0; F.AL.dlt=0; F.AL.give=3000;
+      openBook(1500, 24250, 24100, 24400); S.peak={NIFTY:1500};
+      F.evalAlerts('OPEN'); var ok=F.ALOG.length===0; F.AL.give=0;
+      return ok || 'fired: '+F.ALOG[0].msg; });
+    t('no giveback on a day that never went green', function(){
+      armAll(); F.AL.health=false; F.AL.be=0; F.AL.tgt=0; F.AL.stop=0; F.AL.dlt=0; F.AL.give=500;
+      openBook(-2000, 24250, 24100, 24400); S.peak={NIFTY:-200};
+      F.evalAlerts('OPEN'); var ok=F.ALOG.length===0; F.AL.give=0;
+      return ok || 'fired: '+F.ALOG[0].msg; });
 
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';

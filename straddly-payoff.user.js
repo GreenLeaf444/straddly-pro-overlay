@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      4.1
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -21,10 +21,30 @@
   'use strict';
   const POLL_MS = 2000, UI_REFRESH_MS = 700, WATCHDOG_MS = 2500, SYNC_MS = 60, DEFAULT_ALLOWED_MARGIN = 114113.08;
   // "TradingAlgo" vibe — near-black, bright terminal green, orange-red, mono numbers
-  const C = { bg:'#050609', panel:'#0a0c0f', card:'#0f1217', line:'#171a20', line2:'#232830',
-              text:'#e8eaed', sub:'#8b939c', muted:'#5f666f', dim:'#474d55',
-              accent:'#3fb950', accent2:'#2ea043', up:'#3fb950', dn:'#f0563f', warn:'#d29922',
-              ce:'#4b93d1', pe:'#f0563f', sd:'#a371f7' };
+  // Two themes. Colour carries meaning (P&L sign, alert state) in both; nothing is decorative.
+  // Light is a warm paper tone, not white — white next to a dark chart is glare, and the greens/reds must
+  // darken or they fail contrast on a light ground.
+  const THEMES = {
+    dark: { bg:'#050609', panel:'#0a0c0f', card:'#0f1217', line:'#171a20', line2:'#232830',
+            text:'#e8eaed', sub:'#9aa2ac', muted:'#7a818b', dim:'#5a606a',
+            accent:'#3fb950', accent2:'#2ea043', up:'#3fb950', dn:'#f0563f', warn:'#d29922',
+            ce:'#4b93d1', pe:'#f0563f', sd:'#a371f7',
+            upFill:'rgba(63,185,80,.09)', dnFill:'rgba(240,86,63,.09)',
+            upArea:'rgba(63,185,80,.15)', dnArea:'rgba(240,86,63,.15)',
+            goodBg:'rgba(63,185,80,.07)', warnBg:'rgba(210,153,34,.07)', badBg:'rgba(240,86,63,.07)',
+            beLine:'rgba(210,153,34,.45)', spotLine:'rgba(63,185,80,.45)',
+            hair:'rgba(255,255,255,.30)', tipBg:'rgba(5,6,9,.96)', dot:'#ffffff' },
+    light:{ bg:'#f4f5f3', panel:'#fbfbf9', card:'#f2f3f0', line:'#e4e5e0', line2:'#d3d5cf',
+            text:'#16181d', sub:'#454a52', muted:'#666c74', dim:'#878d95',
+            accent:'#1a7f37', accent2:'#116329', up:'#1a7f37', dn:'#cf222e', warn:'#9a6700',
+            ce:'#0a5fa8', pe:'#cf222e', sd:'#6639ba',
+            upFill:'rgba(26,127,55,.10)', dnFill:'rgba(207,34,46,.09)',
+            upArea:'rgba(26,127,55,.16)', dnArea:'rgba(207,34,46,.14)',
+            goodBg:'rgba(26,127,55,.08)', warnBg:'rgba(154,103,0,.09)', badBg:'rgba(207,34,46,.07)',
+            beLine:'rgba(154,103,0,.55)', spotLine:'rgba(26,127,55,.55)',
+            hair:'rgba(0,0,0,.34)', tipBg:'rgba(251,251,249,.97)', dot:'#16181d' }
+  };
+  const C = Object.assign({}, THEMES.dark);
   // Exchange session. NSE F&O and BSE both close 15:40 IST (moved from 15:30 on 2026-08-03).
   // Time-to-expiry is derived from this, so a wrong value distorts theta/gamma badly on expiry day.
   const OPEN_H = 9, OPEN_M = 15, CLOSE_H = 15, CLOSE_M = 40;
@@ -37,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
@@ -207,18 +227,18 @@
   function dayKey(){ const d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
   function histLoad(){
     try { const raw = localStorage.getItem(HIST_KEY); if (!raw) return; const j = JSON.parse(raw);
-      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; Store.realised = j.r || {}; }
+      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; Store.realised = j.r || {}; Store.peak = j.pk || {}; }
       else localStorage.removeItem(HIST_KEY); // new session day → start clean
     } catch (e) {}
   }
   let _lastSave = 0;
   function histSave(force){
     if (!force && Date.now() - _lastSave < HIST_SAVE_MS) return; _lastSave = Date.now();
-    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist, r: Store.realised })); } catch (e) {}
+    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist, r: Store.realised, pk: Store.peak })); } catch (e) {}
   }
   function histPush(book, mtm, delta){
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
-    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.prevLegs = {}; }
+    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
     const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
     a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(Store.realised[book] || 0)]);
@@ -246,10 +266,23 @@
   function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: (c - cA) * p.qty })); out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: (pp - (p.avg - cA)) * p.qty })); }); return out; }
   // The leg set, its pricing context and its greeks were each rebuilt many times per frame — and every
   // context rebuild re-ran a Newton solve per leg. Compute once per frame; memClear() opens a new frame.
-  const _mem = { legs: null, ctx: new Map(), grk: new Map() };
-  function memClear(){ _mem.legs = null; _mem.ctx.clear(); _mem.grk.clear(); }
+  // SELF-INVALIDATING on purpose: an earlier version cleared this only at the top of a refresh frame, so any
+  // caller outside that frame (alerts, tests, the console) silently got stale legs. The cache key is derived
+  // from every input the leg set depends on, so it cannot go stale no matter who calls it.
+  const _mem = { key: null, legs: null, ctx: new Map(), grk: new Map() };
+  function memClear(){ _mem.key = null; _mem.legs = null; _mem.ctx.clear(); _mem.grk.clear(); }
+  function _legKey(){
+    let k = Store.posVisible + '|' + Store.tableAt + '|' + Store.quoteAt + '|';
+    for (let i = 0; i < Store.positions.length; i++){ const p = Store.positions[i];
+      k += p.symbol + ':' + p.quantity + ':' + p.ltp + ':' + (p.bepPrice || p.avgSellPrice || p.avgBuyPrice) + ';'; }
+    return k;
+  }
   const _memKey = (pos, spot) => Math.round(spot * 100) + '|' + pos.map(p => p.symbol + ':' + p.ltp + ':' + p.qty + ':' + p.avg).join(',');
-  window._allLegs = () => _mem.legs || (_mem.legs = expandLegs(window.parseOpenPos()));
+  window._allLegs = function (){
+    const k = _legKey();
+    if (_mem.key !== k){ _mem.key = k; _mem.legs = expandLegs(window.parseOpenPos()); _mem.ctx.clear(); _mem.grk.clear(); }
+    return _mem.legs;
+  };
   window._bsLegs = () => { const b = activeBook(); return window._allLegs().filter(l => l.under === b); };
   window.getSpot = () => { const b = activeBook(); return Store.spots[b] || spotFor(b) || 0; }; // NEVER fall back to another book's spot
   window.getOpenMTM = () => window.parseOpenPos().reduce((s, p) => s + p.pnl, 0);
@@ -284,6 +317,20 @@
   const col = v => v >= 0 ? C.up : C.dn;
 
   // ══ SHADOW PANEL ════════════════════════════════════════════════════════════
+  const THEME_KEY = 'spay_theme';
+  function applyTheme(name){
+    if (!THEMES[name]) name = 'dark';
+    Object.assign(C, THEMES[name]); Store.theme = name;
+    try { localStorage.setItem(THEME_KEY, name); } catch (e) {}
+    // the stylesheet is a template over C, so it has to be re-emitted wherever the panel currently lives
+    [SR, (POP && !POP.closed) ? POP.document : null].forEach(root => {
+      if (!root) return;
+      const st = root.querySelector('style'); if (st) st.textContent = panelCSS();
+      const b = root.body; if (b) b.style.background = C.bg;
+    });
+    const tb = $id('spay-theme'); if (tb) tb.title = name === 'dark' ? 'Switch to light' : 'Switch to dark';
+    try { window.refreshAll(); } catch (e) {}
+  }
   let SR = null; const $ = s => SR ? SR.querySelector(s) : null, $id = i => $('#' + i);
   // Sized in CSS pixels but backed at devicePixelRatio — without this every line and label is drawn at 1x
   // and upscaled by the compositor, which is why canvas UIs look soft next to the page's own text.
@@ -366,9 +413,9 @@
 
       .alert{display:flex;align-items:center;gap:10px;padding:8px 14px;font-size:11px;font-family:${MONO};
              border-top:1px solid ${C.line};border-left:2px solid;}
-      .alert.bad{background:rgba(240,86,63,.07);border-left-color:${C.dn};color:${C.dn};}
-      .alert.warn{background:rgba(210,153,34,.07);border-left-color:${C.warn};color:${C.warn};}
-      .alert.good{background:rgba(63,185,80,.07);border-left-color:${C.up};color:${C.up};}
+      .alert.bad{background:${C.badBg};border-left-color:${C.dn};color:${C.dn};}
+      .alert.warn{background:${C.warnBg};border-left-color:${C.warn};color:${C.warn};}
+      .alert.good{background:${C.goodBg};border-left-color:${C.up};color:${C.up};}
       .alert .ad{flex:1;} .alert .ax{background:none;border:none;color:inherit;cursor:pointer;font-size:11px;opacity:.6;}
 
       .cfg{padding:12px 14px;border-top:1px solid ${C.line};background:${C.card};}
@@ -404,7 +451,7 @@
         <span class="wm">PAYOFF &amp; RISK</span>
         <span class="tools">
           <span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span>
-          <button class="ic" id="spay-bell" title="Alerts"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M4.6 6.6a3.4 3.4 0 0 1 6.8 0c0 2.4.7 3.4 1.1 3.8H3.5c.4-.4 1.1-1.4 1.1-3.8Z"/><path d="M6.5 12.4a1.6 1.6 0 0 0 3 0"/></svg></button>
+          <button class="ic" id="spay-theme" title="Switch theme"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.4v1.6M8 13v1.6M14.6 8H13M3 8H1.4M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1M12.7 12.7l-1.1-1.1M4.4 4.4 3.3 3.3" stroke-linecap="round"/></svg></button><button class="ic" id="spay-bell" title="Alerts"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M4.6 6.6a3.4 3.4 0 0 1 6.8 0c0 2.4.7 3.4 1.1 3.8H3.5c.4-.4 1.1-1.4 1.1-3.8Z"/><path d="M6.5 12.4a1.6 1.6 0 0 0 3 0"/></svg></button>
           <button class="ic" id="spay-pop" title="Open in its own window"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M9.5 2.5H13.5V6.5"/><path d="M13.5 2.5 8.5 7.5"/><path d="M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/></svg></button>
           <button class="ic" id="spay-min" title="Collapse"><svg viewBox="0 0 16 16" width="12" height="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M4 8h8"/></svg></button>
           <button class="ic" id="spay-close" title="Close"><svg viewBox="0 0 16 16" width="12" height="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></svg></button>
@@ -424,8 +471,9 @@
       <div class="alert" id="spay-alert" style="display:none"><span class="ad"></span><button class="ax" id="spay-ax">✕</button></div>
       <div class="cfg" id="spay-cfg" style="display:none">
         <label>Breakeven warn <input id="a-be" type="number" min="0" step="5"><i>pts</i></label>
-        <label>Target <input id="a-tgt" type="number" step="500"><i>₹ day P&amp;L</i></label>
-        <label>Stop <input id="a-stop" type="number" step="500"><i>₹ negative</i></label>
+        <label>P&amp;L profit at <input id="a-tgt" type="number" step="500"><i>₹ day P&amp;L · 0 = off</i></label>
+        <label>P&amp;L loss at <input id="a-stop" type="number" step="500"><i>₹ negative · 0 = off</i></label>
+        <label>Giveback from peak <input id="a-give" type="number" min="0" step="500"><i>₹ off the day high · 0 = off</i></label>
         <label>Delta limit <input id="a-dlt" type="number" min="0" step="5"><i>0 = off</i></label>
         <div class="cks">
           <label class="ck"><input id="a-on" type="checkbox">alerts on</label>
@@ -469,18 +517,19 @@
   function syncCfg(){
     const v = (id, val) => { const e = $id(id); if (e) e.value = val; };
     const c = (id, val) => { const e = $id(id); if (e) e.checked = !!val; };
-    v('a-be', AL.be); v('a-tgt', AL.tgt); v('a-stop', AL.stop); v('a-dlt', AL.dlt);
+    v('a-be', AL.be); v('a-tgt', AL.tgt); v('a-stop', AL.stop); v('a-give', AL.give); v('a-dlt', AL.dlt);
     c('a-on', AL.on); c('a-snd', AL.sound); c('a-dsk', AL.desktop); c('a-fls', AL.flash); c('a-hl', AL.health);
   }
   function wirePanel(){
     const mn = $id('spay-min'); if (mn) mn.onclick = () => { _mini = !_mini; const w = $id('spay-cv').parentElement; if (w) w.style.display = _mini ? 'none' : ''; };
     const cl = $id('spay-close'); if (cl) cl.onclick = () => { if (POP){ closePop(); return; } const h = document.getElementById('spay-host'); if (h) h.remove(); SR = null; };
     const po = $id('spay-pop'); if (po) po.onclick = () => { if (POP && !POP.closed) closePop(); else popOut(); };
+    const th = $id('spay-theme'); if (th) th.onclick = () => applyTheme(Store.theme === 'dark' ? 'light' : 'dark');
     const ax = $id('spay-ax'); if (ax) ax.onclick = () => { const b = $id('spay-alert'); if (b) b.style.display = 'none'; };
     const bell = $id('spay-bell');
     if (bell) bell.onclick = () => { const c = $id('spay-cfg'); if (!c) return; const show = c.style.display === 'none'; c.style.display = show ? '' : 'none'; if (show){ syncCfg(); renderLog(); } };
     const num = (id, key) => { const e = $id(id); if (!e) return; e.onchange = () => { AL[key] = parseFloat(e.value) || 0; alSave(); Object.keys(ALS).forEach(k => { ALS[k].armed = true; }); }; };
-    num('a-be', 'be'); num('a-tgt', 'tgt'); num('a-stop', 'stop'); num('a-dlt', 'dlt');
+    num('a-be', 'be'); num('a-tgt', 'tgt'); num('a-stop', 'stop'); num('a-give', 'give'); num('a-dlt', 'dlt');
     const chk = (id, key) => { const e = $id(id); if (!e) return; e.onchange = () => {
       AL[key] = e.checked; alSave();
       if (key === 'sound' && e.checked && !audioOn()) { e.checked = false; AL.sound = false; alSave(); }
@@ -503,7 +552,7 @@
     if (!w){ const b = $id('spay-pop'); if (b){ b.textContent = 'pop-ups blocked'; b.style.color = C.warn; setTimeout(() => { b.textContent = '⤡'; b.style.color = ''; }, 3500); } return; }
     try {
       w.document.open();
-      w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Payoff & Risk — Straddly</title><style>' + panelCSS() + '</style></head><body class="pop"><div id="spay">' + panelHTML() + '</div></body></html>');
+      w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>Payoff & Risk — Straddly</title><style>' + panelCSS() + '</style></head><body class="pop" style="background:' + C.bg + '"><div id="spay">' + panelHTML() + '</div></body></html>');
       w.document.close();
       POP = w; SR = w.document; window._SPR = SR; startTimers(w);
       const host = document.getElementById('spay-host'); if (host) host.style.display = 'none';
@@ -570,14 +619,14 @@
     for (let i = 0; i <= 5; i++){ const s = lo + (i / 5) * (hi - lo), x = X(s); ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke(); ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(Math.round(s).toLocaleString('en-IN'), x, H - 7); }
     const z = Y(0); ctx.strokeStyle = C.line2; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(L, z); ctx.lineTo(W - R, z); ctx.stroke(); ctx.setLineDash([]);
     const be = window._breakevens(pos);
-    if (be){ [be.lower, be.upper].forEach(v => { if (v < lo || v > hi) return; const bx = X(v); ctx.strokeStyle = 'rgba(251,191,36,.4)'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(bx, Tp); ctx.lineTo(bx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = C.warn; ctx.textAlign = 'center'; ctx.fillText(Math.round(v), bx, Tp + 10); }); }
-    const sx = X(spot); ctx.strokeStyle = 'rgba(74,222,128,.45)'; ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.moveTo(sx, Tp); ctx.lineTo(sx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
+    if (be){ [be.lower, be.upper].forEach(v => { if (v < lo || v > hi) return; const bx = X(v); ctx.strokeStyle = C.beLine; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(bx, Tp); ctx.lineTo(bx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = C.warn; ctx.textAlign = 'center'; ctx.fillText(Math.round(v), bx, Tp + 10); }); }
+    const sx = X(spot); ctx.strokeStyle = C.spotLine; ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.moveTo(sx, Tp); ctx.lineTo(sx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
     // ── node-dot payoff: green above 0, red below (the "TradingAlgo" vibe) ──
     // filled region to the zero line, then one clean curve — no per-sample dots
     const zc = Math.max(Tp, Math.min(Tp + CH, z));
     const region = () => { ctx.beginPath(); ctx.moveTo(X(pN[0].s), zc); pN.forEach(q => ctx.lineTo(X(q.s), Y(q.p))); ctx.lineTo(X(pN[N].s), zc); ctx.closePath(); };
-    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, zc - Tp)); ctx.clip(); region(); ctx.fillStyle = 'rgba(63,185,80,.09)'; ctx.fill(); ctx.restore();
-    ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region(); ctx.fillStyle = 'rgba(240,86,63,.09)'; ctx.fill(); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, zc - Tp)); ctx.clip(); region(); ctx.fillStyle = C.upFill; ctx.fill(); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region(); ctx.fillStyle = C.dnFill; ctx.fill(); ctx.restore();
     ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
     for (let i = 1; i <= N; i++){
       ctx.strokeStyle = (pN[i - 1].p >= 0 && pN[i].p >= 0) ? C.up : (pN[i - 1].p < 0 && pN[i].p < 0) ? C.dn : C.muted;
@@ -587,7 +636,7 @@
     ctx.strokeStyle = C.panel; ctx.lineWidth = 1.5; ctx.stroke();
     const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '9px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 10);
     // hover crosshair
-    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = 'rgba(5,6,7,.96)'; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
+    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
   };
 
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
@@ -627,8 +676,8 @@
     runs.forEach(([s0, s1]) => {
       if (s1 <= s0) return;
       const area = () => { ctx.beginPath(); ctx.moveTo(X(a[s0][0]), z); for (let i = s0; i <= s1; i++) ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.lineTo(X(a[s1][0]), z); ctx.closePath(); };
-      ctx.save(); ctx.beginPath(); ctx.rect(L2, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = 'rgba(74,222,128,.15)'; ctx.fill(); ctx.restore();
-      ctx.save(); ctx.beginPath(); ctx.rect(L2, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = 'rgba(255,90,82,.15)'; ctx.fill(); ctx.restore();
+      ctx.save(); ctx.beginPath(); ctx.rect(L2, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = C.upArea; ctx.fill(); ctx.restore();
+      ctx.save(); ctx.beginPath(); ctx.rect(L2, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = C.dnArea; ctx.fill(); ctx.restore();
       ctx.strokeStyle = C.ce; ctx.lineWidth = 1.3; ctx.beginPath();
       for (let i = s0; i <= s1; i++){ const x = X(a[i][0]), y = YD(ds[i]); i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
       ctx.stroke(); ctx.lineWidth = 1.7;
@@ -642,13 +691,13 @@
       const tt = t0 + ((cv._cur - L2) / CW) * span;
       let ni = 0; for (let i = 1; i < a.length; i++) if (Math.abs(a[i][0] - tt) < Math.abs(a[ni][0] - tt)) ni = i;
       const nb = a[ni], nv = ms[ni], cx = X(nb[0]);
-      ctx.strokeStyle = 'rgba(255,255,255,.28)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
-      ctx.beginPath(); ctx.arc(cx, Y(nv), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill();
+      ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(cx, Y(nv), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill();
       ctx.beginPath(); ctx.arc(cx, YD(nb[2]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
       const lbl = hhmm(nb[0]) + '  ' + money(nv) + (nb[3] ? '  (R ' + money(nb[3]) + ')' : '') + '  Δ' + nb[2];
       ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14;
       let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx);
-      ctx.fillStyle = 'rgba(5,6,7,.96)'; ctx.fillRect(tx, Tp + 2, tw, 18);
+      ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18);
       ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18);
       ctx.fillStyle = nv >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15);
     }
@@ -662,7 +711,7 @@
   //     value oscillating around a threshold cannot machine-gun you into ignoring the whole system.
   //  3. Every alert says which book it is about; a multi-book screen makes an unlabelled alert useless.
   const ALERT_KEY = 'spay_alerts_v1', ALERT_COOLDOWN = 60000;
-  const AL = { on: true, sound: true, desktop: false, flash: true, health: true, be: 40, tgt: 0, stop: 0, dlt: 0 };
+  const AL = { on: true, sound: true, desktop: false, flash: true, health: true, be: 40, tgt: 0, stop: 0, give: 0, dlt: 0 };
   const ALS = {};            // rule state: key -> { armed, at }
   const ALOG = [];           // most recent first
   function alLoad(){ try { const j = JSON.parse(localStorage.getItem(ALERT_KEY) || '{}'); Object.keys(AL).forEach(k => { if (j[k] !== undefined) AL[k] = j[k]; }); } catch (e) {} }
@@ -728,8 +777,12 @@
             else rearm(u + ':beNear', dist > AL.be * 1.5); }
         }
       }
-      if (AL.tgt > 0){ if (day >= AL.tgt) fire(u + ':tgt', 'good', u + ' TARGET HIT', 'day P&L ' + money(day)); else rearm(u + ':tgt', day < AL.tgt * 0.9); }
-      if (AL.stop < 0){ if (day <= AL.stop) fire(u + ':stop', 'bad', u + ' STOP HIT', 'day P&L ' + money(day)); else rearm(u + ':stop', day > AL.stop * 0.9); }
+      if (AL.tgt > 0){ if (day >= AL.tgt) fire(u + ':tgt', 'good', u + ' PROFIT TARGET', 'day P&L ' + money(day) + ' (target ' + money(AL.tgt) + ')'); else rearm(u + ':tgt', day < AL.tgt * 0.9); }
+      if (AL.stop < 0){ if (day <= AL.stop) fire(u + ':stop', 'bad', u + ' LOSS LIMIT', 'day P&L ' + money(day) + ' (limit ' + money(AL.stop) + ')'); else rearm(u + ':stop', day > AL.stop * 0.9); }
+      // giving back an open profit is the loss a premium seller actually feels, and no target/stop catches it
+      if (AL.give > 0){ const pk = Store.peak[u] || 0, back = pk - day;
+        if (pk > 0 && back >= AL.give) fire(u + ':give', 'warn', u + ' GIVING BACK', money(back) + ' off the day high of ' + money(pk) + ' — now ' + money(day));
+        else rearm(u + ':give', back < AL.give * 0.6); }
       if (AL.dlt > 0){ const nd = window._netGreeks(lg, sp).nD;
         if (Math.abs(nd) >= AL.dlt) fire(u + ':dlt', 'warn', u + ' delta ' + nd.toFixed(1), 'book has drifted directional (limit ' + AL.dlt + ')');
         else rearm(u + ':dlt', Math.abs(nd) < AL.dlt * 0.8); }
@@ -774,7 +827,11 @@
     underlyings().forEach(u => {
       const lg = all.filter(l => l.under === u); if (!lg.length) return;
       const sp = Store.spots[u] || spotFor(u); if (!sp) return;
-      try { histPush(u, lg.reduce((s, p) => s + p.pnl, 0), window._netGreeks(lg, sp).nD); } catch (e) {}
+      try {
+        const mtmU = lg.reduce((s, p) => s + p.pnl, 0), dayU = mtmU + (Store.realised[u] || 0);
+        if (!(Store.peak[u] > dayU)) Store.peak[u] = dayU;   // intraday high-water mark of day P&L
+        histPush(u, mtmU, window._netGreeks(lg, sp).nD);
+      } catch (e) {}
     });
   }
   window.refreshAll = function (){
@@ -841,7 +898,8 @@
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
     window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
-    alLoad(); histLoad(); buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
+    alLoad(); histLoad(); buildPanel();
+    try { applyTheme(localStorage.getItem(THEME_KEY) || 'dark'); } catch (e) {} Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
     startTimers(window);
     setInterval(() => { try {
       if (POP && !POP.closed) return; // popped out — leave the host hidden
