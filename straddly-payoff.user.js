@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -33,15 +33,14 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
-  window.SPAY._fn = { parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
   function ingest(url, body){ if (!url || !body) return; let j; try { j = JSON.parse(body); } catch (e) { return; } const d = j && j.data !== undefined ? j.data : j; try {
     if (/\/(data\/)?[Tt]ouchline/i.test(url) && Array.isArray(d)) {
       const mine = {}; Store.positions.forEach(p => { if (p.symbol) mine[p.symbol] = 1; });
-      d.forEach(q => { if (q && q.symbol){ if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; Store.ltpBySym[q.symbol] = q.ltp; if (mine[q.symbol] && q.ltp > 0) Store.markAt = Date.now(); } });
+      d.forEach(q => { if (q && q.symbol){ if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; Store.ltpBySym[q.symbol] = q.ltp; if (mine[q.symbol] && q.ltp > 0){ Store.markAt = Date.now(); if (Store.ltpBySym[q.symbol] !== q.ltp) Store.quoteAt = Date.now(); } } });
       recomputeSpot(); Store._emit(); return; }
     if (/user\/getuserdetails/i.test(url) && d && d.id) { Store.user = d; Store._emit(); return; }
     if (/\/(Orders\/Get-MarginusedByID|user\/getMargin)/i.test(url) && Array.isArray(d) && d.length) { Store.margin = d[0]; Store._emit(); return; }
@@ -90,6 +89,7 @@
     tables.forEach(t => { try { OBS.mo.observe(t, { subtree: true, childList: true, characterData: true }); } catch (e) {} });
     OBS.tables = tables.slice();
   }
+  let _tableSig = '';
   function scrapePositions(full){
     const live = OBS.tables.length && OBS.tables.every(t => document.contains(t));
     const scope = (!full && live) ? OBS.tables : [document];   // scoped re-reads are cheap enough to run per tick
@@ -130,7 +130,11 @@
     if (Store.posVisible || onPosView) reconcileRealised();
     // else: on another tab → keep last known positions (don't blank)
     watchTables(tables);
-    if (Store.posVisible) Store.markAt = Date.now(); // NOT on every attempt — only on a real read
+    if (Store.posVisible){
+      Store.markAt = Date.now();
+      const tsig = uniq.map(p => p.symbol + ':' + p.ltp).join('|');
+      if (tsig !== _tableSig){ _tableSig = tsig; Store.tableAt = Date.now(); }
+    }
     const qn = Store.positions.filter(p => Store.ltpBySym[p.symbol] > 0).length;
     Store.dbg = 'pos ' + Store.positions.length + (Store.posVisible ? '' : ' · q' + qn + '/' + Store.positions.length) + (function(){ const v = Store.spots[activeBook()] || Store.spot; return v ? ' · spot ' + Math.round(v) : ' · spot ?'; })() + (AUTH ? ' · auth✓' : ' · auth✗');
     return Store.positions.length;
@@ -154,8 +158,9 @@
   }
   // self-fetch the new touchline for the index (spot) + position symbols (fresh ltp), using captured auth
   function selfTouch(){
-    if (!AUTH || !origFetch) return; const us = underlyings(); if (!us.length) us.push('NIFTY'); const syms = us.map(u => IDX[u] || u); Store.positions.forEach(p => { if (p.symbol && syms.indexOf(p.symbol) < 0) syms.push(p.symbol); });
-    origFetch(location.origin + '/api/data/touchline', { method: 'POST', headers: { authorization: AUTH, 'content-type': 'application/json' }, body: JSON.stringify(syms), credentials: 'include' }).then(x => x.text()).then(t => ingest(location.origin + '/api/data/touchline', t)).catch(() => {});
+    if (!AUTH || !origFetch) return;
+    const FET = (POP && !POP.closed && POP.fetch) ? POP.fetch.bind(POP) : origFetch; const us = underlyings(); if (!us.length) us.push('NIFTY'); const syms = us.map(u => IDX[u] || u); Store.positions.forEach(p => { if (p.symbol && syms.indexOf(p.symbol) < 0) syms.push(p.symbol); });
+    FET(location.origin + '/api/data/touchline', { method: 'POST', headers: { authorization: AUTH, 'content-type': 'application/json' }, body: JSON.stringify(syms), credentials: 'include' }).then(x => x.text()).then(t => ingest(location.origin + '/api/data/touchline', t)).catch(() => {});
   }
 
   // ══ INTERCEPTOR ═════════════════════════════════════════════════════════════
@@ -166,6 +171,30 @@
   XMLHttpRequest.prototype.open = function (m, u){ this.__s = { url: String(u) }; return oO.apply(this, arguments); };
   XMLHttpRequest.prototype.setRequestHeader = function (k, v){ if (/^authorization$/i.test(k) && v) AUTH = v; return oH.apply(this, arguments); };
   XMLHttpRequest.prototype.send = function (body){ const d = this.__s; if (d) this.addEventListener('load', () => { try { ingest(d.url, this.responseText); } catch (e) {} }); return oS.apply(this, arguments); };
+  // Chrome throttles hidden-tab timers to ~1/s, then ~1/min after five minutes, and can freeze the tab.
+  // A dedicated Worker's clock is not subject to that, so it drives the poll; setInterval stays as a backstop.
+  let HB = null;
+  function startHeartbeat(){
+    try {
+      const src = 'let t=null;onmessage=function(e){if(e.data&&e.data.ms){clearInterval(t);t=setInterval(function(){postMessage(1);},e.data.ms);}};';
+      const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+      HB = new Worker(url); URL.revokeObjectURL(url);
+      HB.onmessage = () => { try { poll(); window.refreshAll(); } catch (e) {} };
+      HB.postMessage({ ms: POLL_MS });
+    } catch (e) { HB = null; }
+  }
+  // A page playing audio is exempt from intensive throttling and from being frozen/discarded. This is the
+  // same AudioContext the alert tones use, so enabling sound also keeps the data alive.
+  let AC = null, KEEP = null;
+  function audioOn(){
+    try {
+      AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === 'suspended') AC.resume();
+      if (!KEEP){ const o = AC.createOscillator(), g = AC.createGain();
+        g.gain.value = 0.0008; o.frequency.value = 20; o.connect(g); g.connect(AC.destination); o.start(); KEEP = o; }
+      return AC.state === 'running';
+    } catch (e) { return false; }
+  }
   function poll(){ try { scrapePositions(true); selfTouch(); } catch (e) {} } // full re-scan + fresh spot; the observer covers everything between
 
   // ══ MTM / DELTA HISTORY ═════════════════════════════════════════════════════
@@ -198,8 +227,13 @@
   // On the Positions tab, mirror the portal's own LTP column exactly. On Orders/Baskets that table is GONE and its
   // last values are frozen — so prefer the quote from our own touchline poll, which keeps running regardless of tab.
   function liveLtp(p){
+    const q = (p.symbol && Store.ltpBySym[p.symbol] > 0) ? Store.ltpBySym[p.symbol] : 0;
+    // Foreground: the table ticks, so mirror it exactly. Background/off-tab: the table is frozen but our
+    // touchline poll keeps running — whichever source moved most recently is the honest one.
+    const tableFresh = Store.posVisible && p._scraped && p.ltp > 0 && Store.tableAt >= Store.quoteAt;
+    if (tableFresh) return p.ltp;
+    if (q) return q;
     if (Store.posVisible && p._scraped && p.ltp > 0) return p.ltp;
-    if (p.symbol && Store.ltpBySym[p.symbol] > 0) return Store.ltpBySym[p.symbol];
     if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId];
     return p.ltp || 0;
   }
@@ -277,6 +311,24 @@
       .mhdr .k:before{content:'';width:10px;height:3px;border-radius:2px;background:${C.accent};}
       .mhdr .k2:before{background:${C.ce};}
       .mhdr .mnow{margin-left:auto;color:${C.sub};}
+      .alert{display:flex;align-items:center;gap:10px;margin:8px 12px 0;padding:8px 11px;border-radius:9px;font-size:11.5px;font-family:${MONO};border:1px solid;}
+      .alert.bad{background:rgba(255,90,82,.12);border-color:rgba(255,90,82,.45);color:${C.dn};}
+      .alert.warn{background:rgba(251,191,36,.10);border-color:rgba(251,191,36,.42);color:${C.warn};}
+      .alert.good{background:rgba(74,222,128,.10);border-color:rgba(74,222,128,.42);color:${C.accent};}
+      .alert .ad{flex:1;} .alert .ax{background:none;border:none;color:inherit;cursor:pointer;font-size:12px;opacity:.7;}
+      .cfg{margin:8px 12px 0;padding:10px 12px;background:${C.card};border:1px solid ${C.line};border-radius:10px;}
+      .cfg label{display:flex;align-items:center;gap:8px;font-size:11px;color:${C.sub};margin-bottom:6px;}
+      .cfg label i{font-style:normal;color:${C.muted};font-size:9.5px;}
+      .cfg input[type=number]{width:86px;background:${C.bg};border:1px solid ${C.line2};color:${C.text};font-family:${MONO};font-size:11px;padding:3px 6px;border-radius:5px;}
+      .cfg .cks{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;padding-top:8px;border-top:1px solid ${C.line};}
+      .cfg .ck{gap:5px;margin:0;cursor:pointer;}
+      .cfgn{margin-top:8px;font-size:9.5px;color:${C.muted};line-height:1.45;}
+      #spay-log{margin-top:8px;border-top:1px solid ${C.line};padding-top:6px;max-height:150px;overflow:auto;}
+      .lg{font-family:${MONO};font-size:10px;padding:2px 0;color:${C.sub};}
+      .lg span{color:${C.muted};margin-right:8px;} .lg.bad{color:${C.dn};} .lg.warn{color:${C.warn};} .lg.good{color:${C.accent};}
+      .lg.none{color:${C.muted};}
+      .ic.bell{font-size:11px;border:1px solid ${C.line2};border-radius:6px;padding:2px 7px;line-height:1.6;}
+      .ic.bell.act{border-color:${C.accent};color:${C.accent};}
       .brand{letter-spacing:.02em;}
       /* ── pop-out window: fills its own window, drops the floating-card chrome ── */
       body.pop{background:${C.bg};margin:0;padding:16px;}
@@ -293,8 +345,24 @@
     `; }
   function panelHTML(){ return `
       <div class="top" id="spay-top"><div class="brand"><span class="mk">S</span> Payoff &amp; Risk</div>
-        <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic pop" id="spay-pop" title="Open in its own window">⤡</button><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
+        <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic bell" id="spay-bell" title="Alerts">◉</button><button class="ic pop" id="spay-pop" title="Open in its own window">⤡</button><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
       <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span><span id="spay-real" style="display:none"></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
+      <div class="alert" id="spay-alert" style="display:none"><span class="ad"></span><button class="ax" id="spay-ax">✕</button></div>
+      <div class="cfg" id="spay-cfg" style="display:none">
+        <label>Breakeven warn <input id="a-be" type="number" min="0" step="5"><i>pts</i></label>
+        <label>Target <input id="a-tgt" type="number" step="500"><i>₹</i></label>
+        <label>Stop <input id="a-stop" type="number" step="500"><i>₹ (negative)</i></label>
+        <label>|Δ| limit <input id="a-dlt" type="number" min="0" step="5"><i>0 = off</i></label>
+        <div class="cks">
+          <label class="ck"><input id="a-on" type="checkbox">alerts on</label>
+          <label class="ck"><input id="a-snd" type="checkbox">sound</label>
+          <label class="ck"><input id="a-dsk" type="checkbox">desktop</label>
+          <label class="ck"><input id="a-fls" type="checkbox">flash</label>
+          <label class="ck"><input id="a-hl" type="checkbox">feed health</label>
+        </div>
+        <div class="cfgn">Alerts fire once per crossing and re-arm only after the value pulls back. Nothing fires while the feed is stale, frozen, or the market is closed.</div>
+        <div id="spay-log"></div>
+      </div>
       <div class="books" id="spay-books"></div>
       <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
         <div class="mhdr"><span class="k k1">Day P&amp;L ₹</span><span class="k k2">Δ net</span><span class="mnow" id="spay-mnow"></span></div>
@@ -317,10 +385,30 @@
     (document.body || document.documentElement).appendChild(host); // stays on body — Angular can't reconcile it away
     positionPanel(); wirePanel();
   }
+  function syncCfg(){
+    const v = (id, val) => { const e = $id(id); if (e) e.value = val; };
+    const c = (id, val) => { const e = $id(id); if (e) e.checked = !!val; };
+    v('a-be', AL.be); v('a-tgt', AL.tgt); v('a-stop', AL.stop); v('a-dlt', AL.dlt);
+    c('a-on', AL.on); c('a-snd', AL.sound); c('a-dsk', AL.desktop); c('a-fls', AL.flash); c('a-hl', AL.health);
+  }
   function wirePanel(){
     const mn = $id('spay-min'); if (mn) mn.onclick = () => { _mini = !_mini; const w = $id('spay-cv').parentElement; if (w) w.style.display = _mini ? 'none' : ''; };
     const cl = $id('spay-close'); if (cl) cl.onclick = () => { if (POP){ closePop(); return; } const h = document.getElementById('spay-host'); if (h) h.remove(); SR = null; };
     const po = $id('spay-pop'); if (po) po.onclick = () => { if (POP && !POP.closed) closePop(); else popOut(); };
+    const ax = $id('spay-ax'); if (ax) ax.onclick = () => { const b = $id('spay-alert'); if (b) b.style.display = 'none'; };
+    const bell = $id('spay-bell');
+    if (bell) bell.onclick = () => { const c = $id('spay-cfg'); if (!c) return; const show = c.style.display === 'none'; c.style.display = show ? '' : 'none'; if (show){ syncCfg(); renderLog(); } };
+    const num = (id, key) => { const e = $id(id); if (!e) return; e.onchange = () => { AL[key] = parseFloat(e.value) || 0; alSave(); Object.keys(ALS).forEach(k => { ALS[k].armed = true; }); }; };
+    num('a-be', 'be'); num('a-tgt', 'tgt'); num('a-stop', 'stop'); num('a-dlt', 'dlt');
+    const chk = (id, key) => { const e = $id(id); if (!e) return; e.onchange = () => {
+      AL[key] = e.checked; alSave();
+      if (key === 'sound' && e.checked && !audioOn()) { e.checked = false; AL.sound = false; alSave(); }
+      // permission must be asked from a click, never on page load
+      if (key === 'desktop' && e.checked && window.Notification && Notification.permission !== 'granted')
+        Notification.requestPermission().then(pm => { if (pm !== 'granted'){ e.checked = false; AL.desktop = false; alSave(); } });
+    }; };
+    chk('a-on', 'on'); chk('a-snd', 'sound'); chk('a-dsk', 'desktop'); chk('a-fls', 'flash'); chk('a-hl', 'health');
+    const root = $id('spay'); if (root && !root.__au){ root.__au = 1; root.addEventListener('click', () => { if (AL.sound) audioOn(); }, true); }
     [['spay-cv', () => window.drawPayoff()], ['spay-mtm-cv', () => window.drawMtm()]].forEach(([id, draw]) => {
       const cv = $id(id); if (!cv || cv.__h) return; cv.__h = 1; cv.style.cursor = 'crosshair';
       cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { draw(); } catch (_) {} });
@@ -479,6 +567,93 @@
   };
 
 
+  // ══ ALERTS ══════════════════════════════════════════════════════════════════
+  // Design rules, in order of importance:
+  //  1. NEVER fire off bad data — a stop triggered by a frozen mark is worse than no alert at all.
+  //  2. Fire once per crossing. Re-arm only after the value retreats past a buffer (hysteresis), so a
+  //     value oscillating around a threshold cannot machine-gun you into ignoring the whole system.
+  //  3. Every alert says which book it is about; a multi-book screen makes an unlabelled alert useless.
+  const ALERT_KEY = 'spay_alerts_v1', ALERT_COOLDOWN = 60000;
+  const AL = { on: true, sound: true, desktop: false, flash: true, health: true, be: 40, tgt: 0, stop: 0, dlt: 0 };
+  const ALS = {};            // rule state: key -> { armed, at }
+  const ALOG = [];           // most recent first
+  function alLoad(){ try { const j = JSON.parse(localStorage.getItem(ALERT_KEY) || '{}'); Object.keys(AL).forEach(k => { if (j[k] !== undefined) AL[k] = j[k]; }); } catch (e) {} }
+  function alSave(){ try { localStorage.setItem(ALERT_KEY, JSON.stringify(AL)); } catch (e) {} }
+
+  function beep(kind){
+    if (!AL.sound || !audioOn()) return;
+    try { const seq = kind === 'bad' ? [[880, 0], [660, .16], [880, .32]] : [[760, 0], [1010, .13]];
+      seq.forEach(([f, t]) => { const o = AC.createOscillator(), g = AC.createGain(), at = AC.currentTime + t;
+        o.frequency.value = f; o.type = 'sine'; o.connect(g); g.connect(AC.destination);
+        g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(0.22, at + .01);
+        g.gain.exponentialRampToValueAtTime(0.0001, at + .12); o.start(at); o.stop(at + .14); });
+    } catch (e) {}
+  }
+  let _flash = null;
+  function flashTitle(msg){
+    if (!AL.flash || !POP || POP.closed) return;
+    try { clearInterval(_flash); const base = 'Payoff & Risk'; let i = 0;
+      _flash = setInterval(() => { POP.document.title = (i++ % 2) ? base : '🔔 ' + msg; if (i > 12){ clearInterval(_flash); POP.document.title = base; } }, 700);
+    } catch (e) {}
+  }
+  function desktop(title, body){
+    if (!AL.desktop) return;
+    try { if (window.Notification && Notification.permission === 'granted') new Notification(title, { body: body, tag: 'spay', renotify: true }); } catch (e) {}
+  }
+  function fire(key, sev, title, body){
+    const st = ALS[key] || (ALS[key] = { armed: true, at: 0 });
+    if (!st.armed || Date.now() - st.at < ALERT_COOLDOWN) return;
+    st.armed = false; st.at = Date.now();
+    ALOG.unshift({ t: Date.now(), sev: sev, msg: title + ' — ' + body }); if (ALOG.length > 30) ALOG.pop();
+    beep(sev); desktop(title, body); flashTitle(title);
+    const b = $id('spay-alert'); if (b){ b.style.display = ''; b.className = 'alert ' + sev;
+      const d = b.querySelector('.ad'); if (d) d.textContent = title + ' — ' + body;
+      clearTimeout(b.__t); b.__t = setTimeout(() => { b.style.display = 'none'; }, 25000); }
+    renderLog();
+  }
+  function rearm(key, ok){ const st = ALS[key]; if (st && ok) st.armed = true; }
+
+  function evalAlerts(state){          // state is injectable so the suite can test each session case
+    if (!AL.on) return;
+    if ((state || marketState()) !== 'OPEN'){ Object.keys(ALS).forEach(k => { ALS[k].armed = true; }); return; }
+    const age = Store.markAt ? Date.now() - Store.markAt : -1;
+    const frozen = Store.tickAt ? Date.now() - Store.tickAt : -1;
+    const sick = age < 0 || age > 30000 || frozen > 180000;
+    if (AL.health){
+      if (sick) fire('health', 'bad', 'FEED PROBLEM', age > 30000 ? 'no fresh mark for ' + fmtAge(age) : 'no mark has moved in ' + fmtAge(frozen));
+      else rearm('health', true);
+    }
+    if (sick) return; // RULE 1 — do not judge P&L, breakevens or delta on data we do not trust
+    const all = window._allLegs();
+    underlyings().forEach(u => {
+      const lg = all.filter(l => l.under === u); if (!lg.length) return;
+      const sp = Store.spots[u] || spotFor(u); if (!sp) return;
+      const day = lg.reduce((a, p) => a + p.pnl, 0) + (Store.realised[u] || 0);
+      if (AL.be > 0){
+        const be = window._breakevens(lg);
+        if (be){
+          const out = sp < be.lower || sp > be.upper;
+          const dist = Math.min(Math.abs(sp - be.lower), Math.abs(be.upper - sp));
+          if (out) fire(u + ':beBreach', 'bad', u + ' BREAKEVEN BREACHED', 'spot ' + Math.round(sp).toLocaleString('en-IN') + ' is outside ' + Math.round(be.lower) + '–' + Math.round(be.upper));
+          else { rearm(u + ':beBreach', dist > AL.be * 0.5);
+            if (dist <= AL.be) fire(u + ':beNear', 'warn', u + ' near breakeven', Math.round(dist) + ' pts away (' + Math.round(be.lower) + '–' + Math.round(be.upper) + ')');
+            else rearm(u + ':beNear', dist > AL.be * 1.5); }
+        }
+      }
+      if (AL.tgt > 0){ if (day >= AL.tgt) fire(u + ':tgt', 'good', u + ' TARGET HIT', 'day P&L ' + money(day)); else rearm(u + ':tgt', day < AL.tgt * 0.9); }
+      if (AL.stop < 0){ if (day <= AL.stop) fire(u + ':stop', 'bad', u + ' STOP HIT', 'day P&L ' + money(day)); else rearm(u + ':stop', day > AL.stop * 0.9); }
+      if (AL.dlt > 0){ const nd = window._netGreeks(lg, sp).nD;
+        if (Math.abs(nd) >= AL.dlt) fire(u + ':dlt', 'warn', u + ' delta ' + nd.toFixed(1), 'book has drifted directional (limit ' + AL.dlt + ')');
+        else rearm(u + ':dlt', Math.abs(nd) < AL.dlt * 0.8); }
+    });
+  }
+  function renderLog(){
+    const el = $id('spay-log'); if (!el) return;
+    el.innerHTML = ALOG.length
+      ? ALOG.slice(0, 12).map(a => '<div class="lg ' + a.sev + '"><span>' + hhmm(Math.round(a.t / 1000)) + '</span>' + a.msg.replace(/</g, '&lt;') + '</div>').join('')
+      : '<div class="lg none">no alerts yet today</div>';
+  }
+
   // ══ REFRESH ═════════════════════════════════════════════════════════════════
   // one payoff per underlying — NIFTY and BANKNIFTY are different books and must never share a spot
   function renderBooks(active){
@@ -546,6 +721,8 @@
       lv.className = 'live ' + cls; set('spay-lt', txt);
     }
     noteTicks(); recordAllBooks();
+    try { evalAlerts(); } catch (e) {}
+    const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
     renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.textContent = on ? '⇲' : '⤡'; pb.title = on ? 'Dock back into the page' : 'Open in its own window'; }
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
@@ -567,13 +744,17 @@
     add(() => { try { window.refreshAll(); } catch (e) {} }, UI_REFRESH_MS);
   }
   function boot(){
-    histLoad(); buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
+    // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    alLoad(); histLoad(); buildPanel(); Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
     startTimers(window);
     setInterval(() => { try {
       if (POP && !POP.closed) return; // popped out — leave the host hidden
       if (!document.getElementById('spay-host')){ SR = null; buildPanel(); window.refreshAll(); return; }
       positionPanel();
     } catch (e) {} }, WATCHDOG_MS);
+    startHeartbeat();
+    document.addEventListener('visibilitychange', () => { if (!document.hidden){ try { poll(); window.refreshAll(); } catch (e) {} } });
     window.addEventListener('scroll', () => { try { positionPanel(); } catch (e) {} }, true);
     window.addEventListener('resize', () => { try { positionPanel(); } catch (e) {} });
     setTimeout(() => { wirePanel(); poll(); window.refreshAll(); }, 700);

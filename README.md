@@ -66,6 +66,18 @@ believable implied vol, the header says `⚠ 1 leg IV est` rather than quietly i
 **Your session token never leaves the closure** it's captured in — it is deliberately kept off the
 `window.SPAY` debug object so nothing else running on the broker's page can read it.
 
+**Alerts** (the bell in the header): breakeven approach + breach, day P&L target/stop, net-delta band, and
+feed health. Each fires **once per crossing** and re-arms only after the value pulls back past a buffer, so a
+value hovering on a threshold can't machine-gun you. **Nothing fires while the feed is stale or frozen, or
+outside market hours** — a stop triggered by a frozen mark is worse than no alert. Channels: in-panel banner,
+generated tone, desktop notification, and a pop-out title flash. Thresholds persist per browser.
+
+**Background tabs:** Chrome throttles hidden tabs and can freeze them outright, and the portal pauses its own
+feed when hidden. The overlay drives its polling from a Web Worker clock (not subject to that throttling),
+routes its quote fetches through the visible pop-out window when one is open, and falls back to its own
+touchline poll whenever the portal's table has gone stale. Turning **sound** on also keeps the tab exempt
+from freezing. For alerts that must reach you with the browser closed, use a server-side watcher instead.
+
 **Tests:** open [`tests.html`](tests.html) next to the script to re-run the suite (pricing, implied vol,
 P&L signs, mixed expiries, realised-on-exit, session hours, day rollover).
 

@@ -165,6 +165,54 @@
       return (S.histDay===F.dayKey() && S.hist.NIFTY.length===1 && !S.realised.NIFTY)
         || ('day '+S.histDay+' pts '+S.hist.NIFTY.length+' realised '+S.realised.NIFTY); });
 
+    grp('ALERTS');
+    F.AL.sound=false; F.AL.desktop=false; F.AL.flash=false;
+    function armAll(){ Object.keys(F.ALS).forEach(function(k){ delete F.ALS[k]; }); F.ALOG.length=0; }
+    function openBook(dayPnl, spot, lo, hi){
+      // a short strangle whose breakevens bracket lo..hi, marked so day P&L lands on dayPnl
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[
+        {status:'OPEN',symbol:'NIFTY26082024200PE',optionType:'PE',strikePrice:lo+40,quantity:-20,avgSellPrice:40,bepPrice:40,ltp:40-dayPnl/40,_scraped:true,expiryDate:e.toISOString()},
+        {status:'OPEN',symbol:'NIFTY26082024300CE',optionType:'CE',strikePrice:hi-40,quantity:-20,avgSellPrice:40,bepPrice:40,ltp:40-dayPnl/40,_scraped:true,expiryDate:e.toISOString()}];
+      S.spots={NIFTY:spot}; S.book='NIFTY'; S.realised={}; S.posVisible=true;
+      S.markAt=Date.now(); S.tickAt=Date.now();   // healthy feed
+    }
+    t('nothing fires while the market is CLOSED', function(){
+      armAll(); F.AL.on=true; F.AL.health=true; F.AL.be=40;
+      S.markAt=Date.now()-600000; S.tickAt=Date.now()-600000;  // very sick feed
+      F.evalAlerts('CLOSED');
+      return F.ALOG.length===0 || 'fired '+F.ALOG.length+' alerts with the market closed'; });
+    t('a dead feed raises FEED PROBLEM', function(){
+      armAll(); F.AL.on=true; F.AL.health=true;
+      openBook(0, 24250, 24100, 24400); S.markAt=Date.now()-600000; S.tickAt=Date.now()-600000;
+      F.evalAlerts('OPEN');
+      return (F.ALOG.length===1 && /FEED PROBLEM/.test(F.ALOG[0].msg)) || JSON.stringify(F.ALOG.map(function(a){return a.msg;})); });
+    t('a dead feed SUPPRESSES the P&L stop (never act on a frozen mark)', function(){
+      armAll(); F.AL.on=true; F.AL.health=false; F.AL.stop=-1000; F.AL.be=0; F.AL.dlt=0; F.AL.tgt=0;
+      openBook(-9999, 24250, 24100, 24400); S.markAt=Date.now()-600000; S.tickAt=Date.now()-600000;
+      F.evalAlerts('OPEN');
+      return F.ALOG.length===0 || 'fired: '+F.ALOG[0].msg; });
+    t('a breached breakeven fires once, not on every tick', function(){
+      armAll(); F.AL.on=true; F.AL.health=false; F.AL.be=40; F.AL.tgt=0; F.AL.stop=0; F.AL.dlt=0;
+      openBook(0, 26000, 24100, 24400);   // spot far outside
+      for(var i=0;i<8;i++) F.evalAlerts('OPEN');
+      var breach=F.ALOG.filter(function(a){ return /BREACH/.test(a.msg); });
+      return breach.length===1 || 'fired '+breach.length+' times over 8 ticks'; });
+    t('an alert names the book it belongs to', function(){
+      return /NIFTY/.test((F.ALOG[0]||{}).msg||'') || 'no book in "'+((F.ALOG[0]||{}).msg||'')+'"'; });
+    t('a disarmed rule re-arms only after the value pulls back', function(){
+      armAll(); F.AL.on=true; F.AL.health=false; F.AL.be=40; F.AL.tgt=0; F.AL.stop=0; F.AL.dlt=0;
+      openBook(0, 26000, 24100, 24400); F.evalAlerts('OPEN');          // breach -> fires, disarms
+      var after1=F.ALOG.length;
+      openBook(0, 24250, 24100, 24400); F.evalAlerts('OPEN');          // back inside -> re-arms, no fire
+      openBook(0, 26000, 24100, 24400); F.ALS['NIFTY:beBreach'].at=0; F.evalAlerts('OPEN'); // breach again
+      return (F.ALOG.length===after1+1) || 'log went '+after1+' -> '+F.ALOG.length; });
+    t('alerts off means silence', function(){
+      armAll(); F.AL.on=false; F.AL.be=40;
+      openBook(0, 26000, 24100, 24400);
+      F.evalAlerts('OPEN'); F.AL.on=true;
+      return F.ALOG.length===0 || 'fired while off'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
