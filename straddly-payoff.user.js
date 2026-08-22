@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      4.0
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -21,13 +21,17 @@
   'use strict';
   const POLL_MS = 2000, UI_REFRESH_MS = 700, WATCHDOG_MS = 2500, SYNC_MS = 60, DEFAULT_ALLOWED_MARGIN = 114113.08;
   // "TradingAlgo" vibe — near-black, bright terminal green, orange-red, mono numbers
-  const C = { bg:'#050607', panel:'#0a0b0d', card:'#101216', line:'#191c21', line2:'#24282e', text:'#e9edf0', muted:'#697079', sub:'#9aa3af', accent:'#4ade80', accent2:'#22c55e', up:'#4ade80', dn:'#ff5a52', warn:'#fbbf24', ce:'#38bdf8', pe:'#ff5a52', sd:'#a78bfa' };
+  const C = { bg:'#050609', panel:'#0a0c0f', card:'#0f1217', line:'#171a20', line2:'#232830',
+              text:'#e8eaed', sub:'#8b939c', muted:'#5f666f', dim:'#474d55',
+              accent:'#3fb950', accent2:'#2ea043', up:'#3fb950', dn:'#f0563f', warn:'#d29922',
+              ce:'#4b93d1', pe:'#f0563f', sd:'#a371f7' };
   // Exchange session. NSE F&O and BSE both close 15:40 IST (moved from 15:30 on 2026-08-03).
   // Time-to-expiry is derived from this, so a wrong value distorts theta/gamma badly on expiry day.
   const OPEN_H = 9, OPEN_M = 15, CLOSE_H = 15, CLOSE_M = 40;
   const IV_MIN = 0.01, IV_MAX = 3.0; // a solved vol outside 1%–300% is a bad mark, not a real vol
   const HOLIDAYS = []; // optional 'YYYY-MM-DD' trading holidays; the frozen-feed check below covers the rest
-  const MONO = 'ui-monospace,"SF Mono",Menlo,Consolas,monospace';
+  const MONO = 'ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace';
+  const SANS = '-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,system-ui,sans-serif';
 
   // ══ STORE ═══════════════════════════════════════════════════════════════════
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
@@ -71,7 +75,7 @@
   // MutationObserver beats polling on two counts: it fires the moment the portal writes a new LTP/P&L,
   // and it keeps firing when the portal tab is in the BACKGROUND (timers there get throttled to ~1s by Chrome).
   const OBS = { tables: [], mo: null, last: 0, dirty: false, hits: 0, syncs: 0 }; window.__SPAY_OBS = OBS;
-  function syncNow(){ OBS.syncs++; OBS.last = Date.now(); OBS.dirty = false; try { scrapePositions(); window.refreshAll(); } catch (e) {} }
+  function syncNow(){ OBS.syncs++; OBS.last = Date.now(); OBS.dirty = false; memClear(); try { scrapePositions(); window.refreshAll(); } catch (e) {} }
   function onPortalMutate(){
     OBS.hits++;
     const gap = Date.now() - OBS.last;
@@ -240,7 +244,12 @@
   function posAvg(p){ if (p.bepPrice > 0) return p.bepPrice; if (p.quantity < 0) return p.avgSellPrice; if (p.quantity > 0) return p.avgBuyPrice; return p.avgSellPrice || p.avgBuyPrice || 0; }
   window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(CLOSE_H, CLOSE_M, 0, 0); const _s = parseSymbol(p.symbol); return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: (ltp - avg) * p.quantity, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
   function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: (c - cA) * p.qty })); out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: (pp - (p.avg - cA)) * p.qty })); }); return out; }
-  window._allLegs = () => expandLegs(window.parseOpenPos());
+  // The leg set, its pricing context and its greeks were each rebuilt many times per frame — and every
+  // context rebuild re-ran a Newton solve per leg. Compute once per frame; memClear() opens a new frame.
+  const _mem = { legs: null, ctx: new Map(), grk: new Map() };
+  function memClear(){ _mem.legs = null; _mem.ctx.clear(); _mem.grk.clear(); }
+  const _memKey = (pos, spot) => Math.round(spot * 100) + '|' + pos.map(p => p.symbol + ':' + p.ltp + ':' + p.qty + ':' + p.avg).join(',');
+  window._allLegs = () => _mem.legs || (_mem.legs = expandLegs(window.parseOpenPos()));
   window._bsLegs = () => { const b = activeBook(); return window._allLegs().filter(l => l.under === b); };
   window.getSpot = () => { const b = activeBook(); return Store.spots[b] || spotFor(b) || 0; }; // NEVER fall back to another book's spot
   window.getOpenMTM = () => window.parseOpenPos().reduce((s, p) => s + p.pnl, 0);
@@ -248,19 +257,24 @@
   const allowedMargin = () => (Store.user && Store.user.marginAllowed) || (Store.margin && Store.margin.allowedMargin) || DEFAULT_ALLOWED_MARGIN;
   const marginUsed = () => (Store.margin && Store.margin.totalMarginUsed) || 0;
   window.BS = { norm(x){const a1=.254829592,a2=-.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=.3275911;const s=x<0?-1:1;x=Math.abs(x)/Math.sqrt(2);const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return .5*(1+s*y);}, d1(S,K,T,r,v){return(Math.log(S/K)+(r+.5*v*v)*T)/(v*Math.sqrt(T));}, price(S,K,T,r,v,t){if(T<=0)return t==='CE'?Math.max(0,S-K):Math.max(0,K-S);const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T);return t==='CE'?S*this.norm(d1)-K*Math.exp(-r*T)*this.norm(d2):K*Math.exp(-r*T)*this.norm(-d2)-S*this.norm(-d1);}, iv(S,K,T,r,mkt,t){if(!(T>0)||!(mkt>0)||!(S>0)||!(K>0))return 0;const intr=t==='CE'?Math.max(0,S-K*Math.exp(-r*T)):Math.max(0,K*Math.exp(-r*T)-S);if(mkt<=intr+1e-6)return 0;let v=.3;for(let i=0;i<100;i++){const p=this.price(S,K,T,r,v,t),d1=this.d1(S,K,T,r,v),vega=S*Math.sqrt(T)*Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),diff=p-mkt;if(Math.abs(diff)<.001)break;if(vega<1e-10)break;v-=diff/vega;if(!isFinite(v))return 0;if(v<.001)v=.001;if(v>5)v=5;}if(!isFinite(v)||v<IV_MIN||v>IV_MAX)return 0;if(Math.abs(this.price(S,K,T,r,v,t)-mkt)>Math.max(.05,mkt*.02))return 0;return v;}, greeks(S,K,T,r,v,t,qty){if(T<=0||v<=0)return{delta:0,gamma:0,theta:0,vega:0};const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T),nd1=Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),sg=qty<0?-1:1,aq=Math.abs(qty);const delta=t==='CE'?this.norm(d1):this.norm(d1)-1;const gamma=nd1/(S*v*Math.sqrt(T));const theta=t==='CE'?(-S*nd1*v/(2*Math.sqrt(T))-r*K*Math.exp(-r*T)*this.norm(d2))/365:(-S*nd1*v/(2*Math.sqrt(T))+r*K*Math.exp(-r*T)*this.norm(-d2))/365;const vega=S*nd1*Math.sqrt(T)/100;return{delta:sg*delta*aq,gamma:sg*gamma*aq,theta:sg*theta*aq,vega:sg*vega*aq};} };
-  window._getPosCtx = function (pos, spot){ const now = new Date();
+  window._getPosCtx = function (pos, spot){
+    const mk = _memKey(pos, spot); const hit = _mem.ctx.get(mk); if (hit) return hit;
+    const val = _posCtx(pos, spot); _mem.ctx.set(mk, val); return val; };
+  function _posCtx(pos, spot){ const now = new Date();
     const legT = pos.map(p => { let d = 7; if (p.expiry instanceof Date && !isNaN(p.expiry)) d = Math.max(0.001, (p.expiry - now) / 864e5); return Math.max(d / 365, 0.0001); });
     const dte = legT.length ? Math.min(...legT) * 365 : 7, T = Math.max(dte / 365, 0.0001), r = 0.065;
     const raw = pos.map((p, j) => window.BS.iv(spot, p.strike, legT[j], r, p.ltp || p.avg, p.type));
     const ok = raw.filter(v => v > 0).sort((a, b) => a - b);
     const fb = ok.length ? ok[Math.floor(ok.length / 2)] : 0.15; // fall back to the median leg that DID solve
     const legIVs = raw.map(v => v > 0 ? v : fb), ivBad = raw.length - ok.length;
-    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb }; };
+    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb }; }
   window._bsPnl = function (pos, s2, K, ivD){ ivD = ivD || 0; const legT = K.legT || pos.map(() => K.T);
     return pos.reduce((a, p, j) => { const iv = Math.max(0.01, (K.legIVs[j] || 0.15) + ivD); return a + (window.BS.price(s2, p.strike, legT[j], K.r, iv, p.type) - p.avg) * p.qty; }, 0); };
-  window._netGreeks = function (pos, spot){ const K = window._getPosCtx(pos, spot); let nD=0,nG=0,nT=0,nV=0;
+  window._netGreeks = function (pos, spot){
+    const mk = _memKey(pos, spot); const hit = _mem.grk.get(mk); if (hit) return hit;
+    const K = window._getPosCtx(pos, spot); let nD=0,nG=0,nT=0,nV=0;
     pos.forEach((p, j) => { const g = window.BS.greeks(spot, p.strike, K.legT[j], K.r, K.legIVs[j] || 0.15, p.type, p.qty); nD+=g.delta; nG+=g.gamma; nT+=g.theta; nV+=g.vega; });
-    return Object.assign({ nD, nG, nT, nV }, K); };
+    const out = Object.assign({ nD, nG, nT, nV }, K); _mem.grk.set(mk, out); return out; };
   window._breakevens = function (legs){ legs = legs || window._bsLegs(); const spot = window.getSpot(); if (!legs.length || !spot) return null; const ks = legs.map(l => l.strike), lo = Math.min(...ks, spot) * 0.9, hi = Math.max(...ks, spot) * 1.1, N = 800; const E = s => legs.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, s - l.strike) : Math.max(0, l.strike - s); return a + (it - l.avg) * l.qty; }, 0); const cr = []; let prev = E(lo), ps = lo; for (let i = 1; i <= N; i++){ const s = lo + (i / N) * (hi - lo), v = E(s); if ((prev >= 0) !== (v >= 0)) cr.push(ps + (-prev / (v - prev)) * (s - ps)); prev = v; ps = s; } return cr.length ? { lower: Math.min(...cr), upper: Math.max(...cr) } : null; };
 
   const fmtAge = ms => ms < 1000 ? ms + 'ms' : ms < 60000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms / 60000) + 'm';
@@ -271,88 +285,148 @@
 
   // ══ SHADOW PANEL ════════════════════════════════════════════════════════════
   let SR = null; const $ = s => SR ? SR.querySelector(s) : null, $id = i => $('#' + i);
-  function fitCanvas(id, frac){ const cv = $id(id); if (!cv) return null; const w = Math.round(cv.getBoundingClientRect().width) || 420; cv.width = Math.max(w, 260);
-    if (POP && !POP.closed && frac) cv.height = Math.max(Math.round(150 * frac / 0.24), Math.min(560, Math.round((POP.innerHeight || 800) * frac)));
+  // Sized in CSS pixels but backed at devicePixelRatio — without this every line and label is drawn at 1x
+  // and upscaled by the compositor, which is why canvas UIs look soft next to the page's own text.
+  function fitCanvas(id, frac, baseH){
+    const cv = $id(id); if (!cv) return null;
+    const W = Math.max(Math.round(cv.getBoundingClientRect().width) || 420, 260);
+    let H = baseH || 150;
+    if (POP && !POP.closed && frac) H = Math.max(H, Math.min(560, Math.round((POP.innerHeight || 800) * frac)));
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    if (cv._W !== W || cv._H !== H || cv._dpr !== dpr){
+      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+      cv.style.height = H + 'px'; cv._W = W; cv._H = H; cv._dpr = dpr;
+    }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
     return cv; }
   function panelCSS(){ return `
-      :host{all:initial;} *{box-sizing:border-box;margin:0;padding:0;font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;}
-      /* host is positioned (absolute/fixed) by JS to sit in the empty space below the positions tables — never inside Angular's DOM */
-      #spay{position:static;width:100%;background:${C.panel};border:1px solid ${C.line};border-radius:16px;overflow:hidden;color:${C.text};box-shadow:0 14px 40px -20px rgba(0,0,0,.6);}
-      .dbg{font-family:${MONO};font-size:9px;color:${C.muted};margin-left:auto;}
-      .top{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid ${C.line};user-select:none;}
-      .brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:12.5px;}
-      .mk{width:20px;height:20px;border-radius:6px;background:linear-gradient(135deg,${C.accent},${C.accent2});display:grid;place-items:center;color:#04140d;font-weight:800;font-size:11px;}
-      .live{display:flex;align-items:center;gap:6px;font-size:11px;color:${C.muted};}
-      .live .d{width:7px;height:7px;border-radius:50%;background:${C.dn};transition:.3s;}
-      .live.on .d{background:${C.accent};box-shadow:0 0 0 3px rgba(52,211,153,.18);}.live.on{color:${C.accent};}
-      .live.warn .d{background:${C.warn};box-shadow:0 0 0 3px rgba(251,191,36,.16);}.live.warn{color:${C.warn};}
-      .live.bad .d{background:${C.dn};box-shadow:0 0 0 3px rgba(255,90,82,.18);}.live.bad{color:${C.dn};}
-      .live.shut .d{background:${C.muted};}.live.shut{color:${C.muted};}
-      .ic{background:transparent;border:none;color:${C.muted};font-size:15px;cursor:pointer;padding:0 3px;}.ic:hover{color:${C.text};}
-      .sub{display:flex;gap:12px;padding:9px 14px 4px;font-size:12px;color:${C.sub};}.sub b{color:${C.text};}
-      .wrap{padding:6px 12px 12px;}
-      canvas{display:block;width:100%;background:transparent;border-radius:10px;}
-      .grk{display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:10px;}
-      .grk>div{background:${C.card};border-radius:10px;padding:8px 5px;text-align:center;}
-      .gl{font-size:10px;color:${C.muted};}.gv{font-size:15px;font-weight:700;margin-top:2px;}
-      .risk{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:8px;}
-      .rc{background:${C.card};border-radius:10px;padding:8px 10px;}
-      .rl{font-size:10px;color:${C.muted};}.rv{font-size:14px;font-weight:700;margin-top:2px;}.rs{font-size:9.5px;color:${C.muted};margin-top:1px;}
-      .empty{color:${C.muted};font-size:12px;text-align:center;padding:26px 0;}
-      .gv,.rv,#spay-mtm,#spay-spot,#spay-dte{font-family:${MONO};}
-      .books{display:flex;gap:6px;padding:3px 14px 0;}.books:empty{display:none;}
-      .books button{font-family:${MONO};font-size:10.5px;font-weight:700;letter-spacing:.04em;padding:4px 11px;border-radius:7px;border:1px solid ${C.line2};background:transparent;color:${C.muted};cursor:pointer;}
-      .books button:hover{color:${C.text};border-color:${C.muted};}
-      .books button.on{background:${C.accent};border-color:${C.accent};color:#04140d;}
-      #spay-tot,#spay-real,#spay-iv{font-family:${MONO};}
-      #spay-iv{color:${C.warn};cursor:help;}
-      .mhdr{display:flex;align-items:center;gap:12px;margin:10px 0 3px;font-size:9.5px;color:${C.muted};font-family:${MONO};letter-spacing:.05em;}
+      :host{all:initial;}
+      *{box-sizing:border-box;margin:0;padding:0;font-family:${SANS};}
+      /* One surface, hairline rules, two radii. Colour is reserved for P&L sign and alert state. */
+      #spay{position:static;width:100%;background:${C.panel};border:1px solid ${C.line2};border-radius:8px;
+            overflow:hidden;color:${C.text};font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;}
+      .num,.gv,.rv,.hv,#spay-mtm,#spay-spot,#spay-dte,#spay-tot,#spay-real,#spay-dbg{font-family:${MONO};font-variant-numeric:tabular-nums;}
+      .lbl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;white-space:nowrap;}
+
+      .top{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-bottom:1px solid ${C.line};user-select:none;}
+      .wm{font-size:8.5px;letter-spacing:.2em;color:${C.sub};font-weight:600;}
+      .tools{display:flex;align-items:center;gap:4px;}
+      .live{display:flex;align-items:center;gap:5px;font-size:8.5px;letter-spacing:.1em;color:${C.muted};margin-right:6px;text-transform:uppercase;}
+      .live .d{width:5px;height:5px;border-radius:50%;background:${C.muted};}
+      .live.on .d{background:${C.up};}.live.on{color:${C.up};}
+      .live.warn .d{background:${C.warn};}.live.warn{color:${C.warn};}
+      .live.bad .d{background:${C.dn};}.live.bad{color:${C.dn};}
+      .ic{background:transparent;border:none;color:${C.muted};cursor:pointer;padding:3px 4px;border-radius:4px;display:grid;place-items:center;line-height:0;}
+      .ic:hover{color:${C.text};background:${C.card};}
+      .ic.act{color:${C.up};}
+      .ic svg{display:block;}
+
+      /* book switcher: underline, not pills */
+      .books{display:flex;gap:0;padding:0 14px;border-bottom:1px solid ${C.line};}.books:empty{display:none;border:0;}
+      .books button{font-family:${MONO};font-size:9.5px;font-weight:600;letter-spacing:.1em;padding:7px 0;margin-right:16px;
+                    border:none;border-bottom:1.5px solid transparent;background:none;color:${C.muted};cursor:pointer;}
+      .books button:hover{color:${C.sub};}
+      .books button.on{color:${C.text};border-bottom-color:${C.up};}
+
+      /* hero — the answer, first */
+      .hero{padding:13px 14px 12px;border-bottom:1px solid ${C.line};}
+      .hero .hl{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
+      .hv{font-family:${MONO};font-size:29px;line-height:1.05;letter-spacing:-.015em;font-variant-numeric:tabular-nums;}
+      .hs{display:flex;flex-wrap:wrap;gap:12px;margin-top:6px;font-size:10px;color:${C.muted};font-family:${MONO};}
+      .hs b{color:${C.sub};font-weight:400;}
+      #spay-iv{color:${C.warn};cursor:help;font-size:9px;letter-spacing:.04em;}
+      #spay-dbg{margin-left:auto;color:${C.dim};font-size:8.5px;}
+
+      .wrap{padding:10px 14px 12px;}
+      canvas{display:block;width:100%;background:transparent;}
+      .mhdr{display:flex;align-items:center;gap:14px;margin:14px 0 4px;font-size:7.5px;letter-spacing:.14em;
+            color:${C.muted};font-family:${MONO};text-transform:uppercase;}
       .mhdr .k{display:flex;align-items:center;gap:5px;}
-      .mhdr .k:before{content:'';width:10px;height:3px;border-radius:2px;background:${C.accent};}
+      .mhdr .k:before{content:'';width:9px;height:2px;background:${C.up};}
       .mhdr .k2:before{background:${C.ce};}
-      .mhdr .mnow{margin-left:auto;color:${C.sub};}
-      .alert{display:flex;align-items:center;gap:10px;margin:8px 12px 0;padding:8px 11px;border-radius:9px;font-size:11.5px;font-family:${MONO};border:1px solid;}
-      .alert.bad{background:rgba(255,90,82,.12);border-color:rgba(255,90,82,.45);color:${C.dn};}
-      .alert.warn{background:rgba(251,191,36,.10);border-color:rgba(251,191,36,.42);color:${C.warn};}
-      .alert.good{background:rgba(74,222,128,.10);border-color:rgba(74,222,128,.42);color:${C.accent};}
-      .alert .ad{flex:1;} .alert .ax{background:none;border:none;color:inherit;cursor:pointer;font-size:12px;opacity:.7;}
-      .cfg{margin:8px 12px 0;padding:10px 12px;background:${C.card};border:1px solid ${C.line};border-radius:10px;}
-      .cfg label{display:flex;align-items:center;gap:8px;font-size:11px;color:${C.sub};margin-bottom:6px;}
-      .cfg label i{font-style:normal;color:${C.muted};font-size:9.5px;}
-      .cfg input[type=number]{width:86px;background:${C.bg};border:1px solid ${C.line2};color:${C.text};font-family:${MONO};font-size:11px;padding:3px 6px;border-radius:5px;}
-      .cfg .cks{display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;padding-top:8px;border-top:1px solid ${C.line};}
-      .cfg .ck{gap:5px;margin:0;cursor:pointer;}
-      .cfgn{margin-top:8px;font-size:9.5px;color:${C.muted};line-height:1.45;}
-      #spay-log{margin-top:8px;border-top:1px solid ${C.line};padding-top:6px;max-height:150px;overflow:auto;}
-      .lg{font-family:${MONO};font-size:10px;padding:2px 0;color:${C.sub};}
-      .lg span{color:${C.muted};margin-right:8px;} .lg.bad{color:${C.dn};} .lg.warn{color:${C.warn};} .lg.good{color:${C.accent};}
-      .lg.none{color:${C.muted};}
-      .ic.bell{font-size:11px;border:1px solid ${C.line2};border-radius:6px;padding:2px 7px;line-height:1.6;}
-      .ic.bell.act{border-color:${C.accent};color:${C.accent};}
-      .brand{letter-spacing:.02em;}
-      /* ── pop-out window: fills its own window, drops the floating-card chrome ── */
-      body.pop{background:${C.bg};margin:0;padding:16px;}
-      body.pop #spay{max-width:1180px;margin:0 auto;border-radius:12px;box-shadow:none;}
+      .mhdr .mnow{margin-left:auto;color:${C.dim};letter-spacing:.04em;}
+
+      /* greeks: one hairline-separated row, no boxes */
+      .grk{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid ${C.line};}
+      .grk>div{padding:9px 0 9px 12px;border-left:1px solid ${C.line};}
+      .grk>div:first-child{border-left:none;padding-left:14px;}
+      .gl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;}
+      .gv{font-size:14px;margin-top:3px;}
+
+      /* risk: label/value pairs on a grid, no cards */
+      .risk{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid ${C.line};}
+      .rc{padding:10px 14px;border-left:1px solid ${C.line};border-top:1px solid ${C.line};}
+      .rc:nth-child(-n+2){border-top:none;}
+      .rc:nth-child(odd){border-left:none;}
+      .rl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;}
+      .rv{font-size:13.5px;margin-top:3px;}
+      .rs{font-size:9px;color:${C.dim};margin-top:2px;}
+
+      .alert{display:flex;align-items:center;gap:10px;padding:8px 14px;font-size:11px;font-family:${MONO};
+             border-top:1px solid ${C.line};border-left:2px solid;}
+      .alert.bad{background:rgba(240,86,63,.07);border-left-color:${C.dn};color:${C.dn};}
+      .alert.warn{background:rgba(210,153,34,.07);border-left-color:${C.warn};color:${C.warn};}
+      .alert.good{background:rgba(63,185,80,.07);border-left-color:${C.up};color:${C.up};}
+      .alert .ad{flex:1;} .alert .ax{background:none;border:none;color:inherit;cursor:pointer;font-size:11px;opacity:.6;}
+
+      .cfg{padding:12px 14px;border-top:1px solid ${C.line};background:${C.card};}
+      .cfg label{display:flex;align-items:center;gap:8px;font-size:7.5px;letter-spacing:.14em;color:${C.muted};
+                 text-transform:uppercase;margin-bottom:7px;}
+      .cfg label i{font-style:normal;color:${C.dim};letter-spacing:.04em;text-transform:none;font-size:9px;}
+      .cfg input[type=number]{width:92px;background:${C.panel};border:1px solid ${C.line2};color:${C.text};
+                 font-family:${MONO};font-size:11px;padding:4px 7px;border-radius:4px;font-variant-numeric:tabular-nums;}
+      .cfg input[type=number]:focus{outline:none;border-color:${C.up};}
+      .cfg .cks{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;padding-top:10px;border-top:1px solid ${C.line};}
+      .cfg .ck{gap:6px;margin:0;cursor:pointer;letter-spacing:.1em;}
+      .cfg .ck input{accent-color:${C.up};}
+      .cfgn{margin-top:10px;font-size:9px;color:${C.dim};line-height:1.5;letter-spacing:0;text-transform:none;}
+      #spay-log{margin-top:10px;border-top:1px solid ${C.line};padding-top:8px;max-height:150px;overflow:auto;}
+      .lg{font-family:${MONO};font-size:9.5px;padding:2px 0;color:${C.sub};}
+      .lg span{color:${C.dim};margin-right:8px;}
+      .lg.bad{color:${C.dn};}.lg.warn{color:${C.warn};}.lg.good{color:${C.up};}.lg.none{color:${C.dim};}
+
+      /* pop-out window */
+      body.pop{background:${C.bg};margin:0;padding:20px;}
+      body.pop #spay{max-width:1180px;margin:0 auto;}
       #spay-legs{display:none;}
-      body.pop #spay-legs{display:block;margin-top:8px;background:${C.card};border-radius:10px;overflow:hidden;}
-      #spay-legs table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:11.5px;}
-      #spay-legs th{text-align:right;color:${C.muted};font-weight:600;font-size:9.5px;letter-spacing:.06em;padding:7px 12px;border-bottom:1px solid ${C.line};}
-      #spay-legs td{text-align:right;padding:7px 12px;border-bottom:1px solid ${C.line};color:${C.sub};}
+      body.pop #spay-legs{display:block;border-top:1px solid ${C.line};}
+      #spay-legs table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:11px;font-variant-numeric:tabular-nums;}
+      #spay-legs th{text-align:right;color:${C.muted};font-weight:600;font-size:7.5px;letter-spacing:.14em;
+                    text-transform:uppercase;padding:8px 14px;border-bottom:1px solid ${C.line};}
+      #spay-legs td{text-align:right;padding:7px 14px;border-bottom:1px solid ${C.line};color:${C.sub};}
       #spay-legs th:first-child,#spay-legs td:first-child{text-align:left;color:${C.text};}
       #spay-legs tr:last-child td{border-bottom:none;}
-      .ic.pop{font-size:12px;font-weight:700;font-family:${MONO};border:1px solid ${C.line2};border-radius:6px;padding:2px 8px;line-height:1.5;}
-      .ic.pop:hover{border-color:${C.accent};color:${C.accent};}
     `; }
   function panelHTML(){ return `
-      <div class="top" id="spay-top"><div class="brand"><span class="mk">S</span> Payoff &amp; Risk</div>
-        <div style="display:flex;align-items:center;gap:10px;"><span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span><button class="ic bell" id="spay-bell" title="Alerts">◉</button><button class="ic pop" id="spay-pop" title="Open in its own window">⤡</button><button class="ic" id="spay-min">—</button><button class="ic" id="spay-close">✕</button></div></div>
-      <div class="sub"><span id="spay-spot">NIFTY —</span><span id="spay-dte"></span><span>MTM <b id="spay-mtm">—</b></span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span><span id="spay-real" style="display:none"></span><span id="spay-tot" style="display:none"></span><span class="dbg" id="spay-dbg"></span></div>
+      <div class="top" id="spay-top">
+        <span class="wm">PAYOFF &amp; RISK</span>
+        <span class="tools">
+          <span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span>
+          <button class="ic" id="spay-bell" title="Alerts"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M4.6 6.6a3.4 3.4 0 0 1 6.8 0c0 2.4.7 3.4 1.1 3.8H3.5c.4-.4 1.1-1.4 1.1-3.8Z"/><path d="M6.5 12.4a1.6 1.6 0 0 0 3 0"/></svg></button>
+          <button class="ic" id="spay-pop" title="Open in its own window"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M9.5 2.5H13.5V6.5"/><path d="M13.5 2.5 8.5 7.5"/><path d="M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/></svg></button>
+          <button class="ic" id="spay-min" title="Collapse"><svg viewBox="0 0 16 16" width="12" height="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M4 8h8"/></svg></button>
+          <button class="ic" id="spay-close" title="Close"><svg viewBox="0 0 16 16" width="12" height="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></svg></button>
+        </span>
+      </div>
+      <div class="books" id="spay-books"></div>
+      <div class="hero">
+        <div class="hl"><span class="lbl"><span id="spay-book">NIFTY</span> · DAY P&amp;L</span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span></div>
+        <div class="hv" id="spay-day">—</div>
+        <div class="hs">
+          <span id="spay-spot">—</span><span id="spay-dte"></span>
+          <span>open <b id="spay-mtm">—</b></span>
+          <span id="spay-real" style="display:none"></span><span id="spay-tot" style="display:none"></span>
+          <span id="spay-dbg"></span>
+        </div>
+      </div>
       <div class="alert" id="spay-alert" style="display:none"><span class="ad"></span><button class="ax" id="spay-ax">✕</button></div>
       <div class="cfg" id="spay-cfg" style="display:none">
         <label>Breakeven warn <input id="a-be" type="number" min="0" step="5"><i>pts</i></label>
-        <label>Target <input id="a-tgt" type="number" step="500"><i>₹</i></label>
-        <label>Stop <input id="a-stop" type="number" step="500"><i>₹ (negative)</i></label>
-        <label>|Δ| limit <input id="a-dlt" type="number" min="0" step="5"><i>0 = off</i></label>
+        <label>Target <input id="a-tgt" type="number" step="500"><i>₹ day P&amp;L</i></label>
+        <label>Stop <input id="a-stop" type="number" step="500"><i>₹ negative</i></label>
+        <label>Delta limit <input id="a-dlt" type="number" min="0" step="5"><i>0 = off</i></label>
         <div class="cks">
           <label class="ck"><input id="a-on" type="checkbox">alerts on</label>
           <label class="ck"><input id="a-snd" type="checkbox">sound</label>
@@ -360,20 +434,27 @@
           <label class="ck"><input id="a-fls" type="checkbox">flash</label>
           <label class="ck"><input id="a-hl" type="checkbox">feed health</label>
         </div>
-        <div class="cfgn">Alerts fire once per crossing and re-arm only after the value pulls back. Nothing fires while the feed is stale, frozen, or the market is closed.</div>
+        <div class="cfgn">Alerts fire once per crossing and re-arm only after the value pulls back. Nothing fires while the feed is stale or frozen, or outside market hours.</div>
         <div id="spay-log"></div>
       </div>
-      <div class="books" id="spay-books"></div>
-      <div class="wrap"><canvas id="spay-cv" height="230"></canvas>
-        <div class="mhdr"><span class="k k1">Day P&amp;L ₹</span><span class="k k2">Δ net</span><span class="mnow" id="spay-mnow"></span></div>
+      <div class="wrap">
+        <canvas id="spay-cv" height="230"></canvas>
+        <div class="mhdr"><span class="k k1">Day P&amp;L</span><span class="k k2">Net delta</span><span class="mnow" id="spay-mnow"></span></div>
         <canvas id="spay-mtm-cv" height="150"></canvas>
-        <div class="grk"><div><div class="gl">Δ Delta</div><div class="gv" id="g-d">—</div></div><div><div class="gl">Γ Gamma</div><div class="gv" id="g-g">—</div></div><div><div class="gl">Θ /hr</div><div class="gv" id="g-t">—</div></div><div><div class="gl">Vega</div><div class="gv" id="g-v">—</div></div></div>
-        <div class="risk"><div class="rc"><div class="rl">Max loss (±3%)</div><div class="rv" id="r-ml" style="color:${C.dn}">—</div><div class="rs">worst in stress range</div></div>
-          <div class="rc"><div class="rl">Breakevens</div><div class="rv" id="r-be">—</div><div class="rs" id="r-bes">safe zone</div></div>
-          <div class="rc"><div class="rl">Margin used</div><div class="rv" id="r-mg">—</div><div class="rs" id="r-mgs"></div></div>
-          <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl" style="color:${C.up}">—</div><div class="rs">θ if pinned here</div></div></div>
       </div>
-        <div id="spay-legs"></div>`; }
+      <div class="grk">
+        <div><div class="gl">Delta</div><div class="gv" id="g-d">—</div></div>
+        <div><div class="gl">Gamma</div><div class="gv" id="g-g">—</div></div>
+        <div><div class="gl">Theta / hr</div><div class="gv" id="g-t">—</div></div>
+        <div><div class="gl">Vega</div><div class="gv" id="g-v">—</div></div>
+      </div>
+      <div class="risk">
+        <div class="rc"><div class="rl">Breakevens</div><div class="rv" id="r-be">—</div><div class="rs" id="r-bes">safe zone</div></div>
+        <div class="rc"><div class="rl">Max loss ±3%</div><div class="rv" id="r-ml">—</div><div class="rs">worst in stress range</div></div>
+        <div class="rc"><div class="rl">Margin used</div><div class="rv" id="r-mg">—</div><div class="rs" id="r-mgs"></div></div>
+        <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl">—</div><div class="rs">theta if pinned here</div></div>
+      </div>
+      <div id="spay-legs"></div>`; }
 
   let POP = null, _mini = false;
   function buildPanel(){
@@ -411,7 +492,7 @@
     const root = $id('spay'); if (root && !root.__au){ root.__au = 1; root.addEventListener('click', () => { if (AL.sound) audioOn(); }, true); }
     [['spay-cv', () => window.drawPayoff()], ['spay-mtm-cv', () => window.drawMtm()]].forEach(([id, draw]) => {
       const cv = $id(id); if (!cv || cv.__h) return; cv.__h = 1; cv.style.cursor = 'crosshair';
-      cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * (cv.width / r.width); try { draw(); } catch (_) {} });
+      cv.addEventListener('mousemove', e => { const r = cv.getBoundingClientRect(); cv._cur = (e.clientX - r.left) * ((cv._W || r.width) / r.width); try { draw(); } catch (_) {} });
       cv.addEventListener('mouseleave', () => { cv._cur = null; try { draw(); } catch (_) {} });
     });
   }
@@ -470,7 +551,7 @@
   // ══ PAYOFF CHART ════════════════════════════════════════════════════════════
   function smooth(ctx, p){ for (let i = 1; i < p.length; i++) ctx.lineTo(p[i].x, p[i].y); }
   window.drawPayoff = function (){
-    const cv = fitCanvas('spay-cv', 0.38); if (!cv) return; const ctx = cv.getContext('2d'), W = cv.width, H = cv.height; ctx.clearRect(0, 0, W, H);
+    const cv = fitCanvas('spay-cv', 0.38, 230); if (!cv) return; const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const pos = window._bsLegs(), spot = window.getSpot();
     if (!pos.length || !spot){ ctx.fillStyle = C.muted; ctx.font = '12px ' + MONO; ctx.textAlign = 'center'; ctx.fillText('no open positions', W / 2, H / 2); return; }
     const K = window._getPosCtx(pos, spot), dte = K.dte;
@@ -492,11 +573,18 @@
     if (be){ [be.lower, be.upper].forEach(v => { if (v < lo || v > hi) return; const bx = X(v); ctx.strokeStyle = 'rgba(251,191,36,.4)'; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(bx, Tp); ctx.lineTo(bx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = C.warn; ctx.textAlign = 'center'; ctx.fillText(Math.round(v), bx, Tp + 10); }); }
     const sx = X(spot); ctx.strokeStyle = 'rgba(74,222,128,.45)'; ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.moveTo(sx, Tp); ctx.lineTo(sx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
     // ── node-dot payoff: green above 0, red below (the "TradingAlgo" vibe) ──
-    const stepN = Math.max(1, Math.round(N / 54)); let prev = null;
-    for (let i = 0; i <= N; i += stepN){ const p = pN[i], x = X(p.s), y = Y(p.p), c = p.p >= 0 ? C.up : C.dn; if (prev){ ctx.strokeStyle = prev.c; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(x, y); ctx.stroke(); } prev = { x, y, c }; }
-    for (let i = 0; i <= N; i += stepN){ const p = pN[i]; ctx.beginPath(); ctx.arc(X(p.s), Y(p.p), 2.5, 0, 7); ctx.fillStyle = p.p >= 0 ? C.up : C.dn; ctx.fill(); }
-    const at = pN.reduce((b, p) => Math.abs(p.s - spot) < Math.abs(b.s - spot) ? p : b);
-    ctx.beginPath(); ctx.arc(X(at.s), Y(at.p), 4.2, 0, 7); ctx.fillStyle = at.p >= 0 ? C.up : C.dn; ctx.fill(); ctx.strokeStyle = C.bg; ctx.lineWidth = 1.5; ctx.stroke();
+    // filled region to the zero line, then one clean curve — no per-sample dots
+    const zc = Math.max(Tp, Math.min(Tp + CH, z));
+    const region = () => { ctx.beginPath(); ctx.moveTo(X(pN[0].s), zc); pN.forEach(q => ctx.lineTo(X(q.s), Y(q.p))); ctx.lineTo(X(pN[N].s), zc); ctx.closePath(); };
+    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, zc - Tp)); ctx.clip(); region(); ctx.fillStyle = 'rgba(63,185,80,.09)'; ctx.fill(); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region(); ctx.fillStyle = 'rgba(240,86,63,.09)'; ctx.fill(); ctx.restore();
+    ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+    for (let i = 1; i <= N; i++){
+      ctx.strokeStyle = (pN[i - 1].p >= 0 && pN[i].p >= 0) ? C.up : (pN[i - 1].p < 0 && pN[i].p < 0) ? C.dn : C.muted;
+      ctx.beginPath(); ctx.moveTo(X(pN[i - 1].s), Y(pN[i - 1].p)); ctx.lineTo(X(pN[i].s), Y(pN[i].p)); ctx.stroke(); }
+    const at = pN.reduce((b, q) => Math.abs(q.s - spot) < Math.abs(b.s - spot) ? q : b);
+    ctx.beginPath(); ctx.arc(X(at.s), Y(at.p), 3.2, 0, 7); ctx.fillStyle = at.p >= 0 ? C.up : C.dn; ctx.fill();
+    ctx.strokeStyle = C.panel; ctx.lineWidth = 1.5; ctx.stroke();
     const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '9px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 10);
     // hover crosshair
     if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = '#fff'; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = 'rgba(5,6,7,.96)'; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
@@ -505,8 +593,8 @@
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
   const MIN_SPAN = 1800, GAP_S = 45, Y_FLOOR = 1000; // 30-min minimum frame; don't draw across recording gaps
   window.drawMtm = function (){
-    const cv = fitCanvas('spay-mtm-cv', 0.22); if (!cv) return;
-    const ctx = cv.getContext('2d'), W = cv.width, H = cv.height; ctx.clearRect(0, 0, W, H);
+    const cv = fitCanvas('spay-mtm-cv', 0.22, 150); if (!cv) return;
+    const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const a = Store.hist[activeBook()] || [];
     if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '11px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording…' : 'day P&L starts recording now', W / 2, H / 2); return; }
     const L2 = 52, R = 46, Tp = 10, B = 18, CW = W - L2 - R, CH = H - Tp - B;
@@ -649,9 +737,11 @@
   }
   function renderLog(){
     const el = $id('spay-log'); if (!el) return;
-    el.innerHTML = ALOG.length
+    const html = ALOG.length
       ? ALOG.slice(0, 12).map(a => '<div class="lg ' + a.sev + '"><span>' + hhmm(Math.round(a.t / 1000)) + '</span>' + a.msg.replace(/</g, '&lt;') + '</div>').join('')
       : '<div class="lg none">no alerts yet today</div>';
+    if (el.__sig === html) return; el.__sig = html;
+    el.innerHTML = html;
   }
 
   // ══ REFRESH ═════════════════════════════════════════════════════════════════
@@ -667,6 +757,7 @@
     const el = $id('spay-legs'); if (!el) return;
     const legs = window._bsLegs(); if (!legs.length){ if (el.innerHTML) el.innerHTML = ''; return; }
     const rows = legs.map(l => { const v = (l.ltp - l.avg) * l.qty; return '<tr><td>' + l.under + ' ' + l.strike + ' ' + l.type + '</td><td>' + l.qty + '</td><td>' + l.avg.toFixed(2) + '</td><td>' + l.ltp.toFixed(2) + '</td><td style="color:' + col(v) + '">' + money(v) + '</td></tr>'; }).join('');
+    if (el.__sig === rows) return; el.__sig = rows; // only touch the DOM when content actually changed
     el.innerHTML = '<table><thead><tr><th>Leg</th><th>Qty</th><th>Avg</th><th>LTP</th><th>P&amp;L</th></tr></thead><tbody>' + rows + '</tbody></table>';
   }
   // Sample EVERY book, not just the visible one — a book you're not looking at must not go dark.
@@ -688,22 +779,26 @@
   }
   window.refreshAll = function (){
     if (!SR || !$id('spay')) return;
+    memClear(); // start a new frame
     const set = (id, v, c) => { const e = $id(id); if (!e) return; e.textContent = v; if (c) e.style.color = c; };
     const pos = window._bsLegs(), spot = window.getSpot(), book = activeBook(), mtm = window._bookMTM(), total = window.getOpenMTM();
     renderBooks(book);
-    set('spay-spot', book + ' ' + (spot ? spot.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '—'));
-    set('spay-mtm', pos.length ? money(mtm) : '—', col(mtm));
+    set('spay-book', book);
+    set('spay-spot', (spot ? spot.toLocaleString('en-IN', { maximumFractionDigits: 0 }) : '—') + ' spot');
+    const day = mtm + (Store.realised[book] || 0);
+    set('spay-day', pos.length ? money(day) : '—', pos.length ? col(day) : C.muted);
+    set('spay-mtm', pos.length ? money(mtm) : '—', pos.length ? col(mtm) : C.muted);
     const rl = $id('spay-real'); const rv = Store.realised[book] || 0;
     if (rl){ rl.style.display = rv ? '' : 'none'; if (rv){ rl.textContent = 'booked ' + money(rv); rl.style.color = col(rv); } }
-    const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'ALL ' + money(total); tot.style.color = col(total); } }
-    if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? (dte * 24).toFixed(1) + 'h to expiry' : dte.toFixed(1) + 'd to expiry');
+    const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'all books ' + money(total); tot.style.color = col(total); } }
+    if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? Math.floor(dte * 24) + 'h ' + Math.round((dte * 24 % 1) * 60) + 'm to expiry' : dte.toFixed(1) + 'd to expiry');
       const iw = $id('spay-iv');
-      if (iw){ iw.style.display = K.ivBad ? '' : 'none'; if (K.ivBad) iw.textContent = '⚠ ' + K.ivBad + ' leg IV est'; }
+      if (iw){ iw.style.display = K.ivBad ? '' : 'none'; if (K.ivBad) iw.textContent = K.ivBad + ' LEG IV ESTIMATED'; }
       const G = window._netGreeks(pos, spot); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
       const be = window._breakevens(pos); if (be){ const inside = spot >= be.lower && spot <= be.upper, near = Math.min(Math.abs(be.upper - spot), Math.abs(spot - be.lower)); set('r-be', Math.round(be.lower).toLocaleString('en-IN') + '–' + Math.round(be.upper).toLocaleString('en-IN')); set('r-bes', inside ? near.toFixed(0) + ' pt to edge' : 'OUTSIDE', inside ? C.muted : C.dn); } else { set('r-be', '—'); set('r-bes', ''); }
       const decay = pos.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, spot - l.strike) : Math.max(0, l.strike - spot); return a + (l.ltp - it) * (-l.qty); }, 0); set('r-dl', money(decay), decay >= 0 ? C.up : C.dn);
-    } else { ['g-d','g-g','g-t','g-v','r-ml','r-be','r-dl'].forEach(id => set(id, '—', C.muted)); set('spay-dte', ''); }
+    } else { ['g-d','g-g','g-t','g-v','r-ml','r-be','r-dl'].forEach(id => set(id, '—', C.muted)); set('spay-dte', ''); set('spay-day', '—', C.muted); }
     const allowed = allowedMargin(), used = marginUsed(), pctm = Math.min(100, allowed ? used / allowed * 100 : 0);
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
     // Status must describe OUR MARKS, not our network activity. Four honest states, worst-case wins.
@@ -724,7 +819,7 @@
     try { evalAlerts(); } catch (e) {}
     const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
     renderLegs();
-    const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.textContent = on ? '⇲' : '⤡'; pb.title = on ? 'Dock back into the page' : 'Open in its own window'; }
+    const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.classList.toggle('act', !!on); pb.title = on ? 'Dock back into the page' : 'Open in its own window'; } // never overwrite the icon markup
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
     positionPanel();
