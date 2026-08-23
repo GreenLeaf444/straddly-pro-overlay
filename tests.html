@@ -238,6 +238,28 @@
       F.evalAlerts('OPEN'); var ok=F.ALOG.length===0; F.AL.give=0;
       return ok || 'fired: '+F.ALOG[0].msg; });
 
+    grp('THEME');
+    function lum(c){ var m=c.match(/\d+/g).map(Number).slice(0,3).map(function(v){v/=255;return v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4);}); return .2126*m[0]+.7152*m[1]+.0722*m[2]; }
+    function cr(fg,bg){ var a=lum(fg),b=lum(bg); return (Math.max(a,b)+.05)/(Math.min(a,b)+.05); }
+    function worstContrast(){
+      var SRr=window._SPR, pb=getComputedStyle(SRr.querySelector('#spay')).backgroundColor, worst=99, who='';
+      ['.gl','.gv','.rl','.rv','.rs','.hs','.lbl','.wm','.books button','#spay-day'].forEach(function(sel){
+        var e=SRr.querySelector(sel); if(!e) return; var v=cr(getComputedStyle(e).color, pb);
+        if(v<worst){ worst=v; who=sel; } });
+      return {ratio:+worst.toFixed(2), el:who};
+    }
+    t('no text falls below 4.5:1 in either theme after switching', function(){
+      var SRr=window._SPR, btn=SRr.querySelector('#spay-theme'), out=[];
+      for (var i=0;i<4;i++){ btn.click(); var w=worstContrast(); out.push(S.theme+' '+w.el+' '+w.ratio);
+        if (w.ratio < 4.5) return 'FAILED in '+S.theme+' at '+w.el+' = '+w.ratio+':1 (sequence: '+out.join(' | ')+')'; }
+      return true; });
+    t('switching theme leaves no stale inline colour behind', function(){
+      var SRr=window._SPR, btn=SRr.querySelector('#spay-theme');
+      btn.click(); var a=SRr.querySelector('.rv').style.color;
+      btn.click(); var b=SRr.querySelector('.rv').style.color;
+      // either cleared, or re-set from the CURRENT palette - never a leftover from the other theme
+      return (a===b) || 'inline colour drifted across themes: "'+a+'" -> "'+b+'"'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

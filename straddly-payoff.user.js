@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.2
+// @version      4.3
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -34,8 +34,8 @@
             goodBg:'rgba(63,185,80,.07)', warnBg:'rgba(210,153,34,.07)', badBg:'rgba(240,86,63,.07)',
             beLine:'rgba(210,153,34,.45)', spotLine:'rgba(77,155,255,.60)',
             hair:'rgba(255,255,255,.30)', tipBg:'rgba(5,6,9,.96)', dot:'#ffffff' },
-    light:{ bg:'#f4f5f3', panel:'#fbfbf9', card:'#f2f3f0', line:'#e4e5e0', line2:'#d3d5cf',
-            text:'#16181d', sub:'#454a52', muted:'#666c74', dim:'#878d95',
+    light:{ bg:'#eef0ec', panel:'#fcfcfa', card:'#f1f2ee', line:'#dcded8', line2:'#c3c6be',
+            text:'#08090c', sub:'#23272d', muted:'#3f444b', dim:'#5d636b',
             accent:'#0b64d4', accent2:'#0a4fa8', accentRing:'rgba(11,100,212,.22)', up:'#1a7f37', dn:'#cf222e', warn:'#9a6700',
             ce:'#0b64d4', pe:'#cf222e', sd:'#6639ba',
             upFill:'rgba(26,127,55,.10)', dnFill:'rgba(207,34,46,.09)',
@@ -357,12 +357,12 @@
       #spay{position:static;width:100%;background:${C.panel};border:1px solid ${C.line2};border-radius:8px;
             overflow:hidden;color:${C.text};font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1;}
       .num,.gv,.rv,.hv,#spay-mtm,#spay-spot,#spay-dte,#spay-tot,#spay-real,#spay-dbg{font-family:${MONO};font-variant-numeric:tabular-nums;}
-      .lbl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;white-space:nowrap;}
+      .lbl{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;white-space:nowrap;}
 
       .top{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-bottom:1px solid ${C.line};user-select:none;}
-      .wm{font-size:8.5px;letter-spacing:.2em;color:${C.accent};font-weight:600;}
+      .wm{font-size:9.5px;letter-spacing:.18em;color:${C.accent};font-weight:600;}
       .tools{display:flex;align-items:center;gap:4px;}
-      .live{display:flex;align-items:center;gap:5px;font-size:8.5px;letter-spacing:.1em;color:${C.muted};margin-right:6px;text-transform:uppercase;}
+      .live{display:flex;align-items:center;gap:5px;font-size:9.5px;letter-spacing:.1em;color:${C.muted};margin-right:6px;text-transform:uppercase;}
       .live .d{width:5px;height:5px;border-radius:50%;background:${C.muted};}
       .live.on .d{background:${C.up};}.live.on{color:${C.up};}
       .live.warn .d{background:${C.warn};}.live.warn{color:${C.warn};}
@@ -374,7 +374,7 @@
 
       /* book switcher: underline, not pills */
       .books{display:flex;gap:0;padding:0 14px;border-bottom:1px solid ${C.line};}.books:empty{display:none;border:0;}
-      .books button{font-family:${MONO};font-size:9.5px;font-weight:600;letter-spacing:.1em;padding:7px 0;margin-right:16px;
+      .books button{font-family:${MONO};font-size:11px;font-weight:600;letter-spacing:.1em;padding:7px 0;margin-right:16px;
                     border:none;border-bottom:1.5px solid transparent;background:none;color:${C.muted};cursor:pointer;}
       .books button:hover{color:${C.sub};}
       .books button.on{color:${C.text};border-bottom-color:${C.accent};}
@@ -382,18 +382,18 @@
       /* hero — the answer, first */
       .hero{padding:13px 14px 12px;border-bottom:1px solid ${C.line};}
       .hero .hl{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
-      .hv{font-family:${MONO};font-size:29px;line-height:1.05;letter-spacing:-.015em;font-variant-numeric:tabular-nums;}
-      .hs{display:flex;flex-wrap:wrap;gap:12px;margin-top:6px;font-size:10px;color:${C.muted};font-family:${MONO};}
+      .hv{font-family:${MONO};font-size:33px;line-height:1.05;letter-spacing:-.015em;font-variant-numeric:tabular-nums;}
+      .hs{display:flex;flex-wrap:wrap;gap:13px;margin-top:7px;font-size:11.5px;color:${C.muted};font-family:${MONO};}
       .hs b{color:${C.sub};font-weight:400;}
-      #spay-iv{color:${C.warn};cursor:help;font-size:9px;letter-spacing:.04em;}
-      #spay-dbg{margin-left:auto;color:${C.dim};font-size:8.5px;}
+      #spay-iv{color:${C.warn};cursor:help;font-size:10px;letter-spacing:.04em;}
+      #spay-dbg{margin-left:auto;color:${C.dim};font-size:9.5px;}
 
       .wrap{padding:10px 14px 12px;}
       canvas{display:block;width:100%;background:transparent;}
       .rsz{height:11px;margin:1px 0 0;cursor:ns-resize;display:grid;place-items:center;}
       .rsz span{display:block;width:34px;height:2px;border-radius:1px;background:${C.line2};transition:background .12s;}
       .rsz:hover span{background:${C.accent};}
-      .mhdr{display:flex;align-items:center;gap:14px;margin:14px 0 4px;font-size:7.5px;letter-spacing:.14em;
+      .mhdr{display:flex;align-items:center;gap:14px;margin:14px 0 4px;font-size:9px;letter-spacing:.12em;
             color:${C.muted};font-family:${MONO};text-transform:uppercase;}
       .mhdr .k{display:flex;align-items:center;gap:5px;}
       .mhdr .k:before{content:'';width:9px;height:2px;background:${C.accent};}
@@ -404,19 +404,19 @@
       .grk{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid ${C.line};}
       .grk>div{padding:9px 0 9px 12px;border-left:1px solid ${C.line};}
       .grk>div:first-child{border-left:none;padding-left:14px;}
-      .gl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;}
-      .gv{font-size:14px;margin-top:3px;}
+      .gl{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;}
+      .gv{font-size:16.5px;margin-top:4px;}
 
       /* risk: label/value pairs on a grid, no cards */
       .risk{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid ${C.line};}
       .rc{padding:10px 14px;border-left:1px solid ${C.line};border-top:1px solid ${C.line};}
       .rc:nth-child(-n+2){border-top:none;}
       .rc:nth-child(odd){border-left:none;}
-      .rl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;}
-      .rv{font-size:13.5px;margin-top:3px;}
-      .rs{font-size:9px;color:${C.dim};margin-top:2px;}
+      .rl{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;}
+      .rv{font-size:15.5px;margin-top:4px;}
+      .rs{font-size:10px;color:${C.dim};margin-top:3px;}
 
-      .alert{display:flex;align-items:center;gap:10px;padding:8px 14px;font-size:11px;font-family:${MONO};
+      .alert{display:flex;align-items:center;gap:10px;padding:9px 14px;font-size:12px;font-family:${MONO};
              border-top:1px solid ${C.line};border-left:2px solid;}
       .alert.bad{background:${C.badBg};border-left-color:${C.dn};color:${C.dn};}
       .alert.warn{background:${C.warnBg};border-left-color:${C.warn};color:${C.warn};}
@@ -424,18 +424,18 @@
       .alert .ad{flex:1;} .alert .ax{background:none;border:none;color:inherit;cursor:pointer;font-size:11px;opacity:.6;}
 
       .cfg{padding:12px 14px;border-top:1px solid ${C.line};background:${C.card};}
-      .cfg label{display:flex;align-items:center;gap:8px;font-size:7.5px;letter-spacing:.14em;color:${C.muted};
+      .cfg label{display:flex;align-items:center;gap:8px;font-size:9px;letter-spacing:.12em;color:${C.muted};
                  text-transform:uppercase;margin-bottom:7px;}
-      .cfg label i{font-style:normal;color:${C.dim};letter-spacing:.04em;text-transform:none;font-size:9px;}
+      .cfg label i{font-style:normal;color:${C.dim};letter-spacing:.04em;text-transform:none;font-size:10px;}
       .cfg input[type=number]{width:92px;background:${C.panel};border:1px solid ${C.line2};color:${C.text};
-                 font-family:${MONO};font-size:11px;padding:4px 7px;border-radius:4px;font-variant-numeric:tabular-nums;}
+                 font-family:${MONO};font-size:12px;padding:5px 8px;border-radius:4px;font-variant-numeric:tabular-nums;}
       .cfg input[type=number]:focus{outline:none;border-color:${C.accent};box-shadow:0 0 0 2px ${C.accentRing};}
       .cfg .cks{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;padding-top:10px;border-top:1px solid ${C.line};}
       .cfg .ck{gap:6px;margin:0;cursor:pointer;letter-spacing:.1em;}
       .cfg .ck input{accent-color:${C.accent};}
-      .cfgn{margin-top:10px;font-size:9px;color:${C.dim};line-height:1.5;letter-spacing:0;text-transform:none;}
+      .cfgn{margin-top:10px;font-size:10px;color:${C.dim};line-height:1.5;letter-spacing:0;text-transform:none;}
       #spay-log{margin-top:10px;border-top:1px solid ${C.line};padding-top:8px;max-height:150px;overflow:auto;}
-      .lg{font-family:${MONO};font-size:9.5px;padding:2px 0;color:${C.sub};}
+      .lg{font-family:${MONO};font-size:10.5px;padding:2px 0;color:${C.sub};}
       .lg span{color:${C.dim};margin-right:8px;}
       .lg.bad{color:${C.dn};}.lg.warn{color:${C.warn};}.lg.good{color:${C.up};}.lg.none{color:${C.dim};}
 
@@ -444,8 +444,8 @@
       body.pop #spay{max-width:1180px;margin:0 auto;}
       #spay-legs{display:none;}
       body.pop #spay-legs{display:block;border-top:1px solid ${C.line};}
-      #spay-legs table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:11px;font-variant-numeric:tabular-nums;}
-      #spay-legs th{text-align:right;color:${C.muted};font-weight:600;font-size:7.5px;letter-spacing:.14em;
+      #spay-legs table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:12.5px;font-variant-numeric:tabular-nums;}
+      #spay-legs th{text-align:right;color:${C.muted};font-weight:600;font-size:9px;letter-spacing:.12em;
                     text-transform:uppercase;padding:8px 14px;border-bottom:1px solid ${C.line};}
       #spay-legs td{text-align:right;padding:7px 14px;border-bottom:1px solid ${C.line};color:${C.sub};}
       #spay-legs th:first-child,#spay-legs td:first-child{text-align:left;color:${C.text};}
@@ -619,7 +619,7 @@
   window.drawPayoff = function (){
     const cv = fitCanvas('spay-cv', 0.38, 230); if (!cv) return; const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const pos = window._bsLegs(), spot = window.getSpot();
-    if (!pos.length || !spot){ ctx.fillStyle = C.muted; ctx.font = '12px ' + MONO; ctx.textAlign = 'center'; ctx.fillText('no open positions', W / 2, H / 2); return; }
+    if (!pos.length || !spot){ ctx.fillStyle = C.muted; ctx.font = '13px ' + MONO; ctx.textAlign = 'center'; ctx.fillText('no open positions', W / 2, H / 2); return; }
     const K = window._getPosCtx(pos, spot), dte = K.dte;
     const ks = pos.map(p => p.strike);
     const ivs = K.legIVs.slice().sort((a, b) => a - b), ivM = ivs[Math.floor(ivs.length / 2)] || 0.15;
@@ -630,10 +630,10 @@
     for (let i = 0; i <= N; i++){ const s = lo + (i / N) * (hi - lo); pN.push({ s, p: window._bsPnl(pos, s, K, 0) }); }
     const mx = Math.max(...pN.map(p => p.p)), mn = Math.min(...pN.map(p => p.p));
     const yStep = niceStep(((mx - mn) || 1000) / 4), yMin = Math.floor(mn / yStep) * yStep - yStep * 0.2, yMax = Math.ceil(mx / yStep) * yStep + yStep * 0.2;
-    const L = 50, R = 12, Tp = 12, B = 24, CW = W - L - R, CH = H - Tp - B, X = s => L + ((s - lo) / (hi - lo)) * CW, Y = v => Tp + CH - ((v - yMin) / (yMax - yMin)) * CH;
-    ctx.font = '9px ' + MONO;
+    const L = 58, R = 14, Tp = 14, B = 26, CW = W - L - R, CH = H - Tp - B, X = s => L + ((s - lo) / (hi - lo)) * CW, Y = v => Tp + CH - ((v - yMin) / (yMax - yMin)) * CH;
+    ctx.font = '10.5px ' + MONO;
     for (let v = Math.ceil(yMin / yStep) * yStep; v <= yMax; v += yStep){ const y = Y(v); ctx.strokeStyle = (Math.abs(v) < yStep * 0.01) ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke(); ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L - 5, y + 3); }
-    for (let i = 0; i <= 5; i++){ const s = lo + (i / 5) * (hi - lo), x = X(s); ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke(); ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(Math.round(s).toLocaleString('en-IN'), x, H - 7); }
+    for (let i = 0; i <= 5; i++){ const s = lo + (i / 5) * (hi - lo), x = X(s); ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke(); ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(Math.round(s).toLocaleString('en-IN'), x, H - 8); }
     const z = Y(0); ctx.strokeStyle = C.line2; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(L, z); ctx.lineTo(W - R, z); ctx.stroke(); ctx.setLineDash([]);
     const be = window._breakevens(pos);
     if (be){ [be.lower, be.upper].forEach(v => { if (v < lo || v > hi) return; const bx = X(v); ctx.strokeStyle = C.beLine; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(bx, Tp); ctx.lineTo(bx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = C.warn; ctx.textAlign = 'center'; ctx.fillText(Math.round(v), bx, Tp + 10); }); }
@@ -657,9 +657,9 @@
     const at = pN.reduce((b, q) => Math.abs(q.s - spot) < Math.abs(b.s - spot) ? q : b);
     ctx.beginPath(); ctx.arc(X(at.s), Y(at.p), 4.6, 0, 7); ctx.fillStyle = at.p >= 0 ? C.up : C.dn; ctx.fill();
     ctx.strokeStyle = C.panel; ctx.lineWidth = 2; ctx.stroke();
-    const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '9px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 10);
+    const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '10.5px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 11);
     // hover crosshair
-    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
+    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
   };
 
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
@@ -668,8 +668,8 @@
     const cv = fitCanvas('spay-mtm-cv', 0.22, 150); if (!cv) return;
     const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const a = Store.hist[activeBook()] || [];
-    if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '11px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording…' : 'day P&L starts recording now', W / 2, H / 2); return; }
-    const L2 = 52, R = 46, Tp = 10, B = 18, CW = W - L2 - R, CH = H - Tp - B;
+    if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '12px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording…' : 'day P&L starts recording now', W / 2, H / 2); return; }
+    const L2 = 60, R = 52, Tp = 12, B = 21, CW = W - L2 - R, CH = H - Tp - B;
     // left-anchored, minimum 30-minute frame so the curve grows into a stable window instead of rescaling every tick
     const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
     const X = t => L2 + ((t - t0) / span) * CW;
@@ -691,14 +691,14 @@
     if (dMax - dMin < 1){ const c = (dMax + dMin) / 2; dMin = c - 1; dMax = c + 1; }
     const dp = (dMax - dMin) * 0.18; dMin -= dp; dMax += dp;
     const YD = v => Tp + CH - ((v - dMin) / ((dMax - dMin) || 1)) * CH;
-    ctx.font = '9px ' + MONO;
+    ctx.font = '10.5px ' + MONO;
     for (let v = mMin; v <= mMax + 1e-9; v += mStep){ const y = Y(v);
       ctx.strokeStyle = Math.abs(v) < mStep * 0.01 ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L2, y); ctx.lineTo(W - R, y); ctx.stroke();
       ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L2 - 5, y + 3); }
     [dMin, (dMin + dMax) / 2, dMax].forEach(v => { ctx.fillStyle = C.ce; ctx.textAlign = 'left'; ctx.fillText(v.toFixed(0), W - R + 5, YD(v) + 3); });
     for (let i = 0; i <= 3; i++){ const t = t0 + (i / 3) * span, x = X(t);
       ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke();
-      ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(hhmm(t), x, H - 5); }
+      ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(hhmm(t), x, H - 6); }
     // split into contiguous runs — a jump means we weren't recording (other book / tab closed / reload)
     const runs = []; let st = 0;
     for (let i = 1; i < a.length; i++) if (a[i][0] - a[i - 1][0] > GAP_S){ runs.push([st, i - 1]); st = i; }
@@ -726,7 +726,7 @@
       ctx.beginPath(); ctx.arc(cx, Y(nv), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill();
       ctx.beginPath(); ctx.arc(cx, YD(rawD[ni]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
       const lbl = hhmm(nb[0]) + '  ' + money(nv) + (nb[3] ? '  (R ' + money(nb[3]) + ')' : '') + '  Δ' + nb[2];
-      ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14;
+      ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16;
       let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx);
       ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18);
       ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18);
@@ -868,7 +868,9 @@
   window.refreshAll = function (){
     if (!SR || !$id('spay')) return;
     memClear(); // start a new frame
-    const set = (id, v, c) => { const e = $id(id); if (!e) return; e.textContent = v; if (c) e.style.color = c; };
+    // Always write the colour — clearing it to '' when none is given. Leaving the previous inline colour
+    // in place meant a value coloured under one theme kept that colour after switching to the other.
+    const set = (id, v, c) => { const e = $id(id); if (!e) return; e.textContent = v; e.style.color = c || ''; };
     const pos = window._bsLegs(), spot = window.getSpot(), book = activeBook(), mtm = window._bookMTM(), total = window.getOpenMTM();
     renderBooks(book);
     set('spay-book', book);
