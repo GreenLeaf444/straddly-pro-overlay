@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.1
+// @version      4.2
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -27,21 +27,21 @@
   const THEMES = {
     dark: { bg:'#050609', panel:'#0a0c0f', card:'#0f1217', line:'#171a20', line2:'#232830',
             text:'#e8eaed', sub:'#9aa2ac', muted:'#7a818b', dim:'#5a606a',
-            accent:'#3fb950', accent2:'#2ea043', up:'#3fb950', dn:'#f0563f', warn:'#d29922',
-            ce:'#4b93d1', pe:'#f0563f', sd:'#a371f7',
+            accent:'#4d9bff', accent2:'#2f7fe8', accentRing:'rgba(77,155,255,.25)', up:'#3fb950', dn:'#f0563f', warn:'#d29922',
+            ce:'#4d9bff', pe:'#f0563f', sd:'#a371f7',
             upFill:'rgba(63,185,80,.09)', dnFill:'rgba(240,86,63,.09)',
             upArea:'rgba(63,185,80,.15)', dnArea:'rgba(240,86,63,.15)',
             goodBg:'rgba(63,185,80,.07)', warnBg:'rgba(210,153,34,.07)', badBg:'rgba(240,86,63,.07)',
-            beLine:'rgba(210,153,34,.45)', spotLine:'rgba(63,185,80,.45)',
+            beLine:'rgba(210,153,34,.45)', spotLine:'rgba(77,155,255,.60)',
             hair:'rgba(255,255,255,.30)', tipBg:'rgba(5,6,9,.96)', dot:'#ffffff' },
     light:{ bg:'#f4f5f3', panel:'#fbfbf9', card:'#f2f3f0', line:'#e4e5e0', line2:'#d3d5cf',
             text:'#16181d', sub:'#454a52', muted:'#666c74', dim:'#878d95',
-            accent:'#1a7f37', accent2:'#116329', up:'#1a7f37', dn:'#cf222e', warn:'#9a6700',
-            ce:'#0a5fa8', pe:'#cf222e', sd:'#6639ba',
+            accent:'#0b64d4', accent2:'#0a4fa8', accentRing:'rgba(11,100,212,.22)', up:'#1a7f37', dn:'#cf222e', warn:'#9a6700',
+            ce:'#0b64d4', pe:'#cf222e', sd:'#6639ba',
             upFill:'rgba(26,127,55,.10)', dnFill:'rgba(207,34,46,.09)',
             upArea:'rgba(26,127,55,.16)', dnArea:'rgba(207,34,46,.14)',
             goodBg:'rgba(26,127,55,.08)', warnBg:'rgba(154,103,0,.09)', badBg:'rgba(207,34,46,.07)',
-            beLine:'rgba(154,103,0,.55)', spotLine:'rgba(26,127,55,.55)',
+            beLine:'rgba(154,103,0,.55)', spotLine:'rgba(11,100,212,.60)',
             hair:'rgba(0,0,0,.34)', tipBg:'rgba(251,251,249,.97)', dot:'#16181d' }
   };
   const C = Object.assign({}, THEMES.dark);
@@ -334,11 +334,13 @@
   let SR = null; const $ = s => SR ? SR.querySelector(s) : null, $id = i => $('#' + i);
   // Sized in CSS pixels but backed at devicePixelRatio — without this every line and label is drawn at 1x
   // and upscaled by the compositor, which is why canvas UIs look soft next to the page's own text.
+  const PAYOFF_H_KEY = 'spay_payoff_h';
   function fitCanvas(id, frac, baseH){
     const cv = $id(id); if (!cv) return null;
     const W = Math.max(Math.round(cv.getBoundingClientRect().width) || 420, 260);
     let H = baseH || 150;
     if (POP && !POP.closed && frac) H = Math.max(H, Math.min(560, Math.round((POP.innerHeight || 800) * frac)));
+    if (id === 'spay-cv' && Store.payoffH > 0) H = Store.payoffH; // user-dragged height wins
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
     if (cv._W !== W || cv._H !== H || cv._dpr !== dpr){
       cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
@@ -358,7 +360,7 @@
       .lbl{font-size:7.5px;letter-spacing:.14em;color:${C.muted};text-transform:uppercase;white-space:nowrap;}
 
       .top{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;border-bottom:1px solid ${C.line};user-select:none;}
-      .wm{font-size:8.5px;letter-spacing:.2em;color:${C.sub};font-weight:600;}
+      .wm{font-size:8.5px;letter-spacing:.2em;color:${C.accent};font-weight:600;}
       .tools{display:flex;align-items:center;gap:4px;}
       .live{display:flex;align-items:center;gap:5px;font-size:8.5px;letter-spacing:.1em;color:${C.muted};margin-right:6px;text-transform:uppercase;}
       .live .d{width:5px;height:5px;border-radius:50%;background:${C.muted};}
@@ -367,7 +369,7 @@
       .live.bad .d{background:${C.dn};}.live.bad{color:${C.dn};}
       .ic{background:transparent;border:none;color:${C.muted};cursor:pointer;padding:3px 4px;border-radius:4px;display:grid;place-items:center;line-height:0;}
       .ic:hover{color:${C.text};background:${C.card};}
-      .ic.act{color:${C.up};}
+      .ic.act{color:${C.accent};}
       .ic svg{display:block;}
 
       /* book switcher: underline, not pills */
@@ -375,7 +377,7 @@
       .books button{font-family:${MONO};font-size:9.5px;font-weight:600;letter-spacing:.1em;padding:7px 0;margin-right:16px;
                     border:none;border-bottom:1.5px solid transparent;background:none;color:${C.muted};cursor:pointer;}
       .books button:hover{color:${C.sub};}
-      .books button.on{color:${C.text};border-bottom-color:${C.up};}
+      .books button.on{color:${C.text};border-bottom-color:${C.accent};}
 
       /* hero — the answer, first */
       .hero{padding:13px 14px 12px;border-bottom:1px solid ${C.line};}
@@ -388,10 +390,13 @@
 
       .wrap{padding:10px 14px 12px;}
       canvas{display:block;width:100%;background:transparent;}
+      .rsz{height:11px;margin:1px 0 0;cursor:ns-resize;display:grid;place-items:center;}
+      .rsz span{display:block;width:34px;height:2px;border-radius:1px;background:${C.line2};transition:background .12s;}
+      .rsz:hover span{background:${C.accent};}
       .mhdr{display:flex;align-items:center;gap:14px;margin:14px 0 4px;font-size:7.5px;letter-spacing:.14em;
             color:${C.muted};font-family:${MONO};text-transform:uppercase;}
       .mhdr .k{display:flex;align-items:center;gap:5px;}
-      .mhdr .k:before{content:'';width:9px;height:2px;background:${C.up};}
+      .mhdr .k:before{content:'';width:9px;height:2px;background:${C.accent};}
       .mhdr .k2:before{background:${C.ce};}
       .mhdr .mnow{margin-left:auto;color:${C.dim};letter-spacing:.04em;}
 
@@ -424,10 +429,10 @@
       .cfg label i{font-style:normal;color:${C.dim};letter-spacing:.04em;text-transform:none;font-size:9px;}
       .cfg input[type=number]{width:92px;background:${C.panel};border:1px solid ${C.line2};color:${C.text};
                  font-family:${MONO};font-size:11px;padding:4px 7px;border-radius:4px;font-variant-numeric:tabular-nums;}
-      .cfg input[type=number]:focus{outline:none;border-color:${C.up};}
+      .cfg input[type=number]:focus{outline:none;border-color:${C.accent};box-shadow:0 0 0 2px ${C.accentRing};}
       .cfg .cks{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;padding-top:10px;border-top:1px solid ${C.line};}
       .cfg .ck{gap:6px;margin:0;cursor:pointer;letter-spacing:.1em;}
-      .cfg .ck input{accent-color:${C.up};}
+      .cfg .ck input{accent-color:${C.accent};}
       .cfgn{margin-top:10px;font-size:9px;color:${C.dim};line-height:1.5;letter-spacing:0;text-transform:none;}
       #spay-log{margin-top:10px;border-top:1px solid ${C.line};padding-top:8px;max-height:150px;overflow:auto;}
       .lg{font-family:${MONO};font-size:9.5px;padding:2px 0;color:${C.sub};}
@@ -487,6 +492,7 @@
       </div>
       <div class="wrap">
         <canvas id="spay-cv" height="230"></canvas>
+        <div class="rsz" id="spay-rsz" title="Drag to resize the payoff chart"><span></span></div>
         <div class="mhdr"><span class="k k1">Day P&amp;L</span><span class="k k2">Net delta</span><span class="mnow" id="spay-mnow"></span></div>
         <canvas id="spay-mtm-cv" height="150"></canvas>
       </div>
@@ -524,6 +530,17 @@
     const mn = $id('spay-min'); if (mn) mn.onclick = () => { _mini = !_mini; const w = $id('spay-cv').parentElement; if (w) w.style.display = _mini ? 'none' : ''; };
     const cl = $id('spay-close'); if (cl) cl.onclick = () => { if (POP){ closePop(); return; } const h = document.getElementById('spay-host'); if (h) h.remove(); SR = null; };
     const po = $id('spay-pop'); if (po) po.onclick = () => { if (POP && !POP.closed) closePop(); else popOut(); };
+    const rz = $id('spay-rsz');
+    if (rz && !rz.__w){ rz.__w = 1;
+      rz.addEventListener('pointerdown', e => {
+        e.preventDefault(); const cv = $id('spay-cv'); if (!cv) return;
+        const y0 = e.clientY, h0 = cv._H || 230; rz.setPointerCapture(e.pointerId);
+        const mv = ev => { Store.payoffH = Math.max(150, Math.min(620, Math.round(h0 + (ev.clientY - y0)))); try { window.drawPayoff(); } catch (_) {} };
+        const up = () => { rz.removeEventListener('pointermove', mv); rz.removeEventListener('pointerup', up);
+          try { localStorage.setItem(PAYOFF_H_KEY, String(Store.payoffH)); } catch (_) {} };
+        rz.addEventListener('pointermove', mv); rz.addEventListener('pointerup', up);
+      });
+    }
     const th = $id('spay-theme'); if (th) th.onclick = () => applyTheme(Store.theme === 'dark' ? 'light' : 'dark');
     const ax = $id('spay-ax'); if (ax) ax.onclick = () => { const b = $id('spay-alert'); if (b) b.style.display = 'none'; };
     const bell = $id('spay-bell');
@@ -622,18 +639,24 @@
     if (be){ [be.lower, be.upper].forEach(v => { if (v < lo || v > hi) return; const bx = X(v); ctx.strokeStyle = C.beLine; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(bx, Tp); ctx.lineTo(bx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = C.warn; ctx.textAlign = 'center'; ctx.fillText(Math.round(v), bx, Tp + 10); }); }
     const sx = X(spot); ctx.strokeStyle = C.spotLine; ctx.setLineDash([2, 3]); ctx.beginPath(); ctx.moveTo(sx, Tp); ctx.lineTo(sx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
     // ── node-dot payoff: green above 0, red below (the "TradingAlgo" vibe) ──
-    // filled region to the zero line, then one clean curve — no per-sample dots
+    // Node-dot payoff: tinted region to the zero line, then evenly spaced markers joined by a thin line.
+    // Dot spacing is derived from the chart's WIDTH, so they stay evenly spaced as the panel resizes.
     const zc = Math.max(Tp, Math.min(Tp + CH, z));
     const region = () => { ctx.beginPath(); ctx.moveTo(X(pN[0].s), zc); pN.forEach(q => ctx.lineTo(X(q.s), Y(q.p))); ctx.lineTo(X(pN[N].s), zc); ctx.closePath(); };
     ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, zc - Tp)); ctx.clip(); region(); ctx.fillStyle = C.upFill; ctx.fill(); ctx.restore();
     ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region(); ctx.fillStyle = C.dnFill; ctx.fill(); ctx.restore();
-    ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
-    for (let i = 1; i <= N; i++){
-      ctx.strokeStyle = (pN[i - 1].p >= 0 && pN[i].p >= 0) ? C.up : (pN[i - 1].p < 0 && pN[i].p < 0) ? C.dn : C.muted;
-      ctx.beginPath(); ctx.moveTo(X(pN[i - 1].s), Y(pN[i - 1].p)); ctx.lineTo(X(pN[i].s), Y(pN[i].p)); ctx.stroke(); }
+    const gap = 13, want = Math.max(14, Math.min(70, Math.round(CW / gap)));
+    const step = Math.max(1, Math.round(N / want)), nodes = [];
+    for (let i = 0; i <= N; i += step) nodes.push(pN[i]);
+    if (nodes[nodes.length - 1] !== pN[N]) nodes.push(pN[N]);
+    ctx.lineWidth = 1.4; ctx.lineJoin = 'round';
+    for (let i = 1; i < nodes.length; i++){
+      ctx.strokeStyle = (nodes[i - 1].p >= 0 && nodes[i].p >= 0) ? C.up : (nodes[i - 1].p < 0 && nodes[i].p < 0) ? C.dn : C.muted;
+      ctx.beginPath(); ctx.moveTo(X(nodes[i - 1].s), Y(nodes[i - 1].p)); ctx.lineTo(X(nodes[i].s), Y(nodes[i].p)); ctx.stroke(); }
+    nodes.forEach(q => { ctx.beginPath(); ctx.arc(X(q.s), Y(q.p), 2.7, 0, 7); ctx.fillStyle = q.p >= 0 ? C.up : C.dn; ctx.fill(); });
     const at = pN.reduce((b, q) => Math.abs(q.s - spot) < Math.abs(b.s - spot) ? q : b);
-    ctx.beginPath(); ctx.arc(X(at.s), Y(at.p), 3.2, 0, 7); ctx.fillStyle = at.p >= 0 ? C.up : C.dn; ctx.fill();
-    ctx.strokeStyle = C.panel; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(X(at.s), Y(at.p), 4.6, 0, 7); ctx.fillStyle = at.p >= 0 ? C.up : C.dn; ctx.fill();
+    ctx.strokeStyle = C.panel; ctx.lineWidth = 2; ctx.stroke();
     const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '9px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 10);
     // hover crosshair
     if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
@@ -650,7 +673,15 @@
     // left-anchored, minimum 30-minute frame so the curve grows into a stable window instead of rescaling every tick
     const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
     const X = t => L2 + ((t - t0) / span) * CW;
-    const ms = a.map(p => p[1] + (p[3] || 0)), ds = a.map(p => p[2]); // open + realised = day P&L
+    // Raw day P&L is a tick-by-tick series and reads as noise. Smooth it for DISPLAY with a centred moving
+    // average — the stored samples and the hover readout stay raw, so no number is ever fabricated.
+    const raw = a.map(p => p[1] + (p[3] || 0)), rawD = a.map(p => p[2]);
+    const win = Math.max(1, Math.min(9, Math.round(a.length / 40) * 2 + 1));
+    const smooth = arr => { if (win < 2) return arr.slice(); const h = (win - 1) / 2;
+      return arr.map((_, i) => { let sum = 0, c = 0;
+        for (let j = Math.max(0, i - h); j <= Math.min(arr.length - 1, i + h); j++){ sum += arr[j]; c++; }
+        return sum / c; }); };
+    const ms = smooth(raw), ds = smooth(rawD);
     let lo = Math.min(0, ...ms), hi = Math.max(0, ...ms);
     if (hi - lo < Y_FLOOR){ const c = (hi + lo) / 2; lo = c - Y_FLOOR / 2; hi = c + Y_FLOOR / 2; } // don't zoom into tick noise
     const mStep = niceStep(((hi - lo) || 1000) / 3);
@@ -690,10 +721,10 @@
     if (cv._cur != null){
       const tt = t0 + ((cv._cur - L2) / CW) * span;
       let ni = 0; for (let i = 1; i < a.length; i++) if (Math.abs(a[i][0] - tt) < Math.abs(a[ni][0] - tt)) ni = i;
-      const nb = a[ni], nv = ms[ni], cx = X(nb[0]);
+      const nb = a[ni], nv = raw[ni], cx = X(nb[0]); // hover reports the RAW sample, not the smoothed line
       ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
       ctx.beginPath(); ctx.arc(cx, Y(nv), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill();
-      ctx.beginPath(); ctx.arc(cx, YD(nb[2]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, YD(rawD[ni]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
       const lbl = hhmm(nb[0]) + '  ' + money(nv) + (nb[3] ? '  (R ' + money(nb[3]) + ')' : '') + '  Δ' + nb[2];
       ctx.font = '10px ' + MONO; const tw = ctx.measureText(lbl).width + 14;
       let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx);
@@ -881,7 +912,7 @@
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
     positionPanel();
     const mn = $id('spay-mnow');
-    if (mn){ const h = Store.hist[book] || []; mn.textContent = h.length ? h.length + ' pts · since ' + hhmm(h[0][0]) : ''; }
+    if (mn){ const h = Store.hist[book] || []; mn.textContent = h.length ? h.length + ' pts · since ' + hhmm(h[0][0]) + ' · smoothed' : ''; }
     window.drawPayoff(); window.drawMtm();
   };
 
@@ -898,7 +929,9 @@
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
     window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
-    alLoad(); histLoad(); buildPanel();
+    alLoad(); histLoad();
+    try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
+    buildPanel();
     try { applyTheme(localStorage.getItem(THEME_KEY) || 'dark'); } catch (e) {} Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
     startTimers(window);
     setInterval(() => { try {
