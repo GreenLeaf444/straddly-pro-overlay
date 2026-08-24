@@ -271,9 +271,16 @@
     t('quiet market: a table that simply has not ticked is still trusted', function(){
       oneLeg(); S.tableAt=Date.now()-300000; S.quoteAt=Date.now()-300000;
       var v=window._allLegs()[0].ltp; return v===40 || 'used '+v+' — mistook a quiet market for a frozen page'; });
-    t('throttled page: quotes moving long after the table stopped take over', function(){
+    t('a readable row always wins, even against a fresher quote (v4.5 rule)', function(){
+      // Deliberate: timestamp heuristics kept handing the display to stale or mis-mapped quotes, so the
+      // portal's own row now wins whenever we can read it. A page that has stopped updating is reported
+      // by the FROZEN badge instead of being silently papered over with quote data.
       oneLeg(); S.tableAt=Date.now()-120000; S.quoteAt=Date.now()-1000;
-      var v=window._allLegs()[0].ltp; return v===999 || 'used '+v+' — stayed on a frozen table'; });
+      var v=window._allLegs()[0].ltp; return v===40 || 'used '+v+' instead of the row value 40'; });
+    t('off-tab (row not readable) falls back to our own quotes', function(){
+      oneLeg(); S.posVisible=false;
+      var v=window._allLegs()[0].ltp; S.posVisible=true;
+      return v===999 || 'used '+v+' — should have fallen back to the quote'; });
     t('portal total is parsed from the page', function(){
       var host=document.createElement('div'); host.textContent='Total MTM : ₹29.25'; document.body.appendChild(host);
       F.scrapePositions(true); var got=S.portalMTM; host.remove();
@@ -296,6 +303,38 @@
       var legs=window._allLegs(), sum=legs.reduce(function(a,l){return a+l.pnl;},0);
       return (legs.length===2 && Math.abs(sum-(-45.50))<0.01)
         || legs.length+' legs summing to '+Math.round(sum)+' instead of -45.50'; });
+
+    grp('STRADDLE (SD) ROWS');
+    function sdBook(){
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524200SD',optionType:'SD',strikePrice:24200,quantity:-65,
+                    avgSellPrice:167,bepPrice:167,ltp:159.05,_pnl:516.75,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.spots={NIFTY:24334}; S.book='NIFTY'; S.realised={};
+      S.tableAt=Date.now(); S.quoteAt=Date.now();
+    }
+    t("a straddle keeps its OWN mark, never CE+PE from separate quotes", function(){
+      sdBook(); S.ltpBySym={'NIFTY26082524200CE':157.40,'NIFTY26082524200PE':17.55}; // sum 174.95, 16 pts off
+      var v=window.parseOpenPos()[0].ltp;
+      return Math.abs(v-159.05)<0.01 || 'used '+v+' instead of the row mark 159.05'; });
+    t('a straddle P&L keeps the portal sign (the reported bug)', function(){
+      sdBook(); S.ltpBySym={'NIFTY26082524200CE':157.40,'NIFTY26082524200PE':17.55};
+      var legs=window._allLegs(), sum=legs.reduce(function(a,l){return a+l.pnl;},0);
+      return Math.abs(sum-516.75)<0.01 || 'legs sum to '+Math.round(sum)+' but the portal says +516.75'; });
+    t('component quotes that disagree with the mark are refused and flagged', function(){
+      sdBook(); S.ltpBySym={'NIFTY26082524200CE':157.40,'NIFTY26082524200PE':17.55};
+      var legs=window._allLegs();
+      return (legs[0]._est===true && Math.abs(legs[0].ltp-159.05/2)<0.01) || 'ltp '+legs[0].ltp+' est '+legs[0]._est; });
+    t('component quotes that DO reconcile are used for the split', function(){
+      sdBook(); S.ltpBySym={'NIFTY26082524200CE':140.05,'NIFTY26082524200PE':19.00}; // sums to 159.05
+      var legs=window._allLegs(), sum=legs.reduce(function(a,l){return a+l.pnl;},0);
+      return (!legs[0]._est && Math.abs(legs[0].ltp-140.05)<0.01 && Math.abs(sum-516.75)<0.01)
+        || 'est='+legs[0]._est+' ltp='+legs[0].ltp+' sum='+sum; });
+
+    grp('SPOT SOURCE');
+    t('a spot from a different index is rejected for this book', function(){
+      sdBook(); return !F.plausibleSpot('NIFTY', 57390) || 'accepted 57390 for a 24200-strike book'; });
+    t("a spot near this book's strikes is accepted", function(){
+      sdBook(); return F.plausibleSpot('NIFTY', 24341) || 'rejected a valid 24341'; });
 
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';

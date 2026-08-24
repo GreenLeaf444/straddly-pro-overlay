@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.5
+// @version      4.6
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -104,7 +104,26 @@
   // ── multi-book: a screen can hold NIFTY + BANKNIFTY + SENSEX at once. Each needs its OWN spot and its OWN payoff. ──
   function underlyings(){ const u = []; Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x && u.indexOf(x.underlying) < 0) u.push(x.underlying); }); return u; }
   function activeBook(){ const u = underlyings(); if (!u.length) return 'NIFTY'; if (Store.book && u.indexOf(Store.book) >= 0) return Store.book; const cnt = {}; Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x) cnt[x.underlying] = (cnt[x.underlying] || 0) + 1; }); return u.slice().sort((a, b) => cnt[b] - cnt[a])[0]; }
-  function spotFor(under){ const idx = Store.ltpBySym[IDX[under] || under]; if (idx > 0) return idx; const par = paritySpot(under); if (par > 0) return par; const dom = indexSpotDOM(under); if (dom > 0) return dom; return 0; }
+  // A spot is only credible if it sits near this book's own strikes — that guard stops the portal header's
+  // spot for a DIFFERENT index (whatever the user has selected up there) being read as this book's spot.
+  function plausibleSpot(under, v){
+    if (!(v > 0)) return false;
+    const ks = [];
+    Store.positions.forEach(p => { const x = parseSymbol(p.symbol);
+      if (x && x.underlying === under){ const k = p.strikePrice || x.strike; if (k > 0) ks.push(k); } });
+    if (!ks.length) return true;
+    ks.sort((a, b) => a - b);
+    const mid = ks[Math.floor(ks.length / 2)];
+    return v > mid * 0.75 && v < mid * 1.25;
+  }
+  // DOM FIRST. The portal prints a live spot; our touchline poll can stall (expired token, rejected symbol)
+  // and a stalled value would otherwise win forever, freezing the spot and with it the whole payoff.
+  function spotFor(under){
+    const dom = indexSpotDOM(under);              if (plausibleSpot(under, dom)) return dom;
+    const idx = Store.ltpBySym[IDX[under] || under]; if (plausibleSpot(under, idx)) return idx;
+    const par = paritySpot(under);                if (plausibleSpot(under, par)) return par;
+    return 0;
+  }
   function recomputeSpot(){ try { underlyings().forEach(u => { const v = spotFor(u); if (v > 0) Store.spots[u] = v; }); const b = activeBook(); const v = Store.spots[b] || spotFor(b); if (v > 0){ Store.spots[b] = v; Store.spot = v; } } catch (e) {} }
   // ── scrape open positions from the page table (CloudFront build streams positions via socket, not REST) ──
   const MON = { JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12' };
@@ -273,9 +292,11 @@
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
   // On the Positions tab, mirror the portal's own LTP column exactly. On Orders/Baskets that table is GONE and its
   // last values are frozen — so prefer the quote from our own touchline poll, which keeps running regardless of tab.
-  const FROZEN_GAP_MS = 15000;
-  // True while the portal's own table is the trustworthy source (see liveLtp for why the gap is the signal).
-  function tableTrusted(){ return Store.posVisible && (Store.quoteAt - Store.tableAt) <= FROZEN_GAP_MS; }
+  // The portal's own row is authoritative whenever we can read it. Timestamp heuristics (which source moved
+  // last, how long since the table changed) were tried and both failed: they silently handed the display over
+  // to self-fetched quotes, which are stale or mis-mapped, producing numbers that disagreed with the screen.
+  // Our quotes now only fill in what the row cannot give us. If the page stops updating, the FROZEN badge says so.
+  function tableTrusted(){ return Store.posVisible; }
   function liveLtp(p){
     const q = (p.symbol && Store.ltpBySym[p.symbol] > 0) ? Store.ltpBySym[p.symbol] : 0;
     const onScreen = Store.posVisible && p._scraped && p.ltp > 0;
@@ -285,19 +306,39 @@
     //   "table changed in the last N seconds" mistakes a QUIET MARKET for a frozen page.
     // The only honest signal is the GAP: our quotes still moving well after the table stopped means the page
     // is throttled. If both are quiet, the market is quiet and the table is still right.
-    const tableFrozen = q > 0 && (Store.quoteAt - Store.tableAt) > FROZEN_GAP_MS;
-    if (onScreen && !tableFrozen) return p.ltp;
-    if (q) return q;
     if (onScreen) return p.ltp;
+    if (q) return q;
     if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId];
     return p.ltp || 0;
   }
   function posAvg(p){ if (p.bepPrice > 0) return p.bepPrice; if (p.quantity < 0) return p.avgSellPrice; if (p.quantity > 0) return p.avgBuyPrice; return p.avgSellPrice || p.avgBuyPrice || 0; }
-  window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(CLOSE_H, CLOSE_M, 0, 0); const _s = parseSymbol(p.symbol); const _pnl = (p._scraped && p._pnl != null && isFinite(p._pnl) && tableTrusted()) ? p._pnl : (ltp - avg) * p.quantity;
-    return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: _pnl, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
-  function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; const wCE = c / sum; // split the PARENT's P&L by weight so CE+PE always sums back to it exactly
-    out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: p.pnl * wCE }));
-    out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: p.pnl * (1 - wCE) })); }); return out; }
+  // An SD row's own LTP is the straddle's mark. Rebuilding it as CE+PE from separate quotes was the cause of a
+  // sign-flipped P&L: the components summed 16 points away from the mark the portal printed.
+  window.parseOpenPos = function (){
+    return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => {
+      const avg = posAvg(p), ltp = liveLtp(p), _s = parseSymbol(p.symbol);
+      let exp = p.expiryDate ? new Date(p.expiryDate) : (_s || {}).expiry;
+      if (exp instanceof Date && !isNaN(exp)) exp.setHours(CLOSE_H, CLOSE_M, 0, 0);
+      const pnl = (p._scraped && p._pnl != null && isFinite(p._pnl) && tableTrusted()) ? p._pnl : (ltp - avg) * p.quantity;
+      return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity,
+               avg, ltp, pnl, strike: p.strikePrice || (_s || {}).strike || 0, type: p.optionType, expiry: exp };
+    });
+  };
+  function expandLegs(rows){
+    const out = [];
+    rows.forEach(p => {
+      if (p.type !== 'SD'){ out.push(p); return; }
+      const cL = Store.ltpBySym[p.symbol.replace(/SD$/, 'CE')], pL = Store.ltpBySym[p.symbol.replace(/SD$/, 'PE')];
+      // Component quotes are usable ONLY if they actually reconcile with the straddle's own mark. In the wild
+      // they can sit 10%+ away (stale, or a different expiry), which silently corrupts the split.
+      const usable = cL > 0 && pL > 0 && p.ltp > 0 && Math.abs((cL + pL) - p.ltp) <= Math.max(2, p.ltp * 0.05);
+      const c = usable ? cL : p.ltp / 2, pp = usable ? pL : p.ltp / 2, sum = (c + pp) || 1;
+      const wCE = c / sum, cA = p.avg * wCE;
+      out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: p.pnl * wCE, _est: !usable }));
+      out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: p.pnl * (1 - wCE), _est: !usable }));
+    });
+    return out;
+  }
   // The leg set, its pricing context and its greeks were each rebuilt many times per frame — and every
   // context rebuild re-ran a Newton solve per leg. Compute once per frame; memClear() opens a new frame.
   // SELF-INVALIDATING on purpose: an earlier version cleared this only at the top of a refresh frame, so any
@@ -306,9 +347,17 @@
   const _mem = { key: null, legs: null, ctx: new Map(), grk: new Map() };
   function memClear(){ _mem.key = null; _mem.legs = null; _mem.ctx.clear(); _mem.grk.clear(); }
   function _legKey(){
-    let k = Store.posVisible + '|' + Store.tableAt + '|' + Store.quoteAt + '|';
+    let k = Store.posVisible + '|';
     for (let i = 0; i < Store.positions.length; i++){ const p = Store.positions[i];
-      k += p.symbol + ':' + p.quantity + ':' + p.ltp + ':' + (p.bepPrice || p.avgSellPrice || p.avgBuyPrice) + ';'; }
+      k += p.symbol + ':' + p.quantity + ':' + p.ltp + ':' + p._pnl + ':' + (p.bepPrice || p.avgSellPrice || p.avgBuyPrice);
+      // every quote the expansion actually consults must be in the key, including a straddle's CE/PE
+      // components — those never bump quoteAt (it only tracks POSITION symbols), so leaving them out
+      // meant a component quote could change while the cached legs stayed put.
+      k += '/' + Store.ltpBySym[p.symbol];
+      if (p.optionType === 'SD'){ const b = p.symbol.replace(/SD$/, '');
+        k += '/' + Store.ltpBySym[b + 'CE'] + '/' + Store.ltpBySym[b + 'PE']; }
+      k += ';';
+    }
     return k;
   }
   const _memKey = (pos, spot) => Math.round(spot * 100) + '|' + pos.map(p => p.symbol + ':' + p.ltp + ':' + p.qty + ':' + p.avg).join(',');
@@ -929,7 +978,9 @@
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'all books ' + money(total); tot.style.color = col(total); } }
     if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? Math.floor(dte * 24) + 'h ' + Math.round((dte * 24 % 1) * 60) + 'm to expiry' : dte.toFixed(1) + 'd to expiry');
       const iw = $id('spay-iv');
-      if (iw){ iw.style.display = K.ivBad ? '' : 'none'; if (K.ivBad) iw.textContent = K.ivBad + ' LEG IV ESTIMATED'; }
+      const estSplit = pos.filter(l => l._est).length;
+      if (iw){ const msg = K.ivBad ? K.ivBad + ' LEG IV ESTIMATED' : (estSplit ? 'STRADDLE SPLIT ESTIMATED' : '');
+        iw.style.display = msg ? '' : 'none'; if (msg) iw.textContent = msg; }
       const G = window._netGreeks(pos, spot); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
       const be = window._breakevens(pos); if (be){ const inside = spot >= be.lower && spot <= be.upper, near = Math.min(Math.abs(be.upper - spot), Math.abs(spot - be.lower)); set('r-be', Math.round(be.lower).toLocaleString('en-IN') + '–' + Math.round(be.upper).toLocaleString('en-IN')); set('r-bes', inside ? near.toFixed(0) + ' pt to edge' : 'OUTSIDE', inside ? C.muted : C.dn); } else { set('r-be', '—'); set('r-bes', ''); }
@@ -976,7 +1027,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad();
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();
