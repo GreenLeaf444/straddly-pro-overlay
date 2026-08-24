@@ -260,6 +260,25 @@
       // either cleared, or re-set from the CURRENT palette - never a leftover from the other theme
       return (a===b) || 'inline colour drifted across themes: "'+a+'" -> "'+b+'"'; });
 
+    grp('PRICE SOURCE / RECONCILIATION');
+    function oneLeg(){ var e=new Date(Date.now()+2*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082024200PE',optionType:'PE',strikePrice:24200,quantity:-20,
+                    avgSellPrice:50,bepPrice:50,ltp:40,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.ltpBySym={'NIFTY26082024200PE':999}; S.spots={NIFTY:24250}; S.book='NIFTY'; }
+    t('live foreground: the on-screen table beats a self-fetched quote', function(){
+      oneLeg(); S.tableAt=Date.now()-2000; S.quoteAt=Date.now()-1000;
+      var v=window._allLegs()[0].ltp; return v===40 || 'used '+v+' instead of the table value 40'; });
+    t('quiet market: a table that simply has not ticked is still trusted', function(){
+      oneLeg(); S.tableAt=Date.now()-300000; S.quoteAt=Date.now()-300000;
+      var v=window._allLegs()[0].ltp; return v===40 || 'used '+v+' — mistook a quiet market for a frozen page'; });
+    t('throttled page: quotes moving long after the table stopped take over', function(){
+      oneLeg(); S.tableAt=Date.now()-120000; S.quoteAt=Date.now()-1000;
+      var v=window._allLegs()[0].ltp; return v===999 || 'used '+v+' — stayed on a frozen table'; });
+    t('portal total is parsed from the page', function(){
+      var host=document.createElement('div'); host.textContent='Total MTM : ₹29.25'; document.body.appendChild(host);
+      F.scrapePositions(true); var got=S.portalMTM; host.remove();
+      return got===29.25 || 'parsed '+got; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

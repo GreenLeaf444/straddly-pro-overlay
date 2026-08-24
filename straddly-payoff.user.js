@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.3
+// @version      4.4
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
@@ -114,6 +114,12 @@
     OBS.tables = tables.slice();
   }
   let _tableSig = '';
+  // The portal prints its own "Total MTM" — read it, so we can prove we agree instead of assuming it.
+  function scrapePortalMTM(){
+    try { const m = (document.body ? document.body.innerText : '').match(/Total\s*MTM\s*:?\s*₹?\s*(-?[\d,]+(?:\.\d+)?)/i);
+      Store.portalMTM = m ? parseFloat(m[1].replace(/,/g, '')) : null;
+    } catch (e) { Store.portalMTM = null; }
+  }
   function scrapePositions(full){
     const live = OBS.tables.length && OBS.tables.every(t => document.contains(t));
     const scope = (!full && live) ? OBS.tables : [document];   // scoped re-reads are cheap enough to run per tick
@@ -153,7 +159,7 @@
     // never diff while the table is simply absent (Orders/Baskets) — that would bank every leg as "exited"
     if (Store.posVisible || onPosView) reconcileRealised();
     // else: on another tab → keep last known positions (don't blank)
-    watchTables(tables);
+    watchTables(tables); scrapePortalMTM();
     if (Store.posVisible){
       Store.markAt = Date.now();
       const tsig = uniq.map(p => p.symbol + ':' + p.ltp).join('|');
@@ -250,14 +256,20 @@
   // ══ SELECTORS + BS ══════════════════════════════════════════════════════════
   // On the Positions tab, mirror the portal's own LTP column exactly. On Orders/Baskets that table is GONE and its
   // last values are frozen — so prefer the quote from our own touchline poll, which keeps running regardless of tab.
+  const FROZEN_GAP_MS = 15000;
   function liveLtp(p){
     const q = (p.symbol && Store.ltpBySym[p.symbol] > 0) ? Store.ltpBySym[p.symbol] : 0;
-    // Foreground: the table ticks, so mirror it exactly. Background/off-tab: the table is frozen but our
-    // touchline poll keeps running — whichever source moved most recently is the honest one.
-    const tableFresh = Store.posVisible && p._scraped && p.ltp > 0 && Store.tableAt >= Store.quoteAt;
-    if (tableFresh) return p.ltp;
+    const onScreen = Store.posVisible && p._scraped && p.ltp > 0;
+    // The portal's own LTP column is the source of truth. Two earlier rules were both wrong:
+    //   `tableAt >= quoteAt` was a RACE — the timestamps leapfrog tick by tick, so the panel silently drifted
+    //   onto self-fetched quotes and disagreed with the screen;
+    //   "table changed in the last N seconds" mistakes a QUIET MARKET for a frozen page.
+    // The only honest signal is the GAP: our quotes still moving well after the table stopped means the page
+    // is throttled. If both are quiet, the market is quiet and the table is still right.
+    const tableFrozen = q > 0 && (Store.quoteAt - Store.tableAt) > FROZEN_GAP_MS;
+    if (onScreen && !tableFrozen) return p.ltp;
     if (q) return q;
-    if (Store.posVisible && p._scraped && p.ltp > 0) return p.ltp;
+    if (onScreen) return p.ltp;
     if (p.symbolId != null && Store.ltpById[p.symbolId] != null) return Store.ltpById[p.symbolId];
     return p.ltp || 0;
   }
@@ -385,6 +397,7 @@
       .hv{font-family:${MONO};font-size:33px;line-height:1.05;letter-spacing:-.015em;font-variant-numeric:tabular-nums;}
       .hs{display:flex;flex-wrap:wrap;gap:13px;margin-top:7px;font-size:11.5px;color:${C.muted};font-family:${MONO};}
       .hs b{color:${C.sub};font-weight:400;}
+      #spay-rec{color:${C.dn};cursor:help;font-size:10px;letter-spacing:.04em;font-family:${MONO};}
       #spay-iv{color:${C.warn};cursor:help;font-size:10px;letter-spacing:.04em;}
       #spay-dbg{margin-left:auto;color:${C.dim};font-size:9.5px;}
 
@@ -464,7 +477,7 @@
       </div>
       <div class="books" id="spay-books"></div>
       <div class="hero">
-        <div class="hl"><span class="lbl"><span id="spay-book">NIFTY</span> · DAY P&amp;L</span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span></div>
+        <div class="hl"><span class="lbl"><span id="spay-book">NIFTY</span> · DAY P&amp;L</span><span id="spay-rec" style="display:none" title="Our total does not match the portal's own Total MTM. Trust the portal until this clears."></span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span></div>
         <div class="hv" id="spay-day">—</div>
         <div class="hs">
           <span id="spay-spot">—</span><span id="spay-dte"></span>
@@ -878,6 +891,17 @@
     const day = mtm + (Store.realised[book] || 0);
     set('spay-day', pos.length ? money(day) : '—', pos.length ? col(day) : C.muted);
     set('spay-mtm', pos.length ? money(mtm) : '—', pos.length ? col(mtm) : C.muted);
+    // Reconciliation: our number must agree with the portal's own printed total, or we say so out loud.
+    const rec = $id('spay-rec');
+    if (rec){
+      const pm = Store.portalMTM;
+      if (pm == null || !Store.posVisible){ rec.style.display = 'none'; Store.mismatch = 0; }
+      else { const diff = total - pm; Store.mismatch = diff;
+        const bad = Math.abs(diff) > Math.max(5, Math.abs(pm) * 0.01);
+        rec.style.display = bad ? '' : 'none';
+        if (bad) rec.textContent = '≠ PORTAL ' + money(pm) + ' (off by ' + money(diff) + ')';
+      }
+    }
     const rl = $id('spay-real'); const rv = Store.realised[book] || 0;
     if (rl){ rl.style.display = rv ? '' : 'none'; if (rv){ rl.textContent = 'booked ' + money(rv); rl.style.color = col(rv); } }
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'all books ' + money(total); tot.style.color = col(total); } }
@@ -930,7 +954,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad();
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();
