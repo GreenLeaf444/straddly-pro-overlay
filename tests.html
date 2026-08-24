@@ -279,6 +279,24 @@
       F.scrapePositions(true); var got=S.portalMTM; host.remove();
       return got===29.25 || 'parsed '+got; });
 
+    t("P&L uses the portal's own P&L column, not a re-derivation", function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524350CE',optionType:'CE',strikePrice:24350,quantity:-65,
+                    avgSellPrice:167,bepPrice:167,ltp:167.70,_pnl:-45.50,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.ltpBySym={}; S.tableAt=Date.now(); S.quoteAt=Date.now(); S.spots={NIFTY:24334}; S.book='NIFTY';
+      var v=window.parseOpenPos()[0].pnl;
+      return Math.abs(v-(-45.50))<0.01 || 'got '+v+' want -45.50'; });
+    t('splitting a straddle preserves the book P&L exactly', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524350SD',optionType:'SD',strikePrice:24350,quantity:-65,
+                    avgSellPrice:167,bepPrice:167,ltp:167.70,_pnl:-45.50,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.tableAt=Date.now(); S.quoteAt=Date.now(); S.spots={NIFTY:24334}; S.book='NIFTY';
+      // component quotes that do NOT sum to the straddle mark - the real-world failure
+      S.ltpBySym={'NIFTY26082524350CE':300,'NIFTY26082524350PE':250};
+      var legs=window._allLegs(), sum=legs.reduce(function(a,l){return a+l.pnl;},0);
+      return (legs.length===2 && Math.abs(sum-(-45.50))<0.01)
+        || legs.length+' legs summing to '+Math.round(sum)+' instead of -45.50'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

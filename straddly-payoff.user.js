@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.4
+// @version      4.5
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -59,6 +59,23 @@
   let AUTH = '';
   const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
+  // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
+  Store.diag = function (){
+    const rows = (window.parseOpenPos ? window.parseOpenPos() : []).map(l => {
+      const src = Store.positions.filter(x => x.symbol === l.symbol)[0] || {};
+      return { symbol: l.symbol, type: l.type, qty: l.qty, avg: l.avg,
+               ltpUsed: l.ltp, ltpScraped: src.ltp, ltpQuote: Store.ltpBySym[l.symbol],
+               ourPnl: Math.round(l.pnl * 100) / 100, portalPnl: src._pnl,
+               diff: src._pnl != null ? Math.round((l.pnl - src._pnl) * 100) / 100 : null };
+    });
+    const ourTotal = rows.reduce((a, r) => a + r.ourPnl, 0);
+    const out = { legs: rows, ourTotal: Math.round(ourTotal * 100) / 100, portalTotal: Store.portalMTM,
+      totalDiff: Store.portalMTM != null ? Math.round((ourTotal - Store.portalMTM) * 100) / 100 : null,
+      usingTable: tableTrusted(), posVisible: Store.posVisible,
+      quoteMinusTableMs: Store.quoteAt - Store.tableAt, spots: Store.spots };
+    try { console.table(rows); } catch (e) {}
+    console.log('[SPAY.diag]', out); return out;
+  }; // NOTE: intentionally carries no auth token — see AUTH above
   function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] }; }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
   function ingest(url, body){ if (!url || !body) return; let j; try { j = JSON.parse(body); } catch (e) { return; } const d = j && j.data !== undefined ? j.data : j; try {
@@ -257,6 +274,8 @@
   // On the Positions tab, mirror the portal's own LTP column exactly. On Orders/Baskets that table is GONE and its
   // last values are frozen — so prefer the quote from our own touchline poll, which keeps running regardless of tab.
   const FROZEN_GAP_MS = 15000;
+  // True while the portal's own table is the trustworthy source (see liveLtp for why the gap is the signal).
+  function tableTrusted(){ return Store.posVisible && (Store.quoteAt - Store.tableAt) <= FROZEN_GAP_MS; }
   function liveLtp(p){
     const q = (p.symbol && Store.ltpBySym[p.symbol] > 0) ? Store.ltpBySym[p.symbol] : 0;
     const onScreen = Store.posVisible && p._scraped && p.ltp > 0;
@@ -274,8 +293,11 @@
     return p.ltp || 0;
   }
   function posAvg(p){ if (p.bepPrice > 0) return p.bepPrice; if (p.quantity < 0) return p.avgSellPrice; if (p.quantity > 0) return p.avgBuyPrice; return p.avgSellPrice || p.avgBuyPrice || 0; }
-  window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(CLOSE_H, CLOSE_M, 0, 0); const _s = parseSymbol(p.symbol); return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: (ltp - avg) * p.quantity, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
-  function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: (c - cA) * p.qty })); out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: (pp - (p.avg - cA)) * p.qty })); }); return out; }
+  window.parseOpenPos = function (){ return Store.positions.filter(p => p.status === 'OPEN' && p.quantity !== 0).map(p => { const avg = posAvg(p); let ltp = liveLtp(p); if (p.optionType === 'SD'){ const b = p.symbol ? p.symbol.replace(/SD$/, '') : ''; const ce = Store.ltpBySym[b + 'CE'], pe = Store.ltpBySym[b + 'PE']; if (ce != null && pe != null) ltp = ce + pe; } let exp = p.expiryDate ? new Date(p.expiryDate) : (parseSymbol(p.symbol) || {}).expiry; if (exp instanceof Date && !isNaN(exp)) exp.setHours(CLOSE_H, CLOSE_M, 0, 0); const _s = parseSymbol(p.symbol); const _pnl = (p._scraped && p._pnl != null && isFinite(p._pnl) && tableTrusted()) ? p._pnl : (ltp - avg) * p.quantity;
+    return { under: (_s && _s.underlying) || 'NIFTY', symbol: p.symbol, symbolId: p.symbolId, qty: p.quantity, avg, ltp, pnl: _pnl, strike: p.strikePrice || (parseSymbol(p.symbol) || {}).strike || 0, type: p.optionType, expiry: exp }; }); };
+  function expandLegs(rows){ const out = []; rows.forEach(p => { if (p.type !== 'SD'){ out.push(p); return; } const ceSym = p.symbol.replace(/SD$/, 'CE'), peSym = p.symbol.replace(/SD$/, 'PE'); const cL = Store.ltpBySym[ceSym], pL = Store.ltpBySym[peSym]; const have = cL != null && pL != null && (cL + pL) > 0, c = have ? cL : p.ltp / 2, pp = have ? pL : p.ltp / 2, sum = c + pp || 1, cA = p.avg * c / sum; const wCE = c / sum; // split the PARENT's P&L by weight so CE+PE always sums back to it exactly
+    out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: p.pnl * wCE }));
+    out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: p.pnl * (1 - wCE) })); }); return out; }
   // The leg set, its pricing context and its greeks were each rebuilt many times per frame — and every
   // context rebuild re-ran a Newton solve per leg. Compute once per frame; memClear() opens a new frame.
   // SELF-INVALIDATING on purpose: an earlier version cleared this only at the top of a refresh frame, so any
