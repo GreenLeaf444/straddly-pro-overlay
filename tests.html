@@ -336,6 +336,42 @@
     t("a spot near this book's strikes is accepted", function(){
       sdBook(); return F.plausibleSpot('NIFTY', 24341) || 'rejected a valid 24341'; });
 
+    grp('ORDER BOOK');
+    function ordRow(sym, side, qty, price, status){
+      return {symbol:sym, operationType:side, quantity:qty, lotSize:65, inputPrice:price,
+              rateType:'limit', status:status, price:0, triggerPrice:0};
+    }
+    t('an order payload normalises to lots and a clean side', function(){
+      var o=F.normOrder(ordRow('NIFTY26082524500CE','sell',130,22,'open'));
+      return (o.side==='SELL' && o.lots===2 && o.asked===22) || JSON.stringify(o); });
+    t('BUY orders are not mislabelled as SELL', function(){
+      var o=F.normOrder(ordRow('NIFTY26082524500CE','buy',65,4.2,'open'));
+      return o.side==='BUY' || 'got '+o.side; });
+    t('executed and cancelled orders are not shown as working', function(){
+      var w=['open','pending','trigger pending','executed','cancelled','rejected']
+        .map(function(st){ return F.isWorking(F.normOrder(ordRow('NIFTY26082524500CE','sell',65,22,st))); });
+      return JSON.stringify(w)===JSON.stringify([true,true,true,false,false,false]) || JSON.stringify(w); });
+    t('a resting SELL above the market needs spot to RISE', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[]; S.spots={NIFTY:24341}; S.book='NIFTY';
+      S.ltpBySym={'NIFTY26082524500CE':15.80};
+      var o=F.normOrder(ordRow('NIFTY26082524500CE','sell',65,22,'open'));
+      var d=F.orderDistance(o);
+      return (d && d.prem>0 && d.dSpot>0) || JSON.stringify(d); });
+    t('a resting SELL on a PUT needs spot to FALL', function(){
+      S.positions=[]; S.spots={NIFTY:24341}; S.book='NIFTY';
+      S.ltpBySym={'NIFTY26082524000PE':28.90};
+      var o=F.normOrder(ordRow('NIFTY26082524000PE','sell',65,31.5,'open'));
+      var d=F.orderDistance(o);
+      return (d && d.prem>0 && d.dSpot<0) || JSON.stringify(d); });
+    t('distance is reported in sigmas with a touch probability in 0..1', function(){
+      S.positions=[]; S.spots={NIFTY:24341}; S.book='NIFTY';
+      S.ltpBySym={'NIFTY26082524500CE':15.80};
+      var d=F.orderDistance(F.normOrder(ordRow('NIFTY26082524500CE','sell',65,22,'open')));
+      return (d.sigmas>0 && d.touch>0 && d.touch<=1) || JSON.stringify(d); });
+    t('lot sizes match the broker contract sizes', function(){
+      return (F.LOTS.NIFTY===65 && F.LOTS.BANKNIFTY===30 && F.LOTS.SENSEX===20) || JSON.stringify(F.LOTS); });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.6
+// @version      4.7
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -83,9 +83,35 @@
       const mine = {}; Store.positions.forEach(p => { if (p.symbol) mine[p.symbol] = 1; });
       d.forEach(q => { if (q && q.symbol){ if (q.symbolId != null) Store.ltpById[q.symbolId] = q.ltp; Store.ltpBySym[q.symbol] = q.ltp; if (mine[q.symbol] && q.ltp > 0){ Store.markAt = Date.now(); if (Store.ltpBySym[q.symbol] !== q.ltp) Store.quoteAt = Date.now(); } } });
       recomputeSpot(); Store._emit(); return; }
+    if (/(user\/getTrades|Orders\/Get-OrdersByID|\/orders?(\?|$))/i.test(url) && Array.isArray(d)) {
+      const rows = d.map(normOrder).filter(Boolean);
+      if (rows.length || Store.orders.length){ Store.orders = rows; Store.ordersAt = Date.now(); Store._emit(); }
+      return; }
     if (/user\/getuserdetails/i.test(url) && d && d.id) { Store.user = d; Store._emit(); return; }
     if (/\/(Orders\/Get-MarginusedByID|user\/getMargin)/i.test(url) && Array.isArray(d) && d.length) { Store.margin = d[0]; Store._emit(); return; }
   } catch (e) {} }
+  // Orders arrive as /Orders/Get-OrdersByID on the old API and /api/user/getTrades on the CloudFront build,
+  // with slightly different field names. Normalise once so the rest of the code never cares which.
+  const num = v => { const x = parseFloat(v); return isFinite(x) ? x : 0; };
+  function normOrder(o){
+    if (!o || typeof o !== 'object') return null;
+    const sym = o.symbol || o.tradingSymbol || o.instrument; if (!sym) return null;
+    const lot = num(o.lotSize) || (parseSymbol(sym) ? LOTS[parseSymbol(sym).underlying] : 0) || 0;
+    const qty = num(o.quantity != null ? o.quantity : o.qty);
+    const side = String(o.operationType || o.side || o.transactionType || '').toLowerCase();
+    const st = String(o.status || o.orderStatus || '').toLowerCase();
+    return {
+      id: o.id || o.guid || o.orderId || (sym + ':' + o.time),
+      symbol: sym, side: /buy/.test(side) ? 'BUY' : 'SELL',
+      qty: qty, lots: lot > 0 ? Math.round(qty / lot) : 0, lotSize: lot,
+      rateType: String(o.rateType || o.orderRateType || '').toLowerCase(),
+      asked: num(o.inputPrice), fill: num(o.price), trigger: num(o.triggerPrice),
+      status: st, kind: String(o.type || '').toLowerCase(),
+      margin: num(o.marginUsed), time: o.time || o.orderTime || null
+    };
+  }
+  const LOTS = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // confirm against the broker before trusting sizing
+  const isWorking = o => /open|pending|trigger|placed/.test(o.status) && !/cancel|reject|execut|complet/.test(o.status);
   const IDX = { NIFTY: 'NIFTY', BANKNIFTY: 'NIFTY BANK', SENSEX: 'SENSEX' };
   function detectUnderlying(){ for (const p of Store.positions){ const s = parseSymbol(p.symbol); if (s) return s.underlying; } return 'NIFTY'; }
   function paritySpot(under){ const byK = {}; for (const sym in Store.ltpBySym){ const p = parseSymbol(sym), l = Store.ltpBySym[sym]; if (!p || p.type === 'SD' || !(l > 0)) continue; if (under && p.underlying !== under) continue; const o = byK[p.strike] = byK[p.strike] || { exp: p.expiry }; o[p.type] = l; } const rows = []; for (const k in byK){ const r = byK[k]; if (r.CE > 0 && r.PE > 0) rows.push({ k: +k, diff: Math.abs(r.CE - r.PE), cp: r.CE - r.PE, exp: r.exp }); } if (!rows.length) return 0; rows.sort((a, b) => a.diff - b.diff); const top = rows.slice(0, 3), rr = 0.065, now = Date.now(); let s = 0; top.forEach(x => { const T = Math.max((x.exp - now) / (365 * 864e5), 1e-5); s += x.k * Math.exp(-rr * T) + x.cp; }); return s / top.length; }
@@ -156,6 +182,37 @@
       Store.portalMTM = m ? parseFloat(m[1].replace(/,/g, '')) : null;
     } catch (e) { Store.portalMTM = null; }
   }
+  // Match a CELL that is exactly a status, not the row's concatenated text: textContent joins cells with
+  // no separator ('22.00OPEN ORDER'), which defeats a word boundary, while an unanchored match would hit 'Open Positions'.
+  const ORD_RE = /^(OPEN ORDER|OPEN|PENDING|TRIGGER PENDING|EXECUTED|COMPLETE|COMPLETED|CANCELLED|REJECTED)$/i;
+  function scrapeOrders(){
+    try {
+      const rows = document.querySelectorAll('tr, mat-row, [role="row"]'), out = [];
+      rows.forEach(tr => {
+        const cells = [...tr.querySelectorAll('td, mat-cell, [role="cell"], th')]; if (cells.length < 5) return;
+        const txt = tr.textContent;
+        let st = null;
+        for (let i = 0; i < cells.length; i++){ const t = cells[i].textContent.trim(); if (ORD_RE.test(t)){ st = t; break; } }
+        if (!st) return;
+        let ii = -1, m = null;
+        for (let i = 0; i < cells.length; i++){ const mm = cells[i].textContent.match(INSTR_RE); if (mm){ ii = i; m = mm; break; } }
+        if (ii < 0) return;
+        const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
+        const nums = cells.slice(ii + 1).map(c => { const t = c.textContent.replace(/[₹,\s]/g, ''); return /^-?\d+(\.\d+)?$/.test(t) ? parseFloat(t) : null; }).filter(v => v !== null);
+        if (!nums.length) return;
+        const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, '');
+        const yr = new Date().getFullYear(), mo = MON[m[2].toUpperCase()];
+        const sym = und + (yr % 100) + mo + day + (+m[3]) + m[4].toUpperCase();
+        const qty = Math.round(nums[0]) || 0, lot = LOTS[und] || 0;
+        out.push({ id: sym + ':' + nums.join('_'), symbol: sym, side: /BUY/i.test(txt) ? 'BUY' : 'SELL',
+          qty: Math.abs(qty), lots: lot ? Math.round(Math.abs(qty) / lot) : 0, lotSize: lot,
+          rateType: /market/i.test(txt) ? 'market' : 'limit',
+          asked: nums.length > 1 ? nums[1] : 0, fill: 0, trigger: 0,
+          status: st.toLowerCase(), kind: '', margin: 0, time: null, _dom: true });
+      });
+      if (out.length){ Store.orders = out; Store.ordersAt = Date.now(); }
+    } catch (e) { if (!scrapeOrders._warned){ scrapeOrders._warned = 1; console.warn('[spay] order scrape failed:', e); } }
+  }
   function scrapePositions(full){
     const live = OBS.tables.length && OBS.tables.every(t => document.contains(t));
     const scope = (!full && live) ? OBS.tables : [document];   // scoped re-reads are cheap enough to run per tick
@@ -195,7 +252,7 @@
     // never diff while the table is simply absent (Orders/Baskets) — that would bank every leg as "exited"
     if (Store.posVisible || onPosView) reconcileRealised();
     // else: on another tab → keep last known positions (don't blank)
-    watchTables(tables); scrapePortalMTM();
+    watchTables(tables); scrapePortalMTM(); scrapeOrders();
     if (Store.posVisible){
       Store.markAt = Date.now();
       const tsig = uniq.map(p => p.symbol + ':' + p.ltp).join('|');
@@ -262,6 +319,26 @@
     } catch (e) { return false; }
   }
   function poll(){ try { scrapePositions(true); selfTouch(); } catch (e) {} } // full re-scan + fresh spot; the observer covers everything between
+
+  // For a resting limit order, "distance" in premium points is not intuitive. Convert it to the SPOT move
+  // required (via the leg's delta) and express that in sigmas of the underlying's expected move to expiry.
+  // Touch probability for a driftless walk ~ 2*(1-N(z)); this is an approximation, labelled as one.
+  function orderDistance(o){
+    const ps = parseSymbol(o.symbol); if (!ps) return null;
+    const want = o.trigger > 0 ? o.trigger : (o.asked > 0 ? o.asked : 0); if (!want) return null;
+    const ltp = Store.ltpBySym[o.symbol] || 0; if (!ltp) return null;
+    const prem = want - ltp;
+    const spot = Store.spots[ps.underlying] || spotFor(ps.underlying);
+    const T = Math.max((ps.expiry - Date.now()) / (365 * 864e5), 1 / 8760);
+    if (!spot) return { prem: prem };
+    const iv = window.BS.iv(spot, ps.strike, T, 0.065, ltp, ps.type);
+    if (!iv) return { prem: prem };
+    const g = window.BS.greeks(spot, ps.strike, T, 0.065, iv, ps.type, 1);
+    if (!g.delta) return { prem: prem };
+    const dSpot = prem / g.delta, em = spot * iv * Math.sqrt(T);
+    const z = em > 0 ? Math.abs(dSpot) / em : 0;
+    return { prem: prem, dSpot: dSpot, sigmas: z, touch: z > 0 ? Math.min(1, 2 * (1 - window.BS.norm(z))) : 1 };
+  }
 
   // ══ MTM / DELTA HISTORY ═════════════════════════════════════════════════════
   // Can't be reconstructed after the fact, so we sample as we go and keep the day in localStorage.
@@ -526,6 +603,19 @@
       /* pop-out window */
       body.pop{background:${C.bg};margin:0;padding:20px;}
       body.pop #spay{max-width:1180px;margin:0 auto;}
+      #spay-orders{display:none;}
+      body.pop #spay-orders{display:block;border-top:1px solid ${C.line};}
+      #spay-orders .ohd{display:flex;align-items:center;gap:10px;padding:9px 14px 5px;font-size:9px;
+                        letter-spacing:.12em;color:${C.muted};text-transform:uppercase;}
+      #spay-orders .ohd .age{margin-left:auto;color:${C.dim};letter-spacing:.04em;text-transform:none;}
+      #spay-orders table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:12px;font-variant-numeric:tabular-nums;}
+      #spay-orders th{text-align:right;color:${C.muted};font-weight:600;font-size:9px;letter-spacing:.12em;
+                      text-transform:uppercase;padding:6px 14px;border-bottom:1px solid ${C.line};}
+      #spay-orders td{text-align:right;padding:7px 14px;border-bottom:1px solid ${C.line};color:${C.sub};}
+      #spay-orders th:first-child,#spay-orders td:first-child{text-align:left;color:${C.text};}
+      #spay-orders tr:last-child td{border-bottom:none;}
+      #spay-orders .buy{color:${C.ce};} #spay-orders .sell{color:${C.warn};}
+      #spay-orders .near{color:${C.dn};font-weight:600;}
       #spay-legs{display:none;}
       body.pop #spay-legs{display:block;border-top:1px solid ${C.line};}
       #spay-legs table{width:100%;border-collapse:collapse;font-family:${MONO};font-size:12.5px;font-variant-numeric:tabular-nums;}
@@ -592,6 +682,7 @@
         <div class="rc"><div class="rl">Margin used</div><div class="rv" id="r-mg">—</div><div class="rs" id="r-mgs"></div></div>
         <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl">—</div><div class="rs">theta if pinned here</div></div>
       </div>
+      <div id="spay-orders"></div>
       <div id="spay-legs"></div>`; }
 
   let POP = null, _mini = false;
@@ -921,6 +1012,33 @@
     el.innerHTML = u.map(x => '<button data-u="' + x + '"' + (x === active ? ' class="on"' : '') + '>' + x + '</button>').join('');
     [...el.querySelectorAll('button')].forEach(b => { b.onclick = () => { Store.book = b.dataset.u; recomputeSpot(); window.refreshAll(); }; });
   }
+  function renderOrders(){
+    const el = $id('spay-orders'); if (!el) return;
+    const live = Store.orders.filter(isWorking);
+    if (!live.length){ if (el.innerHTML){ el.innerHTML = ''; el.__sig = ''; } return; }
+    const rows = live.map(o => {
+      const d = orderDistance(o);
+      let dist = '—', cls = '';
+      if (d && d.sigmas != null){
+        dist = d.sigmas.toFixed(2) + 'σ · ' + Math.round(d.touch * 100) + '%';
+        if (d.sigmas < 0.5) cls = 'near';
+      } else if (d){ dist = (d.prem >= 0 ? '+' : '') + d.prem.toFixed(2) + ' pts'; }
+      const px = o.trigger > 0 ? o.trigger : o.asked;
+      const ps = parseSymbol(o.symbol);
+      return '<tr><td>' + (ps ? ps.underlying + ' ' + ps.strike + ' ' + ps.type : o.symbol) + '</td>' +
+        '<td class="' + (o.side === 'BUY' ? 'buy' : 'sell') + '">' + o.side + '</td>' +
+        '<td>' + (o.lots ? o.lots + 'L' : o.qty) + '</td>' +
+        '<td>' + (o.rateType === 'market' ? 'MKT' : (px ? px.toFixed(2) : '—')) + '</td>' +
+        '<td>' + (Store.ltpBySym[o.symbol] ? Store.ltpBySym[o.symbol].toFixed(2) : '—') + '</td>' +
+        '<td class="' + cls + '">' + dist + '</td></tr>';
+    }).join('');
+    const age = Store.ordersAt ? 'as of ' + hhmm(Math.round(Store.ordersAt / 1000)) : '';
+    const html = '<div class="ohd">Working orders <span>' + live.length + '</span><span class="age">' + age +
+      (Store.orders[0] && Store.orders[0]._dom ? ' · from the orders tab' : '') + '</span></div>' +
+      '<table><thead><tr><th>Order</th><th>Side</th><th>Qty</th><th>Price</th><th>LTP</th><th>To fill</th></tr></thead><tbody>' +
+      rows + '</tbody></table>';
+    if (el.__sig === html) return; el.__sig = html; el.innerHTML = html;
+  }
   function renderLegs(){
     const el = $id('spay-legs'); if (!el) return;
     const legs = window._bsLegs(); if (!legs.length){ if (el.innerHTML) el.innerHTML = ''; return; }
@@ -1005,7 +1123,7 @@
     noteTicks(); recordAllBooks();
     try { evalAlerts(); } catch (e) {}
     const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
-    renderLegs();
+    renderOrders(); renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.classList.toggle('act', !!on); pb.title = on ? 'Dock back into the page' : 'Open in its own window'; } // never overwrite the icon markup
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
@@ -1027,7 +1145,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad();
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();
