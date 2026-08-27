@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.8
+// @version      4.9
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -33,7 +33,7 @@
             upArea:'rgba(63,185,80,.15)', dnArea:'rgba(240,86,63,.15)',
             goodBg:'rgba(63,185,80,.07)', warnBg:'rgba(210,153,34,.07)', badBg:'rgba(240,86,63,.07)',
             beLine:'rgba(210,153,34,.45)', spotLine:'rgba(77,155,255,.60)',
-            hair:'rgba(255,255,255,.30)', tipBg:'rgba(5,6,9,.96)', dot:'#ffffff' },
+            hair:'rgba(255,255,255,.30)', tipBg:'rgba(5,6,9,.96)', dot:'#ffffff', expLine:'rgba(232,234,237,.20)' },
     light:{ bg:'#eef0ec', panel:'#fcfcfa', card:'#f1f2ee', line:'#dcded8', line2:'#c3c6be',
             text:'#08090c', sub:'#23272d', muted:'#3f444b', dim:'#5d636b',
             accent:'#0b64d4', accent2:'#0a4fa8', accentRing:'rgba(11,100,212,.22)', up:'#1a7f37', dn:'#cf222e', warn:'#9a6700',
@@ -42,7 +42,7 @@
             upArea:'rgba(26,127,55,.16)', dnArea:'rgba(207,34,46,.14)',
             goodBg:'rgba(26,127,55,.08)', warnBg:'rgba(154,103,0,.09)', badBg:'rgba(207,34,46,.07)',
             beLine:'rgba(154,103,0,.55)', spotLine:'rgba(11,100,212,.60)',
-            hair:'rgba(0,0,0,.34)', tipBg:'rgba(251,251,249,.97)', dot:'#16181d' }
+            hair:'rgba(0,0,0,.34)', tipBg:'rgba(251,251,249,.97)', dot:'#16181d', expLine:'rgba(8,9,12,.18)' }
   };
   const C = Object.assign({}, THEMES.dark);
   // Exchange session. NSE F&O and BSE both close 15:40 IST (moved from 15:30 on 2026-08-03).
@@ -468,7 +468,15 @@
     const K = window._getPosCtx(pos, spot); let nD=0,nG=0,nT=0,nV=0;
     pos.forEach((p, j) => { const g = window.BS.greeks(spot, p.strike, K.legT[j], K.r, K.legIVs[j] || 0.15, p.type, p.qty); nD+=g.delta; nG+=g.gamma; nT+=g.theta; nV+=g.vega; });
     const out = Object.assign({ nD, nG, nT, nV }, K); _mem.grk.set(mk, out); return out; };
-  window._breakevens = function (legs){ legs = legs || window._bsLegs(); const spot = window.getSpot(); if (!legs.length || !spot) return null; const ks = legs.map(l => l.strike), lo = Math.min(...ks, spot) * 0.9, hi = Math.max(...ks, spot) * 1.1, N = 800; const E = s => legs.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, s - l.strike) : Math.max(0, l.strike - s); return a + (it - l.avg) * l.qty; }, 0); const cr = []; let prev = E(lo), ps = lo; for (let i = 1; i <= N; i++){ const s = lo + (i / N) * (hi - lo), v = E(s); if ((prev >= 0) !== (v >= 0)) cr.push(ps + (-prev / (v - prev)) * (s - ps)); prev = v; ps = s; } return cr.length ? { lower: Math.min(...cr), upper: Math.max(...cr) } : null; };
+  // P&L if held to expiry: intrinsic only, no time value. The breakeven solver uses the same function so
+  // the drawn expiry curve and the quoted breakevens can never disagree.
+  window._expiryPnl = function (legs, s){
+    return legs.reduce((a, l) => {
+      const intr = l.type === 'CE' ? Math.max(0, s - l.strike) : Math.max(0, l.strike - s);
+      return a + (intr - l.avg) * l.qty;
+    }, 0);
+  };
+  window._breakevens = function (legs){ legs = legs || window._bsLegs(); const spot = window.getSpot(); if (!legs.length || !spot) return null; const ks = legs.map(l => l.strike), lo = Math.min(...ks, spot) * 0.9, hi = Math.max(...ks, spot) * 1.1, N = 800; const E = s => window._expiryPnl(legs, s); const cr = []; let prev = E(lo), ps = lo; for (let i = 1; i <= N; i++){ const s = lo + (i / N) * (hi - lo), v = E(s); if ((prev >= 0) !== (v >= 0)) cr.push(ps + (-prev / (v - prev)) * (s - ps)); prev = v; ps = s; } return cr.length ? { lower: Math.min(...cr), upper: Math.max(...cr) } : null; };
 
   const fmtAge = ms => ms < 1000 ? ms + 'ms' : ms < 60000 ? (ms / 1000).toFixed(1) + 's' : Math.round(ms / 60000) + 'm';
   const money = v => (v >= 0 ? '+' : '−') + '₹' + Math.abs(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
@@ -802,13 +810,16 @@
     const kd = Math.max(0, ...ks.map(k => Math.abs(k - spot)));
     const half = Math.min(Math.max(1.5 * em, kd + 0.4 * em, spot * 0.006), spot * 0.035);
     const lo = spot - half, hi = spot + half, N = 220, pN = [];
-    for (let i = 0; i <= N; i++){ const s = lo + (i / N) * (hi - lo); pN.push({ s, p: window._bsPnl(pos, s, K, 0) }); }
+    const pE = [];
+    for (let i = 0; i <= N; i++){ const s = lo + (i / N) * (hi - lo);
+      pN.push({ s, p: window._bsPnl(pos, s, K, 0) }); pE.push(window._expiryPnl(pos, s)); }
     // Scale to the plausible zone (+/-1 sigma), NOT to the wing losses. A short book near expiry loses
     // enormously in the tails, and letting that set the axis crushes the region around spot into a sliver.
     // The curve still draws past the edges; it is clipped rather than allowed to dictate the scale.
-    const band = pN.filter(q => Math.abs(q.s - spot) <= em);
-    const src = band.length > 4 ? band : pN;
-    const mx = Math.max(...src.map(q => q.p)), mn = Math.min(...src.map(q => q.p));
+    const vals = [];
+    for (let i = 0; i <= N; i++) if (Math.abs(pN[i].s - spot) <= em){ vals.push(pN[i].p); vals.push(pE[i]); }
+    if (vals.length < 8){ for (let i = 0; i <= N; i++){ vals.push(pN[i].p); vals.push(pE[i]); } }
+    const mx = Math.max(...vals), mn = Math.min(...vals);
     const yStep = niceStep(((mx - mn) || 1000) / 4), yMin = Math.floor(mn / yStep) * yStep - yStep * 0.2, yMax = Math.ceil(mx / yStep) * yStep + yStep * 0.2;
     const L = 58, R = 14, Tp = 14, B = 26, CW = W - L - R, CH = H - Tp - B, X = s => L + ((s - lo) / (hi - lo)) * CW, Y = v => Tp + CH - ((v - yMin) / (yMax - yMin)) * CH;
     ctx.font = '10.5px ' + MONO;
@@ -834,6 +845,11 @@
     ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region();
     ctx.fillStyle = fade(1, C.dnFill); ctx.fill(); ctx.restore();
     ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, CH); ctx.clip(); // clip, don't rescale
+    // the at-expiry payoff, sitting behind the live curve as a faint reference
+    ctx.strokeStyle = C.expLine; ctx.lineWidth = 1.2; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    for (let i = 0; i <= N; i++){ const x = X(pN[i].s), y = Y(pE[i]); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.stroke();
     const gap = 13, want = Math.max(14, Math.min(70, Math.round(CW / gap)));
     const step = Math.max(1, Math.round(N / want)), nodes = [];
     for (let i = 0; i <= N; i += step) nodes.push(pN[i]);
@@ -848,8 +864,9 @@
     ctx.strokeStyle = C.panel; ctx.lineWidth = 2; ctx.stroke();
     ctx.restore();
     const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '10.5px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 11);
+    ctx.fillStyle = C.dim; ctx.fillText('faint line = at expiry', L + 2, Tp + 23);
     // hover crosshair
-    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
+    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const nbi = pN.indexOf(nb); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  now ' + money(nb.p) + '  exp ' + money(nbi >= 0 ? pE[nbi] : window._expiryPnl(pos, nb.s)); ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
   };
 
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════

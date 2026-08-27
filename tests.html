@@ -372,6 +372,36 @@
     t('lot sizes match the broker contract sizes', function(){
       return (F.LOTS.NIFTY===65 && F.LOTS.BANKNIFTY===30 && F.LOTS.SENSEX===20) || JSON.stringify(F.LOTS); });
 
+    grp('EXPIRY PAYOFF');
+    function strangle(){
+      var e=new Date(Date.now()+3*864e5);
+      return [{strike:24200,type:'PE',qty:-65,avg:60,ltp:55,expiry:e,under:'NIFTY',symbol:'A'},
+              {strike:24500,type:'CE',qty:-65,avg:50,ltp:45,expiry:e,under:'NIFTY',symbol:'B'}];
+    }
+    t('expiry P&L is intrinsic only, with no time value left', function(){
+      var L=[{strike:24000,type:'CE',qty:-65,avg:100,ltp:100,expiry:new Date(Date.now()+3*864e5)}];
+      var v=window._expiryPnl(L, 24000);      // at the strike: worthless, so we keep the full credit
+      return Math.abs(v-6500)<0.01 || 'got '+v+' want 6500'; });
+    t('a short strangle has a flat top between the strikes', function(){
+      var L=strangle();
+      return Math.abs(window._expiryPnl(L,24250)-window._expiryPnl(L,24450))<0.01
+        || 'top is not flat: '+window._expiryPnl(L,24250)+' vs '+window._expiryPnl(L,24450); });
+    t('the flat top equals the credit collected', function(){
+      var L=strangle();
+      return Math.abs(window._expiryPnl(L,24350)-7150)<0.01 || 'got '+window._expiryPnl(L,24350)+' want 7150'; });
+    t('the expiry curve crosses zero exactly at the quoted breakevens', function(){
+      var L=strangle(); S.positions=[]; S.spots={NIFTY:24350}; S.book='NIFTY';
+      var be=window._breakevens(L);
+      return (Math.abs(window._expiryPnl(L,be.lower))<1 && Math.abs(window._expiryPnl(L,be.upper))<1)
+        || 'lower '+window._expiryPnl(L,be.lower)+' upper '+window._expiryPnl(L,be.upper); });
+    t('expiry loses beyond the breakevens on both sides', function(){
+      var L=strangle();
+      return (window._expiryPnl(L,23900)<0 && window._expiryPnl(L,24900)<0) || 'no tails'; });
+    t('a LONG option cannot lose more than its premium at expiry', function(){
+      var L=[{strike:24000,type:'CE',qty:65,avg:100,ltp:100,expiry:new Date(Date.now()+3*864e5)}];
+      var deep=window._expiryPnl(L, 10000);
+      return Math.abs(deep-(-6500))<0.01 || 'got '+deep+' want -6500'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
