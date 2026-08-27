@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.7
+// @version      4.8
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -803,7 +803,12 @@
     const half = Math.min(Math.max(1.5 * em, kd + 0.4 * em, spot * 0.006), spot * 0.035);
     const lo = spot - half, hi = spot + half, N = 220, pN = [];
     for (let i = 0; i <= N; i++){ const s = lo + (i / N) * (hi - lo); pN.push({ s, p: window._bsPnl(pos, s, K, 0) }); }
-    const mx = Math.max(...pN.map(p => p.p)), mn = Math.min(...pN.map(p => p.p));
+    // Scale to the plausible zone (+/-1 sigma), NOT to the wing losses. A short book near expiry loses
+    // enormously in the tails, and letting that set the axis crushes the region around spot into a sliver.
+    // The curve still draws past the edges; it is clipped rather than allowed to dictate the scale.
+    const band = pN.filter(q => Math.abs(q.s - spot) <= em);
+    const src = band.length > 4 ? band : pN;
+    const mx = Math.max(...src.map(q => q.p)), mn = Math.min(...src.map(q => q.p));
     const yStep = niceStep(((mx - mn) || 1000) / 4), yMin = Math.floor(mn / yStep) * yStep - yStep * 0.2, yMax = Math.ceil(mx / yStep) * yStep + yStep * 0.2;
     const L = 58, R = 14, Tp = 14, B = 26, CW = W - L - R, CH = H - Tp - B, X = s => L + ((s - lo) / (hi - lo)) * CW, Y = v => Tp + CH - ((v - yMin) / (yMax - yMin)) * CH;
     ctx.font = '10.5px ' + MONO;
@@ -818,8 +823,17 @@
     // Dot spacing is derived from the chart's WIDTH, so they stay evenly spaced as the panel resizes.
     const zc = Math.max(Tp, Math.min(Tp + CH, z));
     const region = () => { ctx.beginPath(); ctx.moveTo(X(pN[0].s), zc); pN.forEach(q => ctx.lineTo(X(q.s), Y(q.p))); ctx.lineTo(X(pN[N].s), zc); ctx.closePath(); };
-    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, zc - Tp)); ctx.clip(); region(); ctx.fillStyle = C.upFill; ctx.fill(); ctx.restore();
-    ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region(); ctx.fillStyle = C.dnFill; ctx.fill(); ctx.restore();
+    // The tint fades out over a FIXED distance from the zero line. Filling the whole region instead meant a
+    // book that is underwater across the visible range washed the entire panel red, which reads as alarm
+    // rather than information — and the further from zero, the less the exact shade tells you anyway.
+    const BAND = 80;
+    const fade = (dir, col) => { const g = ctx.createLinearGradient(0, zc, 0, zc + dir * BAND);
+      g.addColorStop(0, col.replace(/[\d.]+\)$/, '0.18)')); g.addColorStop(1, col.replace(/[\d.]+\)$/, '0)')); return g; };
+    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, Math.max(0, zc - Tp)); ctx.clip(); region();
+    ctx.fillStyle = fade(-1, C.upFill); ctx.fill(); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, zc, CW, Math.max(0, Tp + CH - zc)); ctx.clip(); region();
+    ctx.fillStyle = fade(1, C.dnFill); ctx.fill(); ctx.restore();
+    ctx.save(); ctx.beginPath(); ctx.rect(L, Tp, CW, CH); ctx.clip(); // clip, don't rescale
     const gap = 13, want = Math.max(14, Math.min(70, Math.round(CW / gap)));
     const step = Math.max(1, Math.round(N / want)), nodes = [];
     for (let i = 0; i <= N; i += step) nodes.push(pN[i]);
@@ -832,6 +846,7 @@
     const at = pN.reduce((b, q) => Math.abs(q.s - spot) < Math.abs(b.s - spot) ? q : b);
     ctx.beginPath(); ctx.arc(X(at.s), Y(at.p), 4.6, 0, 7); ctx.fillStyle = at.p >= 0 ? C.up : C.dn; ctx.fill();
     ctx.strokeStyle = C.panel; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
     const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '10.5px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 11);
     // hover crosshair
     if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  ' + money(nb.p); ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
@@ -879,6 +894,12 @@
     for (let i = 1; i < a.length; i++) if (a[i][0] - a[i - 1][0] > GAP_S){ runs.push([st, i - 1]); st = i; }
     runs.push([st, a.length - 1]);
     const z = Math.max(Tp, Math.min(Tp + CH, Y(0)));
+    for (let k = 1; k < runs.length; k++){ // faint dotted bridge so a gap reads as "not recorded", not as broken
+      const a0 = runs[k - 1][1], a1 = runs[k][0];
+      ctx.strokeStyle = C.line2; ctx.lineWidth = 1; ctx.setLineDash([2, 4]);
+      ctx.beginPath(); ctx.moveTo(X(a[a0][0]), Y(ms[a0])); ctx.lineTo(X(a[a1][0]), Y(ms[a1])); ctx.stroke();
+      ctx.setLineDash([]);
+    }
     runs.forEach(([s0, s1]) => {
       if (s1 <= s0) return;
       const area = () => { ctx.beginPath(); ctx.moveTo(X(a[s0][0]), z); for (let i = s0; i <= s1; i++) ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.lineTo(X(a[s1][0]), z); ctx.closePath(); };
