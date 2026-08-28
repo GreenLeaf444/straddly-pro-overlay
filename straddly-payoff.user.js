@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.1
+// @version      5.2
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -607,6 +607,19 @@
   const col = v => v >= 0 ? C.up : C.dn;
 
   // ══ SHADOW PANEL ════════════════════════════════════════════════════════════
+  // "barely visible" is a real complaint and the right answer is a control, not a number I picked.
+  const SCALE_KEY = 'spay_scale', SCALES = [1.0, 1.15, 1.3, 1.45, 1.65];
+  function applyScale(v){
+    v = Math.max(SCALES[0], Math.min(SCALES[SCALES.length - 1], v));
+    Store.scale = v; try { localStorage.setItem(SCALE_KEY, String(v)); } catch (e) {}
+    const el = $id('spay'); if (el) el.style.zoom = String(v);   // zoom re-lays-out AND re-fits the canvases
+    try { window.refreshAll(); } catch (e) {}
+  }
+  function bumpScale(dir){
+    let i = SCALES.indexOf(Store.scale);
+    if (i < 0) i = SCALES.reduce((b, x, k) => Math.abs(x - Store.scale) < Math.abs(SCALES[b] - Store.scale) ? k : b, 0);
+    applyScale(SCALES[Math.max(0, Math.min(SCALES.length - 1, i + dir))]);
+  }
   const THEME_KEY = 'spay_theme';
   function applyTheme(name){
     if (!THEMES[name]) name = 'dark';
@@ -691,6 +704,22 @@
 
       .wrap{padding:10px 14px 12px;}
       canvas{display:block;width:100%;background:transparent;}
+      .ic.tt{font-family:${MONO};font-size:11px;font-weight:700;padding:2px 5px;}
+      .notes{padding:12px 14px;border-top:1px solid ${C.line};background:${C.card};}
+      .nin{display:flex;gap:8px;}
+      .nin input{flex:1;background:${C.panel};border:1px solid ${C.line2};color:${C.text};
+                 font-family:${SANS};font-size:12.5px;padding:7px 10px;border-radius:4px;}
+      .nin input:focus{outline:none;border-color:${C.accent};box-shadow:0 0 0 2px ${C.accentRing};}
+      .nin button{background:${C.accent};color:#fff;border:none;border-radius:4px;padding:0 14px;cursor:pointer;
+                  font-family:${MONO};font-size:10.5px;font-weight:700;letter-spacing:.1em;}
+      .nday{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;margin:12px 0 5px;}
+      .nrow{display:flex;align-items:flex-start;gap:9px;padding:5px 0;border-bottom:1px solid ${C.line};}
+      .nrow:last-child{border-bottom:none;}
+      .nt{font-family:${MONO};font-size:10.5px;color:${C.dim};flex:0 0 auto;padding-top:1px;}
+      .nx{flex:1;font-size:12.5px;color:${C.text};line-height:1.45;word-break:break-word;}
+      .ndel{background:none;border:none;color:${C.dim};cursor:pointer;font-size:14px;line-height:1;padding:0 2px;}
+      .ndel:hover{color:${C.dn};}
+      .nempty{color:${C.dim};font-size:12px;}
       .rsz{height:11px;margin:1px 0 0;cursor:ns-resize;display:grid;place-items:center;}
       .rsz span{display:block;width:34px;height:2px;border-radius:1px;background:${C.line2};transition:background .12s;}
       .rsz:hover span{background:${C.accent};}
@@ -770,7 +799,7 @@
         <span class="wm">PAYOFF &amp; RISK</span>
         <span class="tools">
           <span class="live" id="spay-live"><span class="d"></span><span id="spay-lt">connecting</span></span>
-          <button class="ic" id="spay-theme" title="Switch theme"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.4v1.6M8 13v1.6M14.6 8H13M3 8H1.4M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1M12.7 12.7l-1.1-1.1M4.4 4.4 3.3 3.3" stroke-linecap="round"/></svg></button><button class="ic" id="spay-bell" title="Alerts"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M4.6 6.6a3.4 3.4 0 0 1 6.8 0c0 2.4.7 3.4 1.1 3.8H3.5c.4-.4 1.1-1.4 1.1-3.8Z"/><path d="M6.5 12.4a1.6 1.6 0 0 0 3 0"/></svg></button>
+          <button class="ic tt" id="spay-smaller" title="Smaller text">A−</button><button class="ic tt" id="spay-bigger" title="Larger text">A+</button><button class="ic" id="spay-note" title="Notes"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11.2 2.4l2.4 2.4L6 12.4l-3.1.7.7-3.1z"/><path d="M10 3.6l2.4 2.4"/></svg></button><button class="ic" id="spay-theme" title="Switch theme"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="3.2"/><path d="M8 1.4v1.6M8 13v1.6M14.6 8H13M3 8H1.4M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1M12.7 12.7l-1.1-1.1M4.4 4.4 3.3 3.3" stroke-linecap="round"/></svg></button><button class="ic" id="spay-bell" title="Alerts"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M4.6 6.6a3.4 3.4 0 0 1 6.8 0c0 2.4.7 3.4 1.1 3.8H3.5c.4-.4 1.1-1.4 1.1-3.8Z"/><path d="M6.5 12.4a1.6 1.6 0 0 0 3 0"/></svg></button>
           <button class="ic" id="spay-pop" title="Open in its own window"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M9.5 2.5H13.5V6.5"/><path d="M13.5 2.5 8.5 7.5"/><path d="M12 9.5v3a1 1 0 0 1-1 1H3.5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h3"/></svg></button>
           <button class="ic" id="spay-min" title="Collapse"><svg viewBox="0 0 16 16" width="12" height="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M4 8h8"/></svg></button>
           <button class="ic" id="spay-close" title="Close"><svg viewBox="0 0 16 16" width="12" height="12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></svg></button>
@@ -804,6 +833,10 @@
         </div>
         <div class="cfgn">Alerts fire once per crossing and re-arm only after the value pulls back. Nothing fires while the feed is stale or frozen, or outside market hours.</div>
         <div id="spay-log"></div>
+      </div>
+      <div class="notes" id="spay-notes" style="display:none">
+        <div class="nin"><input id="n-in" type="text" maxlength="400" placeholder="what are you seeing? (Enter to save)"><button id="n-add">ADD</button></div>
+        <div id="n-list"></div>
       </div>
       <div class="wrap">
         <canvas id="spay-cv" height="230"></canvas>
@@ -857,6 +890,19 @@
         rz.addEventListener('pointermove', mv); rz.addEventListener('pointerup', up);
       });
     }
+    const sm = $id('spay-smaller'); if (sm) sm.onclick = () => bumpScale(-1);
+    const bg = $id('spay-bigger');  if (bg) bg.onclick = () => bumpScale(1);
+    const nb = $id('spay-note');
+    if (nb) nb.onclick = () => { const p2 = $id('spay-notes'); if (!p2) return;
+      const show = p2.style.display === 'none'; p2.style.display = show ? '' : 'none';
+      nb.classList.toggle('act', show); if (show){ renderNotes(); const i = $id('n-in'); if (i) i.focus(); } };
+    const nin = $id('n-in'), nadd = $id('n-add');
+    const commit = () => { if (!nin) return; noteAdd(nin.value); nin.value = ''; };
+    if (nin && !nin.__w){ nin.__w = 1; nin.addEventListener('keydown', e => { if (e.key === 'Enter'){ e.preventDefault(); commit(); } }); }
+    if (nadd) nadd.onclick = commit;
+    const nl = $id('n-list');
+    if (nl && !nl.__w){ nl.__w = 1; nl.addEventListener('click', e => {
+      const b = e.target.closest && e.target.closest('.ndel'); if (b) noteDel(b.dataset.d, +b.dataset.i); }); }
     const th = $id('spay-theme'); if (th) th.onclick = () => applyTheme(Store.theme === 'dark' ? 'light' : 'dark');
     const ax = $id('spay-ax'); if (ax) ax.onclick = () => { const b = $id('spay-alert'); if (b) b.style.display = 'none'; };
     const bell = $id('spay-bell');
@@ -1081,6 +1127,40 @@
   };
 
 
+  // ══ NOTES ═══════════════════════════════════════════════════════════════════
+  // Timestamped, kept per trading day, pruned to the last 30 days. Written next to the position they refer
+  // to, which is the point — a note recalled a week later is worth little without the day's context.
+  const NOTE_KEY = 'spay_notes_v1', NOTE_DAYS = 30;
+  function notesLoad(){ try { const j = JSON.parse(localStorage.getItem(NOTE_KEY) || '{}'); Store.notes = j.days || {}; } catch (e) { Store.notes = {}; } }
+  function notesSave(){
+    try { const keys = Object.keys(Store.notes).sort().slice(-NOTE_DAYS), out = {};
+      keys.forEach(k => { if ((Store.notes[k] || []).length) out[k] = Store.notes[k]; });
+      Store.notes = out; localStorage.setItem(NOTE_KEY, JSON.stringify({ days: out }));
+    } catch (e) {}
+  }
+  function noteAdd(text){
+    text = (text || '').trim(); if (!text) return;
+    const d = dayKey(); (Store.notes[d] = Store.notes[d] || []).unshift({ t: Date.now(), text: text.slice(0, 400) });
+    notesSave(); renderNotes();
+  }
+  function noteDel(day, i){ const a = Store.notes[day]; if (!a) return; a.splice(i, 1); notesSave(); renderNotes(); }
+  const esc = t => String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+  function renderNotes(){
+    const el = $id('n-list'); if (!el) return;
+    const days = Object.keys(Store.notes).sort().reverse().slice(0, 4);
+    const today = dayKey();
+    let html = '';
+    days.forEach(d => {
+      const rows = Store.notes[d] || []; if (!rows.length) return;
+      html += '<div class="nday">' + (d === today ? 'TODAY' : d) + '</div>';
+      html += rows.map((x, i) => '<div class="nrow"><span class="nt">' + hhmm(Math.round(x.t / 1000)) + '</span>' +
+        '<span class="nx">' + esc(x.text) + '</span>' +
+        '<button class="ndel" data-d="' + d + '" data-i="' + i + '" title="Delete">×</button></div>').join('');
+    });
+    if (!html) html = '<div class="nrow nempty">no notes yet</div>';
+    if (el.__sig === html) return; el.__sig = html; el.innerHTML = html;
+  }
+
   // ══ ALERTS ══════════════════════════════════════════════════════════════════
   // Design rules, in order of importance:
   //  1. NEVER fire off bad data — a stop triggered by a frozen mark is worse than no alert at all.
@@ -1134,7 +1214,11 @@
     const frozen = Store.tickAt ? Date.now() - Store.tickAt : -1;
     const sick = age < 0 || age > 30000 || frozen > 180000;
     if (AL.health){
-      if (sick) fire('health', 'bad', 'FEED PROBLEM', age > 30000 ? 'no fresh mark for ' + fmtAge(age) : 'no mark has moved in ' + fmtAge(frozen));
+      if (sick) fire('health', 'bad', 'FEED PROBLEM',
+        age < 0 ? 'no position marks have arrived yet'
+                : age > 30000 ? 'no fresh mark for ' + fmtAge(age)
+                : frozen > 0 ? 'no mark has moved in ' + fmtAge(frozen)
+                : 'marks are not updating');
       else rearm('health', true);
     }
     if (sick) return; // RULE 1 — do not judge P&L, breakevens or delta on data we do not trust
@@ -1334,10 +1418,12 @@
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
     window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
-    alLoad(); histLoad();
+    alLoad(); histLoad(); notesLoad();
+    try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();
-    try { applyTheme(localStorage.getItem(THEME_KEY) || 'dark'); } catch (e) {} Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
+    try { applyTheme(localStorage.getItem(THEME_KEY) || 'dark'); } catch (e) {}
+    try { applyScale(Store.scale); } catch (e) {} Store.onUpdate(() => { try { window.refreshAll(); } catch (e) {} });
     startTimers(window);
     setInterval(() => { try {
       if (POP && !POP.closed) return; // popped out — leave the host hidden
