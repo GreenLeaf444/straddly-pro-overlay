@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      4.9
+// @version      5.0
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, fwd: {}, fwdSrc: {}, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -71,6 +71,24 @@
     const ourTotal = rows.reduce((a, r) => a + r.ourPnl, 0);
     const out = { legs: rows, ourTotal: Math.round(ourTotal * 100) / 100, portalTotal: Store.portalMTM,
       totalDiff: Store.portalMTM != null ? Math.round((ourTotal - Store.portalMTM) * 100) / 100 : null,
+      forward: (function(){ const o = {}; underlyings().forEach(u => {
+        const sp = Store.spots[u] || 0, F = Store.fwd[u] || 0;
+        const lg = window._allLegs().filter(l => l.under === u);
+        let dF = null, dS = null;
+        if (lg.length && sp){
+          try {
+            const K = window._getPosCtx(lg, sp);
+            dF = +window._netGreeks(lg, sp).nD.toFixed(1);
+            // what the OLD spot-based model would have said, for comparison
+            let t = 0; lg.forEach((l, j) => { const iv = window.BS.iv(sp, l.strike, K.legT[j], K.r, l.ltp || l.avg, l.type) || 0.15;
+              t += window.BS.greeks(sp, l.strike, K.legT[j], K.r, iv, l.type, l.qty).delta; });
+            dS = +t.toFixed(1);
+          } catch (e) {}
+        }
+        o[u] = { spot: sp, fwd: F, basis: +(F - sp).toFixed(2), source: Store.fwdSrc[u],
+                 delta_forward_based: dF, delta_spot_based: dS,
+                 delta_difference: (dF != null && dS != null) ? +(dF - dS).toFixed(1) : null };
+      }); return o; })(),
       usingTable: tableTrusted(), posVisible: Store.posVisible,
       quoteMinusTableMs: Store.quoteAt - Store.tableAt, spots: Store.spots };
     try { console.table(rows); } catch (e) {}
@@ -141,6 +159,52 @@
     ks.sort((a, b) => a - b);
     const mid = ks[Math.floor(ks.length / 2)];
     return v > mid * 0.75 && v < mid * 1.25;
+  }
+  // ── the synthetic forward: what the option chain is actually priced against ──
+  // The portal prints it as "IF" (implied future). It is NOT the futures price: the future carries its own
+  // financing/positioning premium the options do not pay. Observed on this book: fut-spot ~37-69 pts while
+  // IF-spot was only ~5-25. Using the future would over-correct by more than the error it fixes.
+  function headerNum(labelRe, under){
+    try {
+      const leaves = document.querySelectorAll('span,div,b,strong,td,th,p');
+      for (let i = 0; i < leaves.length; i++){
+        const el = leaves[i]; if (el.childElementCount !== 0) continue;
+        if (!labelRe.test(el.textContent.trim())) continue;
+        const probes = [el.nextElementSibling].concat(el.parentElement ? Array.from(el.parentElement.children) : []);
+        for (const c of probes){
+          if (!c || c === el) continue;
+          const m = (c.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/);
+          if (!m) continue;
+          const v = parseFloat(m[1].replace(/,/g, ''));
+          if (plausibleSpot(under, v)) return v;
+        }
+      }
+    } catch (e) {}
+    return 0;
+  }
+  // Independent check: put-call parity on the chain gives F = K + (C - P)*e^{rT} at the most ATM strike.
+  function parityFwd(under){
+    const byK = {};
+    for (const sym in Store.ltpBySym){
+      const q = parseSymbol(sym), l = Store.ltpBySym[sym];
+      if (!q || q.type === 'SD' || !(l > 0) || q.underlying !== under) continue;
+      const o = byK[q.strike] = byK[q.strike] || { exp: q.expiry }; o[q.type] = l;
+    }
+    const rows = [];
+    for (const k in byK){ const x = byK[k];
+      if (x.CE > 0 && x.PE > 0) rows.push({ k: +k, gap: Math.abs(x.CE - x.PE), cp: x.CE - x.PE, exp: x.exp }); }
+    if (!rows.length) return 0;
+    rows.sort((a, b) => a.gap - b.gap);
+    const x = rows[0], T = Math.max((x.exp - Date.now()) / (365 * 864e5), 1e-5);
+    const F = x.k + x.cp * Math.exp(0.065 * T);
+    return plausibleSpot(under, F) ? F : 0;
+  }
+  function fwdFor(under, spot){
+    const iff = headerNum(/^IF:?$/i, under);
+    if (iff > 0){ Store.fwd[under] = iff; Store.fwdSrc[under] = 'IF'; return iff; }
+    const par = parityFwd(under);
+    if (par > 0){ Store.fwd[under] = par; Store.fwdSrc[under] = 'parity'; return par; }
+    Store.fwd[under] = spot || 0; Store.fwdSrc[under] = 'spot'; return spot || 0;
   }
   // DOM FIRST. The portal prints a live spot; our touchline poll can stall (expired token, rejected symbol)
   // and a stalled value would otherwise win forever, freezing the spot and with it the whole payoff.
@@ -331,11 +395,12 @@
     const spot = Store.spots[ps.underlying] || spotFor(ps.underlying);
     const T = Math.max((ps.expiry - Date.now()) / (365 * 864e5), 1 / 8760);
     if (!spot) return { prem: prem };
-    const iv = window.BS.iv(spot, ps.strike, T, 0.065, ltp, ps.type);
+    const F = fwdFor(ps.underlying, spot) || spot;
+    const iv = window.BS.iv76(F, ps.strike, T, 0.065, ltp, ps.type);
     if (!iv) return { prem: prem };
-    const g = window.BS.greeks(spot, ps.strike, T, 0.065, iv, ps.type, 1);
+    const g = window.BS.greeks76(F, ps.strike, T, 0.065, iv, ps.type, 1);
     if (!g.delta) return { prem: prem };
-    const dSpot = prem / g.delta, em = spot * iv * Math.sqrt(T);
+    const dSpot = prem / g.delta, em = F * iv * Math.sqrt(T);
     const z = em > 0 ? Math.abs(dSpot) / em : 0;
     return { prem: prem, dSpot: dSpot, sigmas: z, touch: z > 0 ? Math.min(1, 2 * (1 - window.BS.norm(z))) : 1 };
   }
@@ -450,23 +515,61 @@
   const allowedMargin = () => (Store.user && Store.user.marginAllowed) || (Store.margin && Store.margin.allowedMargin) || DEFAULT_ALLOWED_MARGIN;
   const marginUsed = () => (Store.margin && Store.margin.totalMarginUsed) || 0;
   window.BS = { norm(x){const a1=.254829592,a2=-.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=.3275911;const s=x<0?-1:1;x=Math.abs(x)/Math.sqrt(2);const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return .5*(1+s*y);}, d1(S,K,T,r,v){return(Math.log(S/K)+(r+.5*v*v)*T)/(v*Math.sqrt(T));}, price(S,K,T,r,v,t){if(T<=0)return t==='CE'?Math.max(0,S-K):Math.max(0,K-S);const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T);return t==='CE'?S*this.norm(d1)-K*Math.exp(-r*T)*this.norm(d2):K*Math.exp(-r*T)*this.norm(-d2)-S*this.norm(-d1);}, iv(S,K,T,r,mkt,t){if(!(T>0)||!(mkt>0)||!(S>0)||!(K>0))return 0;const intr=t==='CE'?Math.max(0,S-K*Math.exp(-r*T)):Math.max(0,K*Math.exp(-r*T)-S);if(mkt<=intr+1e-6)return 0;let v=.3;for(let i=0;i<100;i++){const p=this.price(S,K,T,r,v,t),d1=this.d1(S,K,T,r,v),vega=S*Math.sqrt(T)*Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),diff=p-mkt;if(Math.abs(diff)<.001)break;if(vega<1e-10)break;v-=diff/vega;if(!isFinite(v))return 0;if(v<.001)v=.001;if(v>5)v=5;}if(!isFinite(v)||v<IV_MIN||v>IV_MAX)return 0;if(Math.abs(this.price(S,K,T,r,v,t)-mkt)>Math.max(.05,mkt*.02))return 0;return v;}, greeks(S,K,T,r,v,t,qty){if(T<=0||v<=0)return{delta:0,gamma:0,theta:0,vega:0};const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T),nd1=Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),sg=qty<0?-1:1,aq=Math.abs(qty);const delta=t==='CE'?this.norm(d1):this.norm(d1)-1;const gamma=nd1/(S*v*Math.sqrt(T));const theta=t==='CE'?(-S*nd1*v/(2*Math.sqrt(T))-r*K*Math.exp(-r*T)*this.norm(d2))/365:(-S*nd1*v/(2*Math.sqrt(T))+r*K*Math.exp(-r*T)*this.norm(-d2))/365;const vega=S*nd1*Math.sqrt(T)/100;return{delta:sg*delta*aq,gamma:sg*gamma*aq,theta:sg*theta*aq,vega:sg*vega*aq};} };
+  window.BS.d1F = function (F, K, T, v){ return (Math.log(F / K) + 0.5 * v * v * T) / (v * Math.sqrt(T)); };
+  window.BS.price76 = function (F, K, T, r, v, t){
+    if (!(T > 0) || !(v > 0)) return t === 'CE' ? Math.max(0, F - K) : Math.max(0, K - F);
+    const d1 = this.d1F(F, K, T, v), d2 = d1 - v * Math.sqrt(T), df = Math.exp(-r * T);
+    return t === 'CE' ? df * (F * this.norm(d1) - K * this.norm(d2))
+                      : df * (K * this.norm(-d2) - F * this.norm(-d1));
+  };
+  window.BS.iv76 = function (F, K, T, r, mkt, t){
+    if (!(T > 0) || !(mkt > 0) || !(F > 0) || !(K > 0)) return 0;
+    const df = Math.exp(-r * T), intr = df * (t === 'CE' ? Math.max(0, F - K) : Math.max(0, K - F));
+    if (mkt <= intr + 1e-6) return 0;                       // no vol solves a mark at/below intrinsic
+    let lo = IV_MIN, hi = IV_MAX;
+    if (this.price76(F, K, T, r, hi, t) < mkt) return 0;     // richer than 300% vol -> a bad mark
+    for (let i = 0; i < 80; i++){ const m = (lo + hi) / 2;
+      if (this.price76(F, K, T, r, m, t) < mkt) lo = m; else hi = m; }
+    const v = (lo + hi) / 2;
+    if (!isFinite(v) || v <= IV_MIN * 1.001 || v >= IV_MAX * 0.999) return 0;
+    if (Math.abs(this.price76(F, K, T, r, v, t) - mkt) > Math.max(0.05, mkt * 0.02)) return 0;
+    return v;
+  };
+  window.BS.greeks76 = function (F, K, T, r, v, t, qty){
+    if (!(T > 0) || !(v > 0)) return { delta: 0, gamma: 0, theta: 0, vega: 0 };
+    const st = Math.sqrt(T), d1 = this.d1F(F, K, T, v), d2 = d1 - v * st;
+    const nd1 = Math.exp(-0.5 * d1 * d1) / Math.sqrt(2 * Math.PI), df = Math.exp(-r * T);
+    const delta = df * (t === 'CE' ? this.norm(d1) : this.norm(d1) - 1);   // w.r.t. the forward
+    const gamma = df * nd1 / (F * v * st);
+    const vega = df * F * nd1 * st / 100;
+    const theta = (t === 'CE'
+      ? -F * df * nd1 * v / (2 * st) + r * F * df * this.norm(d1) - r * K * df * this.norm(d2)
+      : -F * df * nd1 * v / (2 * st) - r * F * df * this.norm(-d1) + r * K * df * this.norm(-d2)) / 365;
+    return { delta: delta * qty, gamma: gamma * qty, theta: theta * qty, vega: vega * qty };
+  };
+
   window._getPosCtx = function (pos, spot){
     const mk = _memKey(pos, spot); const hit = _mem.ctx.get(mk); if (hit) return hit;
     const val = _posCtx(pos, spot); _mem.ctx.set(mk, val); return val; };
   function _posCtx(pos, spot){ const now = new Date();
     const legT = pos.map(p => { let d = 7; if (p.expiry instanceof Date && !isNaN(p.expiry)) d = Math.max(0.001, (p.expiry - now) / 864e5); return Math.max(d / 365, 0.0001); });
     const dte = legT.length ? Math.min(...legT) * 365 : 7, T = Math.max(dte / 365, 0.0001), r = 0.065;
-    const raw = pos.map((p, j) => window.BS.iv(spot, p.strike, legT[j], r, p.ltp || p.avg, p.type));
+    const under = (pos[0] && pos[0].under) || activeBook();
+    const fwd = fwdFor(under, spot) || spot, basis = fwd - spot;
+    const raw = pos.map((p, j) => window.BS.iv76(fwd, p.strike, legT[j], r, p.ltp || p.avg, p.type));
     const ok = raw.filter(v => v > 0).sort((a, b) => a - b);
     const fb = ok.length ? ok[Math.floor(ok.length / 2)] : 0.15; // fall back to the median leg that DID solve
     const legIVs = raw.map(v => v > 0 ? v : fb), ivBad = raw.length - ok.length;
-    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb }; }
-  window._bsPnl = function (pos, s2, K, ivD){ ivD = ivD || 0; const legT = K.legT || pos.map(() => K.T);
-    return pos.reduce((a, p, j) => { const iv = Math.max(0.01, (K.legIVs[j] || 0.15) + ivD); return a + (window.BS.price(s2, p.strike, legT[j], K.r, iv, p.type) - p.avg) * p.qty; }, 0); };
+    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb, spot, fwd, basis, fwdSrc: Store.fwdSrc[under] }; }
+  window._bsPnl = function (pos, s2, K, ivD){
+    ivD = ivD || 0; const legT = K.legT || pos.map(() => K.T), b = K.basis || 0;
+    // s2 is a hypothetical SPOT; carry the basis across so the model stays on the forward it solved on
+    return pos.reduce((a, p, j) => { const iv = Math.max(0.01, (K.legIVs[j] || 0.15) + ivD);
+      return a + (window.BS.price76(s2 + b, p.strike, legT[j], K.r, iv, p.type) - p.avg) * p.qty; }, 0); };
   window._netGreeks = function (pos, spot){
     const mk = _memKey(pos, spot); const hit = _mem.grk.get(mk); if (hit) return hit;
     const K = window._getPosCtx(pos, spot); let nD=0,nG=0,nT=0,nV=0;
-    pos.forEach((p, j) => { const g = window.BS.greeks(spot, p.strike, K.legT[j], K.r, K.legIVs[j] || 0.15, p.type, p.qty); nD+=g.delta; nG+=g.gamma; nT+=g.theta; nV+=g.vega; });
+    pos.forEach((p, j) => { const g = window.BS.greeks76(K.fwd || spot, p.strike, K.legT[j], K.r, K.legIVs[j] || 0.15, p.type, p.qty); nD+=g.delta; nG+=g.gamma; nT+=g.theta; nV+=g.vega; });
     const out = Object.assign({ nD, nG, nT, nV }, K); _mem.grk.set(mk, out); return out; };
   // P&L if held to expiry: intrinsic only, no time value. The breakeven solver uses the same function so
   // the drawn expiry curve and the quoted breakevens can never disagree.
@@ -1183,7 +1286,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad();
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();

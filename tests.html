@@ -402,6 +402,54 @@
       var deep=window._expiryPnl(L, 10000);
       return Math.abs(deep-(-6500))<0.01 || 'got '+deep+' want -6500'; });
 
+    grp('FORWARD (BLACK-76)');
+    t('Black-76 on F = S*e^(rT) reproduces Black-Scholes on S', function(){
+      var S0=24000,T=7/365,r=.065,v=.14, F=S0*Math.exp(r*T), worst=0;
+      [23500,24000,24500].forEach(function(K){ ['CE','PE'].forEach(function(ty){
+        var a=BS.price(S0,K,T,r,v,ty), b=BS.price76(F,K,T,r,v,ty);
+        worst=Math.max(worst, Math.abs(a-b)); }); });
+      return worst<0.01 || 'max price gap '+worst.toFixed(4); });
+    t('forward put-call parity holds: C - P = (F-K)*e^(-rT)', function(){
+      var F=24100,K=24000,T=5/365,r=.065,v=.15;
+      var c=BS.price76(F,K,T,r,v,'CE'), p=BS.price76(F,K,T,r,v,'PE');
+      return near(c-p,(F-K)*Math.exp(-r*T),0.01,'C-P'); });
+    t('iv76 round-trips a fair forward price', function(){
+      var F=24100,K=24200,T=5/365,r=.065;
+      var px=BS.price76(F,K,T,r,0.142,'CE');
+      return near(BS.iv76(F,K,T,r,px,'CE'),0.142,0.002,'iv'); });
+    t('iv76 refuses a mark at or below forward intrinsic', function(){
+      var F=24400,K=24000,T=5/365,r=.065;
+      var intr=Math.exp(-r*T)*(F-K);
+      return BS.iv76(F,K,T,r,intr*0.99,'CE')===0 || 'accepted a sub-intrinsic mark'; });
+    t('iv76 never returns a vol outside the 1pct-300pct band', function(){
+      for(var m=0.05;m<4000;m*=1.8){ var got=BS.iv76(24100,24200,5/365,.065,m,'CE');
+        if(got!==0 && (got<K.IV_MIN||got>K.IV_MAX)) return 'mark '+m.toFixed(2)+' gave '+got; }
+      return true; });
+    t('forward delta is discounted and correctly signed', function(){
+      var F=24100,T=5/365,r=.065,v=.15;
+      var c=BS.greeks76(F,24000,T,r,v,'CE',1).delta, p=BS.greeks76(F,24000,T,r,v,'PE',1).delta;
+      return (c>0 && c<1 && p<0 && p>-1) || 'CE '+c+' PE '+p; });
+    t('forward gamma and vega are positive for a long option', function(){
+      var g=BS.greeks76(24100,24100,5/365,.065,.15,'CE',1);
+      return (g.gamma>0 && g.vega>0) || JSON.stringify(g); });
+    t('the payoff curve carries the basis, so at zero basis it is unchanged', function(){
+      var e=new Date(Date.now()+3*864e5);
+      var L=[{strike:24200,type:'PE',qty:-65,avg:60,ltp:55,expiry:e,under:'NIFTY',symbol:'A'}];
+      S.positions=[]; S.spots={NIFTY:24350}; S.book='NIFTY'; S.ltpBySym={};
+      var Kc=window._getPosCtx(L,24350);
+      return (Math.abs(Kc.basis)<1e-9 && Kc.fwdSrc==='spot')
+        || 'basis '+Kc.basis+' src '+Kc.fwdSrc; });
+    t('parity-implied forward is recovered from a CE/PE pair', function(){
+      var e=new Date(Date.now()+3*864e5), T=(e-Date.now())/(365*864e5), F=24380, Kx=24300;
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524300CE',optionType:'CE',strikePrice:24300,
+                    quantity:-65,avgSellPrice:1,bepPrice:1,ltp:1,_scraped:true,expiryDate:e.toISOString()}];
+      // C - P = (F-K)e^(-rT)  ->  place quotes that satisfy it exactly
+      var diff=(F-Kx)*Math.exp(-0.065*T);
+      S.ltpBySym={}; S.ltpBySym['NIFTY26082524300CE']=200; S.ltpBySym['NIFTY26082524300PE']=200-diff;
+      var got=F_parity('NIFTY');
+      return Math.abs(got-F)<2 || 'implied '+got+' want '+F; });
+    function F_parity(u){ return window.SPAY._fn.parityFwd(u); }
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
