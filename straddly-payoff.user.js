@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      5.1
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, fwd: {}, fwdSrc: {}, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -164,7 +164,15 @@
   // The portal prints it as "IF" (implied future). It is NOT the futures price: the future carries its own
   // financing/positioning premium the options do not pay. Observed on this book: fut-spot ~37-69 pts while
   // IF-spot was only ~5-25. Using the future would over-correct by more than the error it fixes.
+  const _hdr = {};
   function headerNum(labelRe, under){
+    const key = String(labelRe) + '|' + under, c = _hdr[key];
+    if (c && c.el && document.contains(c.el)){
+      const m = (c.el.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/);
+      if (m){ const v = parseFloat(m[1].replace(/,/g, '')); if (plausibleSpot(under, v)) return v; }
+    }
+    if (c && Date.now() - c.at < 2000) return 0;   // don't rescan the whole page every frame
+    _hdr[key] = { el: null, at: Date.now() };
     try {
       const leaves = document.querySelectorAll('span,div,b,strong,td,th,p');
       for (let i = 0; i < leaves.length; i++){
@@ -176,7 +184,7 @@
           const m = (c.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/);
           if (!m) continue;
           const v = parseFloat(m[1].replace(/,/g, ''));
-          if (plausibleSpot(under, v)) return v;
+          if (plausibleSpot(under, v)){ _hdr[key].el = c; return v; }
         }
       }
     } catch (e) {}
@@ -205,6 +213,17 @@
     const par = parityFwd(under);
     if (par > 0){ Store.fwd[under] = par; Store.fwdSrc[under] = 'parity'; return par; }
     Store.fwd[under] = spot || 0; Store.fwdSrc[under] = 'spot'; return spot || 0;
+  }
+  // The four levels a trader wants side by side: cash, future, the portal's implied future, and our own
+  // parity-implied synthetic. Seeing all four makes the basis explicit and cross-checks IF against parity.
+  let _refsAt = 0;
+  function refsFor(under){
+    const cur = Store.refs[under];
+    if (cur && Date.now() - _refsAt < 1000) return cur;
+    _refsAt = Date.now();
+    const o = { spot: Store.spots[under] || 0, fut: headerNum(/^Fut:?$/i, under),
+                iff: headerNum(/^IF:?$/i, under), synth: parityFwd(under) };
+    Store.refs[under] = o; return o;
   }
   // DOM FIRST. The portal prints a live spot; our touchline poll can stall (expired token, rejected symbol)
   // and a stalled value would otherwise win forever, freezing the spot and with it the whole payoff.
@@ -651,6 +670,16 @@
       .books button.on{color:${C.text};border-bottom-color:${C.accent};}
 
       /* hero — the answer, first */
+      .refs{display:flex;flex-wrap:wrap;gap:0;border-bottom:1px solid ${C.line};}.refs:empty{display:none;border:0;}
+      .rf{flex:1 1 0;min-width:96px;padding:8px 12px;border-left:1px solid ${C.line};}
+      .rf:first-child{border-left:none;padding-left:14px;}
+      .rf .rfl{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;display:flex;align-items:center;gap:5px;}
+      .rf .rfv{font-family:${MONO};font-size:14px;margin-top:3px;font-variant-numeric:tabular-nums;color:${C.text};}
+      .rf .rfb{font-family:${MONO};font-size:9.5px;margin-top:1px;color:${C.dim};font-variant-numeric:tabular-nums;}
+      .rf.on .rfl{color:${C.accent};}
+      .rf.on .rfl:after{content:'PRICING';font-size:7.5px;letter-spacing:.1em;color:${C.accent};
+                        border:1px solid ${C.accent};border-radius:3px;padding:0 3px;}
+      .rf.warn .rfb{color:${C.warn};}
       .hero{padding:13px 14px 12px;border-bottom:1px solid ${C.line};}
       .hero .hl{display:flex;align-items:center;gap:8px;margin-bottom:5px;}
       .hv{font-family:${MONO};font-size:33px;line-height:1.05;letter-spacing:-.015em;font-variant-numeric:tabular-nums;}
@@ -748,6 +777,7 @@
         </span>
       </div>
       <div class="books" id="spay-books"></div>
+      <div class="refs" id="spay-refs"></div>
       <div class="hero">
         <div class="hl"><span class="lbl"><span id="spay-book">NIFTY</span> · DAY P&amp;L</span><span id="spay-rec" style="display:none" title="Our total does not match the portal's own Total MTM. Trust the portal until this clears."></span><span id="spay-iv" style="display:none" title="A leg's mark did not solve to a believable implied vol, so its greeks use an estimate."></span></div>
         <div class="hv" id="spay-day">—</div>
@@ -1153,6 +1183,23 @@
     el.innerHTML = u.map(x => '<button data-u="' + x + '"' + (x === active ? ' class="on"' : '') + '>' + x + '</button>').join('');
     [...el.querySelectorAll('button')].forEach(b => { b.onclick = () => { Store.book = b.dataset.u; recomputeSpot(); window.refreshAll(); }; });
   }
+  function renderRefs(){
+    const el = $id('spay-refs'); if (!el) return;
+    const u = activeBook(), R = refsFor(u), sp = R.spot, src = Store.fwdSrc[u];
+    const fmt = v => v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    // IF and our parity synthetic should agree; a wide gap means one of them is not what we think it is
+    const disagree = (R.iff > 0 && R.synth > 0 && Math.abs(R.iff - R.synth) > 15);
+    const cell = (lbl, v, on, warn) => {
+      if (!(v > 0)) return '';
+      const b = (sp > 0 && lbl !== 'SPOT') ? (v - sp) : null;
+      return '<div class="rf' + (on ? ' on' : '') + (warn ? ' warn' : '') + '">' +
+        '<div class="rfl">' + lbl + '</div><div class="rfv">' + fmt(v) + '</div>' +
+        '<div class="rfb">' + (b === null ? 'cash' : (b >= 0 ? '+' : '') + b.toFixed(2) + ' vs spot') + '</div></div>';
+    };
+    const html = cell('SPOT', sp, false, false) + cell('FUT', R.fut, false, false) +
+                 cell('IF', R.iff, src === 'IF', disagree) + cell('SYNTHETIC', R.synth, src === 'parity', disagree);
+    if (el.__sig === html) return; el.__sig = html; el.innerHTML = html;
+  }
   function renderOrders(){
     const el = $id('spay-orders'); if (!el) return;
     const live = Store.orders.filter(isWorking);
@@ -1264,7 +1311,7 @@
     noteTicks(); recordAllBooks();
     try { evalAlerts(); } catch (e) {}
     const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
-    renderOrders(); renderLegs();
+    renderRefs(); renderOrders(); renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.classList.toggle('act', !!on); pb.title = on ? 'Dock back into the page' : 'Open in its own window'; } // never overwrite the icon markup
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
@@ -1286,7 +1333,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad();
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();

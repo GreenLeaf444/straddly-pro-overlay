@@ -450,6 +450,26 @@
       return Math.abs(got-F)<2 || 'implied '+got+' want '+F; });
     function F_parity(u){ return window.SPAY._fn.parityFwd(u); }
 
+    t('the reference set gathers spot, future, IF and synthetic', function(){
+      var e=new Date(Date.now()+3*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524300CE',optionType:'CE',strikePrice:24300,
+                    quantity:-65,avgSellPrice:1,bepPrice:1,ltp:1,_scraped:true,expiryDate:e.toISOString()}];
+      S.spots={NIFTY:24341.65}; S.book='NIFTY'; S.refs={};
+      var T=(e-Date.now())/(365*864e5), diff=(24380-24300)*Math.exp(-0.065*T);
+      S.ltpBySym={'NIFTY26082524300CE':200,'NIFTY26082524300PE':200-diff};
+      var R=F.refsFor('NIFTY');
+      return ('spot' in R && 'fut' in R && 'iff' in R && 'synth' in R && Math.abs(R.synth-24380)<2)
+        || JSON.stringify(R); });
+    t('a chain that reconciles puts the synthetic within a few points of the true forward', function(){
+      var e=new Date(Date.now()+3*864e5), T=(e-Date.now())/(365*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524300CE',optionType:'CE',strikePrice:24300,
+                    quantity:-65,avgSellPrice:1,bepPrice:1,ltp:1,_scraped:true,expiryDate:e.toISOString()}];
+      S.spots={NIFTY:24341.65}; S.book='NIFTY';
+      var F0=24366.83, diff=(F0-24300)*Math.exp(-0.065*T);
+      S.ltpBySym={'NIFTY26082524300CE':180,'NIFTY26082524300PE':180-diff};
+      var got=F.parityFwd('NIFTY');
+      return Math.abs(got-F0)<3 || 'synthetic '+got+' vs IF '+F0; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
