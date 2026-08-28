@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      5.3
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -89,6 +89,8 @@
                  delta_forward_based: dF, delta_spot_based: dS,
                  delta_difference: (dF != null && dS != null) ? +(dF - dS).toFixed(1) : null };
       }); return o; })(),
+      portalOpenRows: Store.portalOpen, weParsedRows: (window.parseOpenPos ? window.parseOpenPos().length : 0),
+      scrapeGap: Store.scrapeGap, portalClosedRows: Store.portalClosed, realisedTotal: allRealised(),
       usingTable: tableTrusted(), posVisible: Store.posVisible,
       quoteMinusTableMs: Store.quoteAt - Store.tableAt, spots: Store.spots };
     try { console.table(rows); } catch (e) {}
@@ -261,9 +263,18 @@
   let _tableSig = '';
   // The portal prints its own "Total MTM" — read it, so we can prove we agree instead of assuming it.
   function scrapePortalMTM(){
-    try { const m = (document.body ? document.body.innerText : '').match(/Total\s*MTM\s*:?\s*₹?\s*(-?[\d,]+(?:\.\d+)?)/i);
+    try {
+      const txt = document.body ? document.body.innerText : '';
+      const m = txt.match(/Total\s*MTM\s*:?\s*₹?\s*(-?[\d,]+(?:\.\d+)?)/i);
       Store.portalMTM = m ? parseFloat(m[1].replace(/,/g, '')) : null;
-    } catch (e) { Store.portalMTM = null; }
+      // The portal prints how many open positions it has. That count is the only way to tell a row we
+      // FAILED TO PARSE apart from a row that was genuinely exited — and the two must never be confused,
+      // because banking a phantom exit corrupts realised P&L for the rest of the day.
+      const o = txt.match(/Open\s+Positions\s*\((\d+)\)/i);
+      const c = txt.match(/Closed\s+Positions\s*\((\d+)\)/i);
+      Store.portalOpen = o ? parseInt(o[1], 10) : null;
+      Store.portalClosed = c ? parseInt(c[1], 10) : null;
+    } catch (e) { Store.portalMTM = null; Store.portalOpen = null; Store.portalClosed = null; }
   }
   // Match a CELL that is exactly a status, not the row's concatenated text: textContent joins cells with
   // no separator ('22.00OPEN ORDER'), which defeats a word boundary, while an unanchored match would hit 'Open Positions'.
@@ -332,10 +343,13 @@
     Store.posVisible = uniq.length > 0;
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
     else if (onPosView){ Store.positions = []; } // on the positions view with none open → genuinely flat
-    // never diff while the table is simply absent (Orders/Baskets) — that would bank every leg as "exited"
-    if (Store.posVisible || onPosView) reconcileRealised();
+    scrapePortalMTM();
+    // A parse gap is not an exit. If the portal says it has more open rows than we managed to read, we are
+    // blind to some of the book — bank nothing, and say so.
+    Store.scrapeGap = (Store.portalOpen != null && Store.posVisible) ? Math.max(0, Store.portalOpen - uniq.length) : 0;
+    if ((Store.posVisible || onPosView) && !Store.scrapeGap) reconcileRealised();
     // else: on another tab → keep last known positions (don't blank)
-    watchTables(tables); scrapePortalMTM(); scrapeOrders();
+    watchTables(tables); scrapeOrders();
     if (Store.posVisible){
       Store.markAt = Date.now();
       const tsig = uniq.map(p => p.symbol + ':' + p.ltp).join('|');
@@ -531,6 +545,7 @@
   window.getSpot = () => { const b = activeBook(); return Store.spots[b] || spotFor(b) || 0; }; // NEVER fall back to another book's spot
   window.getOpenMTM = () => window.parseOpenPos().reduce((s, p) => s + p.pnl, 0);
   window._bookMTM = () => window._bsLegs().reduce((s, p) => s + p.pnl, 0);
+  const allRealised = () => Object.keys(Store.realised).reduce((a, k) => a + (Store.realised[k] || 0), 0);
   const allowedMargin = () => (Store.user && Store.user.marginAllowed) || (Store.margin && Store.margin.allowedMargin) || DEFAULT_ALLOWED_MARGIN;
   const marginUsed = () => (Store.margin && Store.margin.totalMarginUsed) || 0;
   window.BS = { norm(x){const a1=.254829592,a2=-.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=.3275911;const s=x<0?-1:1;x=Math.abs(x)/Math.sqrt(2);const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return .5*(1+s*y);}, d1(S,K,T,r,v){return(Math.log(S/K)+(r+.5*v*v)*T)/(v*Math.sqrt(T));}, price(S,K,T,r,v,t){if(T<=0)return t==='CE'?Math.max(0,S-K):Math.max(0,K-S);const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T);return t==='CE'?S*this.norm(d1)-K*Math.exp(-r*T)*this.norm(d2):K*Math.exp(-r*T)*this.norm(-d2)-S*this.norm(-d1);}, iv(S,K,T,r,mkt,t){if(!(T>0)||!(mkt>0)||!(S>0)||!(K>0))return 0;const intr=t==='CE'?Math.max(0,S-K*Math.exp(-r*T)):Math.max(0,K*Math.exp(-r*T)-S);if(mkt<=intr+1e-6)return 0;let v=.3;for(let i=0;i<100;i++){const p=this.price(S,K,T,r,v,t),d1=this.d1(S,K,T,r,v),vega=S*Math.sqrt(T)*Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),diff=p-mkt;if(Math.abs(diff)<.001)break;if(vega<1e-10)break;v-=diff/vega;if(!isFinite(v))return 0;if(v<.001)v=.001;if(v>5)v=5;}if(!isFinite(v)||v<IV_MIN||v>IV_MAX)return 0;if(Math.abs(this.price(S,K,T,r,v,t)-mkt)>Math.max(.05,mkt*.02))return 0;return v;}, greeks(S,K,T,r,v,t,qty){if(T<=0||v<=0)return{delta:0,gamma:0,theta:0,vega:0};const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T),nd1=Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),sg=qty<0?-1:1,aq=Math.abs(qty);const delta=t==='CE'?this.norm(d1):this.norm(d1)-1;const gamma=nd1/(S*v*Math.sqrt(T));const theta=t==='CE'?(-S*nd1*v/(2*Math.sqrt(T))-r*K*Math.exp(-r*T)*this.norm(d2))/365:(-S*nd1*v/(2*Math.sqrt(T))+r*K*Math.exp(-r*T)*this.norm(-d2))/365;const vega=S*nd1*Math.sqrt(T)/100;return{delta:sg*delta*aq,gamma:sg*gamma*aq,theta:sg*theta*aq,vega:sg*vega*aq};} };
@@ -1356,8 +1371,15 @@
     const rec = $id('spay-rec');
     if (rec){
       const pm = Store.portalMTM;
-      if (pm == null || !Store.posVisible){ rec.style.display = 'none'; Store.mismatch = 0; }
-      else { const diff = total - pm; Store.mismatch = diff;
+      if (Store.scrapeGap > 0){
+        rec.style.display = ''; Store.mismatch = 0;
+        // count PARSED ROWS, not expanded legs — a straddle row becomes two legs and would overstate this
+        rec.textContent = '⚠ READ ' + Store.positions.length + ' OF ' + Store.portalOpen + ' ROWS — figures incomplete';
+      } else if (pm == null || !Store.posVisible){ rec.style.display = 'none'; Store.mismatch = 0; }
+      else {
+        // compare like for like: if the portal's total covers closed trades too, ours must include booked
+        const mine = (Store.portalClosed > 0) ? total + allRealised() : total;
+        const diff = mine - pm; Store.mismatch = diff;
         const bad = Math.abs(diff) > Math.max(5, Math.abs(pm) * 0.01);
         rec.style.display = bad ? '' : 'none';
         if (bad) rec.textContent = '≠ PORTAL ' + money(pm) + ' (off by ' + money(diff) + ')';
@@ -1417,7 +1439,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}

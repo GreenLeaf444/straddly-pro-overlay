@@ -470,6 +470,41 @@
       var got=F.parityFwd('NIFTY');
       return Math.abs(got-F0)<3 || 'synthetic '+got+' vs IF '+F0; });
 
+    grp('SCRAPE GAP (a missed row is not an exit)');
+    function portalPage(openCount, closedCount, totalMtm){
+      var h=document.createElement('div'); h.id='pgtest';
+      h.textContent='Open Positions ('+openCount+')  Total MTM : ₹'+totalMtm+'   Closed Positions ('+closedCount+')';
+      document.body.appendChild(h); return h;
+    }
+    t('the portal open-row count is read from the page', function(){
+      var h=portalPage(2,0,1222); F.scrapePortalMTM(); h.remove();
+      return (S.portalOpen===2 && S.portalClosed===0 && S.portalMTM===1222)
+        || 'open '+S.portalOpen+' closed '+S.portalClosed+' mtm '+S.portalMTM; });
+    t('a row we failed to parse is NOT banked as realised', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.realised={}; S.prevLegs={}; S.posVisible=true; S.portalOpen=2; S.scrapeGap=0;
+      // two legs seen first
+      S.positions=[
+        {status:'OPEN',symbol:'NIFTY26082524200PE',optionType:'PE',strikePrice:24200,quantity:-20,avgSellPrice:50,bepPrice:50,ltp:40,_pnl:200,_scraped:true,expiryDate:e.toISOString()},
+        {status:'OPEN',symbol:'NIFTY26082524300CE',optionType:'CE',strikePrice:24300,quantity:-20,avgSellPrice:60,bepPrice:60,ltp:45,_pnl:300,_scraped:true,expiryDate:e.toISOString()}];
+      F.reconcileRealised();
+      // now the parser only manages one row, but the portal still reports 2 open
+      S.positions=S.positions.slice(0,1);
+      S.scrapeGap=1;                                  // what scrapePositions computes in this situation
+      if (!S.scrapeGap) F.reconcileRealised();        // the guard: skipped while blind
+      var banked=S.realised.NIFTY||0;
+      return banked===0 || 'banked '+banked+' from a row it simply could not read'; });
+    t('a genuine exit IS still banked when the counts agree', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.realised={}; S.prevLegs={}; S.posVisible=true; S.scrapeGap=0;
+      S.positions=[
+        {status:'OPEN',symbol:'NIFTY26082524200PE',optionType:'PE',strikePrice:24200,quantity:-20,avgSellPrice:50,bepPrice:50,ltp:40,_pnl:200,_scraped:true,expiryDate:e.toISOString()},
+        {status:'OPEN',symbol:'NIFTY26082524300CE',optionType:'CE',strikePrice:24300,quantity:-20,avgSellPrice:60,bepPrice:60,ltp:45,_pnl:300,_scraped:true,expiryDate:e.toISOString()}];
+      F.reconcileRealised();
+      S.positions=S.positions.slice(0,1); S.portalOpen=1; S.scrapeGap=0;   // portal agrees: one leg left
+      F.reconcileRealised();
+      return Math.abs((S.realised.NIFTY||0)-300)<0.01 || 'banked '+(S.realised.NIFTY||0)+' want 300'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
