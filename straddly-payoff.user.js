@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.4
+// @version      5.5
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -130,7 +130,8 @@
       margin: num(o.marginUsed), time: o.time || o.orderTime || null
     };
   }
-  const LOTS = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 }; // confirm against the broker before trusting sizing
+  const LOTS = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
+  const STRIKE_STEP = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 }; // confirm with the broker before trusting // confirm against the broker before trusting sizing
   const isWorking = o => /open|pending|trigger|placed/.test(o.status) && !/cancel|reject|execut|complet/.test(o.status);
   const IDX = { NIFTY: 'NIFTY', BANKNIFTY: 'NIFTY BANK', SENSEX: 'SENSEX' };
   function detectUnderlying(){ for (const p of Store.positions){ const s = parseSymbol(p.symbol); if (s) return s.underlying; } return 'NIFTY'; }
@@ -795,6 +796,13 @@
       /* pop-out window */
       body.pop{background:${C.bg};margin:0;padding:20px;}
       body.pop #spay{max-width:1180px;margin:0 auto;}
+      #spay-hedge{display:none;}
+      #spay-hedge.on{display:block;border-top:1px solid ${C.line};padding:10px 14px;}
+      #spay-hedge .hh{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;margin-bottom:4px;}
+      #spay-hedge .hm{font-family:${MONO};font-size:13.5px;color:${C.text};}
+      #spay-hedge .hm b{color:${C.accent};font-weight:400;}
+      #spay-hedge .hs{font-family:${MONO};font-size:10.5px;color:${C.dim};margin-top:3px;}
+      #spay-hedge .hw{font-size:10.5px;color:${C.warn};margin-top:5px;line-height:1.45;}
       #spay-orders{display:none;}
       body.pop #spay-orders{display:block;border-top:1px solid ${C.line};}
       #spay-orders .ohd{display:flex;align-items:center;gap:10px;padding:9px 14px 5px;font-size:9px;
@@ -880,6 +888,7 @@
         <div class="rc"><div class="rl">Margin used</div><div class="rv" id="r-mg">—</div><div class="rs" id="r-mgs"></div></div>
         <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl">—</div><div class="rs">theta if pinned here</div></div>
       </div>
+      <div id="spay-hedge"></div>
       <div id="spay-orders"></div>
       <div id="spay-legs"></div>`; }
 
@@ -1185,6 +1194,43 @@
     if (el.__sig === html) return; el.__sig = html; el.innerHTML = html;
   }
 
+  // ══ DELTA HEDGE ═════════════════════════════════════════════════════════════
+  // Given a net delta, work out what to sell to flatten it. Sell a CALL to shed positive delta, a PUT to
+  // shed negative delta — which is what a premium seller reaches for. It also returns the futures-equivalent,
+  // because selling MORE options flattens delta while ADDING short gamma and vega: it fixes the symptom and
+  // worsens the tail. The caller is told both, and what the hedge costs in greeks.
+  function hedgeSuggestion(under){
+    const legs = window._allLegs().filter(l => l.under === under);
+    if (!legs.length) return null;
+    const sp = Store.spots[under] || spotFor(under); if (!sp) return null;
+    const lot = LOTS[under]; if (!lot) return null;
+    const K = window._getPosCtx(legs, sp);
+    if (K.ivBad > 0 || legs.some(l => l._est)) return null;   // never advise a trade off estimated greeks
+    const nD = window._netGreeks(legs, sp).nD;
+    if (!isFinite(nD) || Math.abs(nD) < 1) return null;
+    const F = K.fwd || sp, T = K.T, r = K.r;
+    const ivs = K.legIVs.slice().sort((a, b) => a - b), iv = ivs[Math.floor(ivs.length / 2)] || 0.15;
+    const type = nD > 0 ? 'CE' : 'PE', step = STRIKE_STEP[under] || 50;
+    let best = null;
+    for (let i = 1; i <= 30; i++){
+      const strike = Math.round((type === 'CE' ? F + i * step : F - i * step) / step) * step;
+      if (strike <= 0) break;
+      const d = window.BS.greeks76(F, strike, T, r, iv, type, 1).delta;
+      if (!d || Math.abs(d) < 0.06 || Math.abs(d) > 0.50) continue;  // skip deep ITM and worthless wings
+      const lots = Math.round(nD / d / lot);
+      if (lots < 1) continue;
+      const residual = nD - d * lots * lot;
+      if (!best || Math.abs(residual) < Math.abs(best.residual)) best = { strike, d, lots, residual };
+    }
+    if (!best) return null;
+    const qty = -best.lots * lot;                              // negative: we are SELLING
+    const add = window.BS.greeks76(F, best.strike, T, r, iv, type, qty);
+    const px = window.BS.price76(F, best.strike, T, r, iv, type);
+    return { under, netDelta: nD, type, strike: best.strike, lots: best.lots, units: best.lots * lot,
+             optDelta: best.d, residual: best.residual, price: px, add,
+             futLots: +(Math.abs(nD) / lot).toFixed(2), futSide: nD > 0 ? 'SHORT' : 'LONG' };
+  }
+
   // ══ ALERTS ══════════════════════════════════════════════════════════════════
   // Design rules, in order of importance:
   //  1. NEVER fire off bad data — a stop triggered by a frozen mark is worse than no alert at all.
@@ -1295,8 +1341,13 @@
       const Kb = window._getPosCtx(lg, sp);
       const greeksEstimated = Kb.ivBad > 0 || lg.some(l => l._est);
       if (AL.dlt > 0 && !greeksEstimated){ const nd = window._netGreeks(lg, sp).nD;
-        if (Math.abs(nd) >= AL.dlt) fire(u + ':dlt', 'warn', u + ' delta ' + nd.toFixed(1), 'book has drifted directional (limit ' + AL.dlt + ')');
-        else rearm(u + ':dlt', Math.abs(nd) < AL.dlt * 0.8); }
+        if (Math.abs(nd) >= AL.dlt){
+          const h = hedgeSuggestion(u);
+          const how = h ? 'sell ' + h.lots + ' lot' + (h.lots > 1 ? 's' : '') + ' ' + h.strike + ' ' + h.type +
+                          ' → Δ ' + h.residual.toFixed(1)
+                        : 'no clean hedge at listed strikes';
+          fire(u + ':dlt', 'warn', u + ' DELTA ' + (nd > 0 ? '+' : '') + nd.toFixed(1), how + ' (limit ' + AL.dlt + ')');
+        } else rearm(u + ':dlt', Math.abs(nd) < AL.dlt * 0.8); }
     });
   }
   function renderLog(){
@@ -1350,6 +1401,21 @@
     const html = cell('SPOT', sp, false, false) + cell('FUT', R.fut, false, false) +
                  cell('IF', R.iff, src === 'IF', disagree) + cell('SYNTHETIC', R.synth, src === 'parity', disagree);
     if (el.__sig === html) return; el.__sig = html; el.innerHTML = html;
+  }
+  function renderHedge(){
+    const el = $id('spay-hedge'); if (!el) return;
+    const h = (AL.dlt > 0) ? hedgeSuggestion(activeBook()) : null;
+    if (!h || Math.abs(h.netDelta) < AL.dlt){ if (el.className){ el.className = ''; el.innerHTML = ''; el.__sig = ''; } return; }
+    const g = h.add;
+    const html =
+      '<div class="hh">Delta hedge · ' + h.under + ' net Δ ' + (h.netDelta > 0 ? '+' : '') + h.netDelta.toFixed(1) + '</div>' +
+      '<div class="hm">SELL <b>' + h.lots + ' lot' + (h.lots > 1 ? 's' : '') + ' ' + h.strike + ' ' + h.type + '</b>' +
+      ' · Δ' + Math.abs(h.optDelta).toFixed(2) + ' · ≈₹' + h.price.toFixed(2) +
+      ' → residual Δ ' + (h.residual > 0 ? '+' : '') + h.residual.toFixed(1) + '</div>' +
+      '<div class="hs">adds Γ ' + g.gamma.toFixed(3) + ' · Θ ' + money(g.theta / 6.25) + '/hr · vega ' + g.vega.toFixed(0) +
+      ' · or ' + h.futSide + ' ' + h.futLots + ' future lots (no added gamma or vega)</div>' +
+      '<div class="hw">Selling more premium flattens delta but increases short gamma and vega — it treats the symptom and thickens the tail. The futures leg is the risk-neutral one.</div>';
+    if (el.__sig === html) return; el.__sig = html; el.className = 'on'; el.innerHTML = html;
   }
   function renderOrders(){
     const el = $id('spay-orders'); if (!el) return;
@@ -1470,7 +1536,7 @@
     try { evalAlerts(); Store.alertBeat = Date.now(); Store.alertErr = null; }
     catch (e) { Store.alertErr = (e && e.message) || String(e); engineAlarm('evaluation failed: ' + Store.alertErr); }
     const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
-    renderAlertStatus(); renderRefs(); renderOrders(); renderLegs();
+    renderAlertStatus(); renderRefs(); renderHedge(); renderOrders(); renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.classList.toggle('act', !!on); pb.title = on ? 'Dock back into the page' : 'Open in its own window'; } // never overwrite the icon markup
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
@@ -1492,7 +1558,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, renderAlertStatus, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}

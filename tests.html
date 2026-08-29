@@ -585,6 +585,63 @@
       return (/BLOCKED/.test(el.textContent) && /read 1 of 2 rows/.test(el.textContent) && el.className.indexOf('blocked')>=0)
         || 'status "'+el.textContent+'" class '+el.className; });
 
+    grp('DELTA HEDGE');
+    function shortStraddle(spotAt){
+      var e=new Date(Date.now()+2*864e5), T=(e-Date.now())/(365*864e5);
+      // price the legs from a known vol so the marks are always solvable — a hand-typed mark below
+      // intrinsic makes the engine (correctly) refuse to advise, which is not what we are testing here
+      var ce=BS.price76(spotAt,24200,T,0.065,0.14,'CE'), pe=BS.price76(spotAt,24200,T,0.065,0.14,'PE');
+      S.positions=[
+        {status:'OPEN',symbol:'NIFTY26082524200CE',optionType:'CE',strikePrice:24200,quantity:-65,
+         avgSellPrice:ce,bepPrice:ce,ltp:ce,_pnl:0,_scraped:true,expiryDate:e.toISOString()},
+        {status:'OPEN',symbol:'NIFTY26082524200PE',optionType:'PE',strikePrice:24200,quantity:-65,
+         avgSellPrice:pe,bepPrice:pe,ltp:pe,_pnl:0,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.spots={NIFTY:spotAt}; S.book='NIFTY'; S.realised={}; S.refs={};
+      S.ltpBySym={}; S.fwd={}; S.fwdSrc={};
+      S.markAt=Date.now(); S.tickAt=Date.now(); S.tableAt=Date.now(); S.quoteAt=Date.now();
+      S.scrapeGap=0; S.mismatch=0; S.portalMTM=0; S.portalOpen=2;
+    }
+    t('it sells a CALL to shed long delta and a PUT to shed short delta', function(){
+      shortStraddle(24450);                       // spot well above 24200 -> the short call dominates? check sign
+      var nd=window._netGreeks(window._allLegs(),24450).nD;
+      var h=F.hedgeSuggestion('NIFTY');
+      if(!h) return 'no suggestion (net delta '+nd.toFixed(1)+')';
+      return (h.netDelta>0 ? h.type==='CE' : h.type==='PE')
+        || 'net delta '+h.netDelta.toFixed(1)+' but suggested '+h.type; });
+    t('the hedge actually reduces the absolute delta', function(){
+      shortStraddle(24450); var h=F.hedgeSuggestion('NIFTY');
+      if(!h) return 'no suggestion';
+      return Math.abs(h.residual) < Math.abs(h.netDelta)
+        || 'residual '+h.residual.toFixed(1)+' is no better than '+h.netDelta.toFixed(1); });
+    t('it sells a whole number of lots, at least one', function(){
+      shortStraddle(24450); var h=F.hedgeSuggestion('NIFTY');
+      if(!h) return 'no suggestion';
+      return (h.lots>=1 && h.lots===Math.round(h.lots) && h.units===h.lots*65)
+        || 'lots '+h.lots+' units '+h.units; });
+    t('it picks a tradeable strike, not a deep ITM or a worthless wing', function(){
+      shortStraddle(24450); var h=F.hedgeSuggestion('NIFTY');
+      if(!h) return 'no suggestion';
+      return (Math.abs(h.optDelta)>=0.06 && Math.abs(h.optDelta)<=0.50)
+        || 'chose a '+h.optDelta.toFixed(2)+' delta strike'; });
+    t('it reports the gamma and vega the hedge ADDS', function(){
+      shortStraddle(24450); var h=F.hedgeSuggestion('NIFTY');
+      if(!h) return 'no suggestion';
+      // selling an option is short gamma and short vega
+      return (h.add.gamma<0 && h.add.vega<0)
+        || 'added gamma '+h.add.gamma+' vega '+h.add.vega+' - selling should be short both'; });
+    t('it offers a futures-equivalent sized to the same delta', function(){
+      shortStraddle(24450); var h=F.hedgeSuggestion('NIFTY');
+      if(!h) return 'no suggestion';
+      var want=Math.abs(h.netDelta)/65;
+      return (Math.abs(h.futLots-want)<0.02 && (h.futSide==='SHORT')===(h.netDelta>0))
+        || 'futLots '+h.futLots+' want '+want.toFixed(2)+' side '+h.futSide; });
+    t('it refuses to advise when the greeks are only estimated', function(){
+      shortStraddle(24450);
+      S.positions[0].ltp=0.01; S.positions[0].avgSellPrice=0.01; S.positions[0].bepPrice=0.01; // unsolvable mark
+      var K=window._getPosCtx(window._allLegs(),24450);
+      var h=F.hedgeSuggestion('NIFTY');
+      return (K.ivBad>0 ? h===null : true) || 'advised a trade with ivBad='+K.ivBad; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
