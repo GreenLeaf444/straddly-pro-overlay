@@ -156,9 +156,14 @@
       for(var i=0;i<50;i++) F.histPush('NIFTY', 100+i, -5);
       var n=(S.hist.NIFTY||[]).length;
       return n===1 || 'wrote '+n+' samples in a tight loop'; });
-    t('a sample carries [t, mtm, delta, realised]', function(){
+    t('a sample carries [t, mtm, delta, realised, vega, theta]', function(){
       var s0=S.hist.NIFTY[0];
-      return (s0.length===4 && typeof s0[0]==='number') || JSON.stringify(s0); });
+      return (s0.length===6 && typeof s0[0]==='number') || JSON.stringify(s0); });
+    t('vega and theta are recorded, not just delta', function(){
+      S.hist={}; S.histDay=F.dayKey();
+      F.histPush('NIFTY', 500, -12, -880, 4200);
+      var s0=S.hist.NIFTY[0];
+      return (s0[2]===-12 && s0[4]===-880 && s0[5]===4200) || JSON.stringify(s0); });
     t('a new trading day resets the series and the booked total', function(){
       S.histDay='2026-01-01'; S.hist={NIFTY:[[1,2,3,4]]}; S.realised={NIFTY:999};
       F.histPush('NIFTY', 10, -1);

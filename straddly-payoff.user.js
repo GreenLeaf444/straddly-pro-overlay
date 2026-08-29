@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.5
+// @version      5.6
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -441,7 +441,7 @@
 
   // ══ MTM / DELTA HISTORY ═════════════════════════════════════════════════════
   // Can't be reconstructed after the fact, so we sample as we go and keep the day in localStorage.
-  const HIST_KEY = 'spay_hist_v2', HIST_MS = 3000, HIST_SAVE_MS = 15000, HIST_MAX = 8000;
+  const HIST_KEY = 'spay_hist_v3', HIST_MS = 3000, HIST_SAVE_MS = 15000, HIST_MAX = 8000;
   function dayKey(){ const d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
   function histLoad(){
     try { const raw = localStorage.getItem(HIST_KEY); if (!raw) return; const j = JSON.parse(raw);
@@ -454,12 +454,13 @@
     if (!force && Date.now() - _lastSave < HIST_SAVE_MS) return; _lastSave = Date.now();
     try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist, r: Store.realised, pk: Store.peak })); } catch (e) {}
   }
-  function histPush(book, mtm, delta){
+  function histPush(book, mtm, delta, vega, theta){
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
     const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
     const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
-    a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(Store.realised[book] || 0)]);
+    a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(Store.realised[book] || 0),
+            Math.round(vega || 0), Math.round(theta || 0)]);
     if (a.length > HIST_MAX) a.splice(0, a.length - HIST_MAX);
     histSave(false);
   }
@@ -654,9 +655,11 @@
   // Sized in CSS pixels but backed at devicePixelRatio — without this every line and label is drawn at 1x
   // and upscaled by the compositor, which is why canvas UIs look soft next to the page's own text.
   const PAYOFF_H_KEY = 'spay_payoff_h';
-  function fitCanvas(id, frac, baseH){
+  function fitCanvas(id, frac, baseH, minW){
     const cv = $id(id); if (!cv) return null;
-    const W = Math.max(Math.round(cv.getBoundingClientRect().width) || 420, 260);
+    // the floor must not exceed the element's real width, or the backing store is wider than the box and
+    // the drawing is squashed horizontally when the browser scales it down to fit
+    const W = Math.max(Math.round(cv.getBoundingClientRect().width) || 420, minW || 260);
     let H = baseH || 150;
     if (POP && !POP.closed && frac) H = Math.max(H, Math.min(560, Math.round((POP.innerHeight || 800) * frac)));
     if (id === 'spay-cv' && Store.payoffH > 0) H = Store.payoffH; // user-dragged height wins
@@ -745,10 +748,11 @@
             color:${C.muted};font-family:${MONO};text-transform:uppercase;}
       .mhdr .k{display:flex;align-items:center;gap:5px;}
       .mhdr .k:before{content:'';width:9px;height:2px;background:${C.accent};}
-      .mhdr .k2:before{background:${C.ce};}
       .mhdr .mnow{margin-left:auto;color:${C.dim};letter-spacing:.04em;}
 
       /* greeks: one hairline-separated row, no boxes */
+      .minis{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-top:12px;}
+      .minis canvas{background:transparent;border:1px solid ${C.line};border-radius:4px;}
       .grk{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid ${C.line};}
       .grk>div{padding:9px 0 9px 12px;border-left:1px solid ${C.line};}
       .grk>div:first-child{border-left:none;padding-left:14px;}
@@ -873,8 +877,13 @@
       <div class="wrap">
         <canvas id="spay-cv" height="230"></canvas>
         <div class="rsz" id="spay-rsz" title="Drag to resize the payoff chart"><span></span></div>
-        <div class="mhdr"><span class="k k1">Day P&amp;L</span><span class="k k2">Net delta</span><span class="mnow" id="spay-mnow"></span></div>
+        <div class="mhdr"><span class="k k1">Day P&amp;L</span><span class="mnow" id="spay-mnow"></span></div>
         <canvas id="spay-mtm-cv" height="150"></canvas>
+        <div class="minis">
+          <canvas id="gm-d" height="84"></canvas>
+          <canvas id="gm-t" height="84"></canvas>
+          <canvas id="gm-v" height="84"></canvas>
+        </div>
       </div>
       <div class="grk">
         <div><div class="gl">Delta</div><div class="gv" id="g-d">—</div></div>
@@ -1088,33 +1097,28 @@
     const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const a = Store.hist[activeBook()] || [];
     if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '12px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording…' : 'day P&L starts recording now', W / 2, H / 2); return; }
-    const L2 = 60, R = 52, Tp = 12, B = 21, CW = W - L2 - R, CH = H - Tp - B;
+    const L2 = 60, R = 16, Tp = 12, B = 21, CW = W - L2 - R, CH = H - Tp - B;
     // left-anchored, minimum 30-minute frame so the curve grows into a stable window instead of rescaling every tick
     const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
     const X = t => L2 + ((t - t0) / span) * CW;
     // Raw day P&L is a tick-by-tick series and reads as noise. Smooth it for DISPLAY with a centred moving
     // average — the stored samples and the hover readout stay raw, so no number is ever fabricated.
-    const raw = a.map(p => p[1] + (p[3] || 0)), rawD = a.map(p => p[2]);
+    const raw = a.map(p => p[1] + (p[3] || 0));
     const win = Math.max(1, Math.min(9, Math.round(a.length / 40) * 2 + 1));
     const smooth = arr => { if (win < 2) return arr.slice(); const h = (win - 1) / 2;
       return arr.map((_, i) => { let sum = 0, c = 0;
         for (let j = Math.max(0, i - h); j <= Math.min(arr.length - 1, i + h); j++){ sum += arr[j]; c++; }
         return sum / c; }); };
-    const ms = smooth(raw), ds = smooth(rawD);
+    const ms = smooth(raw);
     let lo = Math.min(0, ...ms), hi = Math.max(0, ...ms);
     if (hi - lo < Y_FLOOR){ const c = (hi + lo) / 2; lo = c - Y_FLOOR / 2; hi = c + Y_FLOOR / 2; } // don't zoom into tick noise
     const mStep = niceStep(((hi - lo) || 1000) / 3);
     const mMin = Math.floor(lo / mStep) * mStep, mMax = Math.ceil(hi / mStep) * mStep;
     const Y = v => Tp + CH - ((v - mMin) / ((mMax - mMin) || 1)) * CH;
-    let dMin = Math.min(...ds), dMax = Math.max(...ds);
-    if (dMax - dMin < 1){ const c = (dMax + dMin) / 2; dMin = c - 1; dMax = c + 1; }
-    const dp = (dMax - dMin) * 0.18; dMin -= dp; dMax += dp;
-    const YD = v => Tp + CH - ((v - dMin) / ((dMax - dMin) || 1)) * CH;
     ctx.font = '10.5px ' + MONO;
     for (let v = mMin; v <= mMax + 1e-9; v += mStep){ const y = Y(v);
       ctx.strokeStyle = Math.abs(v) < mStep * 0.01 ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L2, y); ctx.lineTo(W - R, y); ctx.stroke();
       ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L2 - 5, y + 3); }
-    [dMin, (dMin + dMax) / 2, dMax].forEach(v => { ctx.fillStyle = C.ce; ctx.textAlign = 'left'; ctx.fillText(v.toFixed(0), W - R + 5, YD(v) + 3); });
     for (let i = 0; i <= 3; i++){ const t = t0 + (i / 3) * span, x = X(t);
       ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke();
       ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(hhmm(t), x, H - 6); }
@@ -1134,9 +1138,7 @@
       const area = () => { ctx.beginPath(); ctx.moveTo(X(a[s0][0]), z); for (let i = s0; i <= s1; i++) ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.lineTo(X(a[s1][0]), z); ctx.closePath(); };
       ctx.save(); ctx.beginPath(); ctx.rect(L2, Tp, CW, Math.max(0, z - Tp)); ctx.clip(); area(); ctx.fillStyle = C.upArea; ctx.fill(); ctx.restore();
       ctx.save(); ctx.beginPath(); ctx.rect(L2, z, CW, Math.max(0, Tp + CH - z)); ctx.clip(); area(); ctx.fillStyle = C.dnArea; ctx.fill(); ctx.restore();
-      ctx.strokeStyle = C.ce; ctx.lineWidth = 1.3; ctx.beginPath();
-      for (let i = s0; i <= s1; i++){ const x = X(a[i][0]), y = YD(ds[i]); i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
-      ctx.stroke(); ctx.lineWidth = 1.7;
+      ctx.lineWidth = 1.7;
       for (let i = s0 + 1; i <= s1; i++){
         ctx.strokeStyle = (ms[i - 1] >= 0 && ms[i] >= 0) ? C.up : (ms[i - 1] < 0 && ms[i] < 0) ? C.dn : C.muted;
         ctx.beginPath(); ctx.moveTo(X(a[i - 1][0]), Y(ms[i - 1])); ctx.lineTo(X(a[i][0]), Y(ms[i])); ctx.stroke(); }
@@ -1149,8 +1151,7 @@
       const nb = a[ni], nv = raw[ni], cx = X(nb[0]); // hover reports the RAW sample, not the smoothed line
       ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]);
       ctx.beginPath(); ctx.arc(cx, Y(nv), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill();
-      ctx.beginPath(); ctx.arc(cx, YD(rawD[ni]), 2.6, 0, 7); ctx.fillStyle = C.ce; ctx.fill();
-      const lbl = hhmm(nb[0]) + '  ' + money(nv) + (nb[3] ? '  (R ' + money(nb[3]) + ')' : '') + '  Δ' + nb[2];
+      const lbl = hhmm(nb[0]) + '  ' + money(nv) + (nb[3] ? '  (R ' + money(nb[3]) + ')' : '');
       ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16;
       let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx);
       ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18);
@@ -1359,6 +1360,50 @@
     el.innerHTML = html;
   }
 
+  // Greeks as curves rather than numbers: a delta of +30 means one thing if it has been flat all morning and
+  // quite another if it has doubled in ten minutes. Same time axis as the P&L chart above, so they read across.
+  function drawMini(id, idx, label, col, fmt){
+    const cv = fitCanvas(id, 0, 84, 90); if (!cv) return;
+    const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
+    const a = Store.hist[activeBook()] || [];
+    ctx.font = '9.5px ' + MONO;
+    if (a.length < 2){ ctx.fillStyle = C.dim; ctx.textAlign = 'left'; ctx.fillText(label, 6, 14); return; }
+    const L = 6, R = 6, Tp = 20, B = 6, CW = W - L - R, CH = H - Tp - B;
+    const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
+    const X = t => L + ((t - t0) / span) * CW;
+    const v = a.map(p => p[idx] || 0);
+    let lo = Math.min(0, ...v), hi = Math.max(0, ...v);
+    if (hi - lo < 1e-6){ lo -= 1; hi += 1; }
+    const pad = (hi - lo) * 0.15; lo -= pad; hi += pad;
+    const Y = x => Tp + CH - ((x - lo) / ((hi - lo) || 1)) * CH;
+    const z = Y(0);
+    ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(L, z); ctx.lineTo(W - R, z); ctx.stroke();
+    // break the line across recording gaps, exactly as the P&L chart does
+    const runs = []; let st = 0;
+    for (let i = 1; i < a.length; i++) if (a[i][0] - a[i - 1][0] > GAP_S){ runs.push([st, i - 1]); st = i; }
+    runs.push([st, a.length - 1]);
+    runs.forEach(([s0, s1]) => {
+      if (s1 <= s0) return;
+      ctx.beginPath(); ctx.moveTo(X(a[s0][0]), z);
+      for (let i = s0; i <= s1; i++) ctx.lineTo(X(a[i][0]), Y(v[i]));
+      ctx.lineTo(X(a[s1][0]), z); ctx.closePath();
+      ctx.fillStyle = col.replace(/[\d.]+\)$/, '0.13)'); ctx.fill();
+      ctx.strokeStyle = col; ctx.lineWidth = 1.4; ctx.beginPath();
+      for (let i = s0; i <= s1; i++){ const x = X(a[i][0]), y = Y(v[i]); i === s0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
+      ctx.stroke();
+    });
+    const last = v[v.length - 1];
+    ctx.beginPath(); ctx.arc(X(a[a.length - 1][0]), Y(last), 2.6, 0, 7); ctx.fillStyle = col; ctx.fill();
+    ctx.fillStyle = C.muted; ctx.textAlign = 'left'; ctx.font = '9px ' + MONO; ctx.fillText(label, L, 11);
+    ctx.fillStyle = C.text; ctx.textAlign = 'right'; ctx.font = '12px ' + MONO;
+    ctx.fillText(fmt(last), W - R, 12);
+  }
+  window.drawGreekMinis = function (){
+    drawMini('gm-d', 2, 'DELTA', 'rgba(77,155,255,1)', v => (v >= 0 ? '+' : '') + v.toFixed(1));
+    drawMini('gm-t', 5, 'THETA / HR', 'rgba(63,185,80,1)', v => money(v / 6.25));
+    drawMini('gm-v', 4, 'VEGA', 'rgba(163,113,247,1)', v => Math.round(v).toLocaleString('en-IN'));
+  };
+
   // ══ REFRESH ═════════════════════════════════════════════════════════════════
   // one payoff per underlying — NIFTY and BANKNIFTY are different books and must never share a spot
   function renderBooks(active){
@@ -1468,7 +1513,8 @@
       try {
         const mtmU = lg.reduce((s, p) => s + p.pnl, 0), dayU = mtmU + (Store.realised[u] || 0);
         if (!(Store.peak[u] > dayU)) Store.peak[u] = dayU;   // intraday high-water mark of day P&L
-        histPush(u, mtmU, window._netGreeks(lg, sp).nD);
+        const G = window._netGreeks(lg, sp);
+        histPush(u, mtmU, G.nD, G.nV, G.nT);
       } catch (e) {}
     });
   }
@@ -1543,7 +1589,7 @@
     positionPanel();
     const mn = $id('spay-mnow');
     if (mn){ const h = Store.hist[book] || []; mn.textContent = h.length ? h.length + ' pts · since ' + hhmm(h[0][0]) + ' · smoothed' : ''; }
-    window.drawPayoff(); window.drawMtm();
+    window.drawPayoff(); window.drawMtm(); window.drawGreekMinis();
   };
 
   // ══ BOOT + WATCHDOG ═════════════════════════════════════════════════════════
