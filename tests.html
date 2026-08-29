@@ -186,7 +186,8 @@
       armAll(); F.AL.on=true; F.AL.health=true;
       openBook(0, 24250, 24100, 24400); S.markAt=Date.now()-600000; S.tickAt=Date.now()-600000;
       F.evalAlerts('OPEN');
-      return (F.ALOG.length===1 && /FEED PROBLEM/.test(F.ALOG[0].msg)) || JSON.stringify(F.ALOG.map(function(a){return a.msg;})); });
+      // the health alert now names WHICH check failed, not just that one did
+      return (F.ALOG.length===1 && /DATA NOT TRUSTED/.test(F.ALOG[0].msg) && /stale|frozen/.test(F.ALOG[0].msg)) || JSON.stringify(F.ALOG.map(function(a){return a.msg;})); });
     t('a dead feed SUPPRESSES the P&L stop (never act on a frozen mark)', function(){
       armAll(); F.AL.on=true; F.AL.health=false; F.AL.stop=-1000; F.AL.be=0; F.AL.dlt=0; F.AL.tgt=0;
       openBook(-9999, 24250, 24100, 24400); S.markAt=Date.now()-600000; S.tickAt=Date.now()-600000;
@@ -504,6 +505,85 @@
       S.positions=S.positions.slice(0,1); S.portalOpen=1; S.scrapeGap=0;   // portal agrees: one leg left
       F.reconcileRealised();
       return Math.abs((S.realised.NIFTY||0)-300)<0.01 || 'banked '+(S.realised.NIFTY||0)+' want 300'; });
+
+    grp('ALERT INTEGRITY GATE');
+    function healthyBook(){
+      var e=new Date(Date.now()+2*864e5);
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524200PE',optionType:'PE',strikePrice:24200,quantity:-20,
+                    avgSellPrice:50,bepPrice:50,ltp:40,_pnl:200,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.spots={NIFTY:24250}; S.book='NIFTY'; S.realised={}; S.refs={};
+      S.markAt=Date.now(); S.tickAt=Date.now(); S.tableAt=Date.now(); S.quoteAt=Date.now();
+      S.scrapeGap=0; S.mismatch=0; S.portalMTM=200; S.portalOpen=1; S.portalClosed=0;
+      F.AL.sound=false; F.AL.desktop=false; F.AL.flash=false; F.AL.on=true; F.AL.health=true;
+      F.AL.be=0; F.AL.tgt=0; F.AL.stop=-1; F.AL.give=0; F.AL.dlt=0;
+      Object.keys(F.ALS).forEach(function(k){ delete F.ALS[k]; }); F.ALOG.length=0;
+    }
+    t('a healthy book passes the integrity gate', function(){
+      healthyBook(); var g=F.dataTrust();
+      return g.ok || 'blocked by: '+g.why.join(', '); });
+    t('a scrape gap blocks every alert except data health', function(){
+      healthyBook(); S.scrapeGap=1; S.portalOpen=2;
+      F.evalAlerts('OPEN');
+      var msgs=F.ALOG.map(function(a){return a.msg;});
+      return (msgs.length===1 && /DATA NOT TRUSTED/.test(msgs[0]) && /read 1 of 2 rows/.test(msgs[0]))
+        || JSON.stringify(msgs); });
+    t('a portal disagreement blocks alerts', function(){
+      healthyBook(); S.mismatch=-741; S.portalMTM=1222;
+      var g=F.dataTrust();
+      return (!g.ok && /disagrees with portal/.test(g.why.join(','))) || JSON.stringify(g.why); });
+    t('a stop-loss does NOT fire while the data is untrusted', function(){
+      healthyBook(); F.AL.stop=-100; F.AL.health=false; S.scrapeGap=1; S.portalOpen=2;
+      S.positions[0]._pnl=-9999;                     // a loss well past the limit
+      F.evalAlerts('OPEN');
+      return F.ALOG.length===0 || 'fired anyway: '+F.ALOG[0].msg; });
+    t('the same stop-loss DOES fire once the data is trusted again', function(){
+      healthyBook(); F.AL.stop=-100; F.AL.health=false;
+      S.positions[0]._pnl=-9999;
+      F.evalAlerts('OPEN');
+      return (F.ALOG.length===1 && /LOSS LIMIT/.test(F.ALOG[0].msg)) || JSON.stringify(F.ALOG.map(function(a){return a.msg;})); });
+    t('a stale feed still blocks, as before', function(){
+      healthyBook(); S.markAt=Date.now()-600000;
+      var g=F.dataTrust();
+      return (!g.ok && /stale/.test(g.why.join(','))) || JSON.stringify(g.why); });
+    t('IF and synthetic disagreeing blocks alerts', function(){
+      healthyBook(); S.refs={NIFTY:{spot:24250,fut:24400,iff:24300,synth:24260}};
+      var g=F.dataTrust();
+      return (!g.ok && /IF vs synthetic/.test(g.why.join(','))) || JSON.stringify(g.why); });
+    t('the reason for being blocked is recorded, not just the fact', function(){
+      healthyBook(); S.scrapeGap=1; S.portalOpen=2; F.dataTrust();
+      return (S.alertBlock.length>0 && typeof S.alertBlock[0]==='string') || JSON.stringify(S.alertBlock); });
+
+    t('a broken engine reports a fault instead of going quiet', function(){
+      healthyBook(); S.alertErr=null; S.alertBeat=Date.now();
+      var real=window._allLegs;
+      window._allLegs=function(){ throw new Error('simulated engine fault'); };
+      var threw=false;
+      try { F.evalAlerts('OPEN'); } catch(e){ threw=true; S.alertErr=e.message; }
+      window._allLegs=real;
+      F.renderAlertStatus('OPEN');
+      var el=window._SPR.querySelector('#spay-astat');
+      var ok = threw && /ENGINE FAULT/.test(el.textContent) && el.className.indexOf('fault')>=0;
+      S.alertErr=null;
+      return ok || 'threw='+threw+' status="'+el.textContent+'" class='+el.className; });
+    t('a stalled evaluator is reported, not mistaken for calm', function(){
+      healthyBook(); S.alertErr=null; S.alertBeat=Date.now()-120000;   // last checked 2 minutes ago
+      F.renderAlertStatus('OPEN');
+      var el=window._SPR.querySelector('#spay-astat');
+      return (/NOT EVALUATING/.test(el.textContent) && el.className.indexOf('fault')>=0)
+        || 'status "'+el.textContent+'" class '+el.className; });
+    t('a healthy engine reads ARMED with its last check time', function(){
+      healthyBook(); S.alertErr=null; S.alertBeat=Date.now(); S.alertBlock=[];
+      F.renderAlertStatus('OPEN');
+      var el=window._SPR.querySelector('#spay-astat');
+      return (/ARMED/.test(el.textContent) && el.className.indexOf('ok')>=0)
+        || 'status "'+el.textContent+'" class '+el.className; });
+    t('being blocked looks different from being armed', function(){
+      healthyBook(); S.alertErr=null; S.alertBeat=Date.now();
+      S.scrapeGap=1; S.portalOpen=2; F.dataTrust();
+      F.renderAlertStatus('OPEN');
+      var el=window._SPR.querySelector('#spay-astat');
+      return (/BLOCKED/.test(el.textContent) && /read 1 of 2 rows/.test(el.textContent) && el.className.indexOf('blocked')>=0)
+        || 'status "'+el.textContent+'" class '+el.className; });
 
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';

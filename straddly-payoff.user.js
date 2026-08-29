@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.3
+// @version      5.4
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -688,6 +688,8 @@
       .ic{background:transparent;border:none;color:${C.muted};cursor:pointer;padding:3px 4px;border-radius:4px;display:grid;place-items:center;line-height:0;}
       .ic:hover{color:${C.text};background:${C.card};}
       .ic.act{color:${C.accent};}
+      .ic.warn{color:${C.warn};}
+      .ic.bad{color:${C.dn};}
       .ic svg{display:block;}
 
       /* book switcher: underline, not pills */
@@ -778,6 +780,12 @@
       .cfg .cks{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;padding-top:10px;border-top:1px solid ${C.line};}
       .cfg .ck{gap:6px;margin:0;cursor:pointer;letter-spacing:.1em;}
       .cfg .ck input{accent-color:${C.accent};}
+      .astat{font-family:${MONO};font-size:11px;padding:8px 10px;border-radius:4px;margin-bottom:12px;
+             border-left:2px solid;line-height:1.5;}
+      .astat.ok{background:${C.goodBg};border-left-color:${C.up};color:${C.up};}
+      .astat.blocked{background:${C.warnBg};border-left-color:${C.warn};color:${C.warn};}
+      .astat.fault{background:${C.badBg};border-left-color:${C.dn};color:${C.dn};}
+      .astat.off{background:transparent;border-left-color:${C.line2};color:${C.dim};}
       .cfgn{margin-top:10px;font-size:10px;color:${C.dim};line-height:1.5;letter-spacing:0;text-transform:none;}
       #spay-log{margin-top:10px;border-top:1px solid ${C.line};padding-top:8px;max-height:150px;overflow:auto;}
       .lg{font-family:${MONO};font-size:10.5px;padding:2px 0;color:${C.sub};}
@@ -834,6 +842,7 @@
       </div>
       <div class="alert" id="spay-alert" style="display:none"><span class="ad"></span><button class="ax" id="spay-ax">✕</button></div>
       <div class="cfg" id="spay-cfg" style="display:none">
+        <div class="astat" id="spay-astat"></div>
         <label>Breakeven warn <input id="a-be" type="number" min="0" step="5"><i>pts</i></label>
         <label>P&amp;L profit at <input id="a-tgt" type="number" step="500"><i>₹ day P&amp;L · 0 = off</i></label>
         <label>P&amp;L loss at <input id="a-stop" type="number" step="500"><i>₹ negative · 0 = off</i></label>
@@ -1222,21 +1231,45 @@
   }
   function rearm(key, ok){ const st = ALS[key]; if (st && ok) st.armed = true; }
 
+  // Every integrity signal the panel computes, in one place. An alert fired on data we already know is wrong
+  // is worse than none: it lends the panel's authority to a bad decision. This session alone produced a
+  // sign-flipped straddle P&L, a frozen spot and a silently missed position row — under the old gate, which
+  // checked only staleness, every one of those would still have triggered a stop-loss alert.
+  function dataTrust(){
+    const why = [];
+    const age = Store.markAt ? Date.now() - Store.markAt : -1;
+    const frozen = Store.tickAt ? Date.now() - Store.tickAt : -1;
+    if (age < 0) why.push('no position marks yet');
+    else if (age > 30000) why.push('marks stale ' + fmtAge(age));
+    if (frozen > 180000) why.push('feed frozen ' + fmtAge(frozen));
+    if (Store.scrapeGap > 0) why.push('read ' + Store.positions.length + ' of ' + Store.portalOpen + ' rows');
+    if (Math.abs(Store.mismatch || 0) > Math.max(5, Math.abs(Store.portalMTM || 0) * 0.01))
+      why.push('disagrees with portal by ' + money(Store.mismatch));
+    const R = Store.refs[activeBook()];
+    if (R && R.iff > 0 && R.synth > 0 && Math.abs(R.iff - R.synth) > 15)
+      why.push('IF vs synthetic off by ' + Math.round(Math.abs(R.iff - R.synth)) + ' pts');
+    Store.alertBlock = why;
+    return { ok: !why.length, why: why };
+  }
+  // The engine alarming about ITSELF. An empty catch meant a thrown error stopped alerts permanently with no
+  // outward sign — and silence is indistinguishable from "all clear", the one failure an alert system may
+  // never have.
+  function engineAlarm(msg){
+    const b = $id('spay-alert');
+    if (b){ b.style.display = ''; b.className = 'alert bad';
+      const d = b.querySelector('.ad'); if (d) d.textContent = 'ALERT ENGINE — ' + msg; }
+    try { beep('bad'); desktop('ALERT ENGINE PROBLEM', msg); } catch (e) {}
+  }
   function evalAlerts(state){          // state is injectable so the suite can test each session case
     if (!AL.on) return;
     if ((state || marketState()) !== 'OPEN'){ Object.keys(ALS).forEach(k => { ALS[k].armed = true; }); return; }
-    const age = Store.markAt ? Date.now() - Store.markAt : -1;
-    const frozen = Store.tickAt ? Date.now() - Store.tickAt : -1;
-    const sick = age < 0 || age > 30000 || frozen > 180000;
+    const trust = dataTrust(), sick = !trust.ok;
     if (AL.health){
-      if (sick) fire('health', 'bad', 'FEED PROBLEM',
-        age < 0 ? 'no position marks have arrived yet'
-                : age > 30000 ? 'no fresh mark for ' + fmtAge(age)
-                : frozen > 0 ? 'no mark has moved in ' + fmtAge(frozen)
-                : 'marks are not updating');
+      if (sick) fire('health', 'bad', 'DATA NOT TRUSTED', trust.why.join(' · '));
       else rearm('health', true);
     }
-    if (sick) return; // RULE 1 — do not judge P&L, breakevens or delta on data we do not trust
+    // RULE 1 — never judge P&L, breakevens or delta on data that failed any integrity check
+    if (sick) return;
     const all = window._allLegs();
     underlyings().forEach(u => {
       const lg = all.filter(l => l.under === u); if (!lg.length) return;
@@ -1259,7 +1292,9 @@
       if (AL.give > 0){ const pk = Store.peak[u] || 0, back = pk - day;
         if (pk > 0 && back >= AL.give) fire(u + ':give', 'warn', u + ' GIVING BACK', money(back) + ' off the day high of ' + money(pk) + ' — now ' + money(day));
         else rearm(u + ':give', back < AL.give * 0.6); }
-      if (AL.dlt > 0){ const nd = window._netGreeks(lg, sp).nD;
+      const Kb = window._getPosCtx(lg, sp);
+      const greeksEstimated = Kb.ivBad > 0 || lg.some(l => l._est);
+      if (AL.dlt > 0 && !greeksEstimated){ const nd = window._netGreeks(lg, sp).nD;
         if (Math.abs(nd) >= AL.dlt) fire(u + ':dlt', 'warn', u + ' delta ' + nd.toFixed(1), 'book has drifted directional (limit ' + AL.dlt + ')');
         else rearm(u + ':dlt', Math.abs(nd) < AL.dlt * 0.8); }
     });
@@ -1281,6 +1316,23 @@
     const key = u.join('|') + '>' + active; if (el.dataset.key === key) return; el.dataset.key = key;
     el.innerHTML = u.map(x => '<button data-u="' + x + '"' + (x === active ? ' class="on"' : '') + '>' + x + '</button>').join('');
     [...el.querySelectorAll('button')].forEach(b => { b.onclick = () => { Store.book = b.dataset.u; recomputeSpot(); window.refreshAll(); }; });
+  }
+  // Armed, blocked and broken must never look the same. A quiet alert panel has to prove it is quiet
+  // BECAUSE nothing is wrong, not because it stopped running.
+  function renderAlertStatus(state){          // state is injectable so the suite can test each branch
+    const el = $id('spay-astat'); if (!el) return;
+    const beat = Store.alertBeat ? Date.now() - Store.alertBeat : -1;
+    let cls, txt;
+    if (Store.alertErr){ cls = 'fault'; txt = '⚠ ENGINE FAULT — ' + Store.alertErr; }
+    else if (!AL.on){ cls = 'off'; txt = 'alerts are switched off'; }
+    else if ((state || marketState()) !== 'OPEN'){ cls = 'off'; txt = 'market closed — alerts idle'; }
+    else if (beat < 0 || beat > 20000){ cls = 'fault'; txt = '⚠ NOT EVALUATING — last checked ' + (beat < 0 ? 'never' : fmtAge(beat)); }
+    else if (Store.alertBlock.length){ cls = 'blocked'; txt = 'BLOCKED — ' + Store.alertBlock.join(' · ') + ' — only the data-health alert can fire while this stands'; }
+    else { cls = 'ok'; txt = 'ARMED · checked ' + fmtAge(beat) + ' ago'; }
+    const sig = cls + '|' + txt; if (el.__sig === sig) return; el.__sig = sig;
+    el.className = 'astat ' + cls; el.textContent = txt;
+    const bell = $id('spay-bell');
+    if (bell){ bell.classList.toggle('warn', cls === 'blocked'); bell.classList.toggle('bad', cls === 'fault'); }
   }
   function renderRefs(){
     const el = $id('spay-refs'); if (!el) return;
@@ -1415,9 +1467,10 @@
       lv.className = 'live ' + cls; set('spay-lt', txt);
     }
     noteTicks(); recordAllBooks();
-    try { evalAlerts(); } catch (e) {}
+    try { evalAlerts(); Store.alertBeat = Date.now(); Store.alertErr = null; }
+    catch (e) { Store.alertErr = (e && e.message) || String(e); engineAlarm('evaluation failed: ' + Store.alertErr); }
     const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
-    renderRefs(); renderOrders(); renderLegs();
+    renderAlertStatus(); renderRefs(); renderOrders(); renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.classList.toggle('act', !!on); pb.title = on ? 'Dock back into the page' : 'Open in its own window'; } // never overwrite the icon markup
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
@@ -1439,7 +1492,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, renderAlertStatus, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
@@ -1453,6 +1506,14 @@
       positionPanel();
     } catch (e) {} }, WATCHDOG_MS);
     startHeartbeat();
+    setInterval(() => { try {
+      if (!AL.on || marketState() !== 'OPEN') return;
+      const beat = Store.alertBeat ? Date.now() - Store.alertBeat : -1;
+      if (beat < 0 || beat > 20000){
+        if (!Store._beatWarned){ Store._beatWarned = 1;
+          engineAlarm('alerts have not been evaluated for ' + (beat < 0 ? 'the whole session' : fmtAge(beat))); }
+      } else Store._beatWarned = 0;
+    } catch (e) {} }, 5000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden){ try { poll(); window.refreshAll(); } catch (e) {} } });
     window.addEventListener('scroll', () => { try { positionPanel(); } catch (e) {} }, true);
     window.addEventListener('resize', () => { try { positionPanel(); } catch (e) {} });
