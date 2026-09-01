@@ -722,6 +722,32 @@
       var raw=JSON.parse(localStorage.getItem('spay_hist_v3')||'{}');
       return (raw.cp && Math.abs(raw.cp.NIFTY-123.45)<0.01) || JSON.stringify(raw.cp); });
 
+    t('charges come from the executed order log, ignoring cancelled orders', function(){
+      S.orders=[
+        {symbol:'NIFTY26090124000PE',side:'SELL',qty:65,lots:1,lotSize:65,fill:23.65,asked:23.65,status:'executed'},
+        {symbol:'NIFTY26090124000PE',side:'BUY', qty:65,lots:1,lotSize:65,fill:0,asked:28.89,status:'cancelled'}
+      ];
+      var c=F.costFromOrders('NIFTY');
+      return (c && c.fills===1) || 'counted '+(c&&c.fills)+' fills, should ignore the cancelled one'; });
+    t('a fill is charged at its FILL price, not the order price', function(){
+      S.orders=[{symbol:'NIFTY26090124000PE',side:'SELL',qty:65,lots:1,lotSize:65,fill:50,asked:999,status:'executed'}];
+      var c=F.costFromOrders('NIFTY');
+      var expect=F.legCost(50,65,1,'SELL',false).total;
+      return Math.abs(c.total-expect)<0.01 || 'got '+c.total+' want '+expect+' (used the order price?)'; });
+    t('a straddle fill is charged straddle brokerage', function(){
+      S.orders=[{symbol:'NIFTY26090124100SD',side:'SELL',qty:65,lots:1,lotSize:65,fill:100,asked:100,status:'executed'}];
+      var c=F.costFromOrders('NIFTY');
+      return c.brok===F.COSTS.brokSdLot || 'brokerage '+c.brok+' want '+F.COSTS.brokSdLot; });
+    t('the order log is filtered to the book being viewed', function(){
+      S.orders=[
+        {symbol:'NIFTY26090124000PE',side:'SELL',qty:65,lots:1,lotSize:65,fill:20,asked:20,status:'executed'},
+        {symbol:'BANKNIFTY26090157800CE',side:'SELL',qty:30,lots:1,lotSize:30,fill:200,asked:200,status:'executed'}
+      ];
+      var n=F.costFromOrders('NIFTY'), b=F.costFromOrders('BANKNIFTY');
+      return (n.fills===1 && b.fills===1) || 'nifty '+n.fills+' banknifty '+b.fills; });
+    t('with no order log at all it returns null so the estimate is used', function(){
+      S.orders=[]; return F.costFromOrders('NIFTY')===null || 'should be null with no orders'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

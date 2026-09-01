@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.8
+// @version      5.9
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -302,7 +302,9 @@
         out.push({ id: sym + ':' + nums.join('_'), symbol: sym, side: /BUY/i.test(txt) ? 'BUY' : 'SELL',
           qty: Math.abs(qty), lots: lot ? Math.round(Math.abs(qty) / lot) : 0, lotSize: lot,
           rateType: /market/i.test(txt) ? 'market' : 'limit',
-          asked: nums.length > 1 ? nums[1] : 0, fill: 0, trigger: 0,
+          asked: nums.length > 1 ? nums[1] : 0,
+          // for an executed row the Price column IS the fill, and that is what charges are levied on
+          fill: /execut|complet/i.test(st) && nums.length > 1 ? nums[1] : 0, trigger: 0,
           status: st.toLowerCase(), kind: '', margin: 0, time: null, _dom: true });
       });
       if (out.length){ Store.orders = out; Store.ordersAt = Date.now(); }
@@ -1264,6 +1266,25 @@
     return { amt, which };
   }
 
+  // Charges computed from the EXECUTED ORDER LOG rather than inferred from position closes.
+  // Inference only captures a close the panel happened to be watching: reload, start late or shut the tab and
+  // those charges vanish. The order log is every fill at the price actually paid, so it is both complete and
+  // exact — and it survives anything, because the portal keeps it, not us.
+  const isFilled = o => /execut|complet/i.test(o.status || '');
+  function costFromOrders(book){
+    const rows = Store.orders.filter(o => { if (!isFilled(o)) return false;
+      const x = parseSymbol(o.symbol); return x && (!book || x.underlying === book); });
+    if (!rows.length) return null;
+    const out = zeroCost(); out.fills = rows.length;
+    rows.forEach(o => {
+      const x = parseSymbol(o.symbol), lot = o.lotSize || LOTS[x.underlying] || 0;
+      const lots = o.lots || (lot ? Math.abs(o.qty) / lot : Math.abs(o.qty));
+      const px = o.fill > 0 ? o.fill : o.asked;          // the price actually filled at
+      addCost(out, legCost(px, o.qty, lots, o.side, x.type === 'SD'));
+    });
+    return out;
+  }
+
   // ══ NOTES ═══════════════════════════════════════════════════════════════════
   // Timestamped, kept per trading day, pruned to the last 30 days. Written next to the position they refer
   // to, which is the point — a note recalled a week later is worth little without the day's context.
@@ -1568,7 +1589,10 @@
   function renderCosts(){
     const el = $id('spay-costs'); if (!el) return;
     const legs = window._bsLegs(), book = activeBook();
-    const paid = Store.costPaid[book] || 0, booked = Store.realised[book] || 0;
+    const booked = Store.realised[book] || 0;
+    const fromLog = costFromOrders(book);                     // preferred: every fill, at its fill price
+    const paid = fromLog ? fromLog.total : (Store.costPaid[book] || 0);
+    const basis = fromLog ? (fromLog.fills + ' fills from the order log') : 'estimated from closes seen';
     // stay visible on a flat book: the day's closed trades still cost real money
     if (!legs.length && !paid && !booked){ if (el.innerHTML){ el.innerHTML = ''; el.__sig = ''; } return; }
     const entry = legs.length ? costOfEntry(legs) : zeroCost();
@@ -1584,20 +1608,24 @@
       '</div><div class="cs">' + sub + '</div></div>';
     let html = '<div class="cgrid">' +
       cell('Net after costs', money(net), col(net), 'gross ' + money(gross)) +
-      cell('Charges today', money(-totalCost), C.dn,
+      cell('Charges today', totalCost ? money(-totalCost) : '₹0', totalCost ? C.dn : C.muted,
            'paid ' + money(-paid) + (round ? ' · to exit ' + money(-round) : '')) +
-      cell(legs.length ? 'Cost to exit now' : 'Closed trades', legs.length ? money(-exit.total) : money(-paid), C.dn,
-           legs.length ? 'at the marks on screen' : 'charges already incurred') +
+      cell(legs.length ? 'Cost to exit now' : 'Fills today',
+           legs.length ? money(-exit.total) : String((fromLog && fromLog.fills) || 0),
+           legs.length && exit.total ? C.dn : C.text,
+           legs.length ? 'at the marks on screen' : 'executed orders charged') +
       cell('Cost drag', drag == null ? '—' : drag.toFixed(1) + '%', (drag != null && drag > 30) ? C.dn : C.text, 'of gross P&L') +
       '</div>';
-    if (legs.length)
-      html += '<div class="cbrk">' +
-        [['BROKERAGE','brok'],['STT','stt'],['EXCH','exch'],['SEBI','sebi'],['STAMP','stamp'],['GST','gst']]
-          .map(([lbl, k]) => '<span>' + lbl + ' <b>₹' + ((entry[k] || 0) + (exit[k] || 0)).toFixed(0) + '</b></span>').join('') +
-        '<span style="margin-left:auto">open book · rates editable, verify against a contract note</span></div>';
-    else
-      html += '<div class="cbrk"><span>flat book — charges shown are what today’s closed trades cost</span>' +
-        '<span style="margin-left:auto">rates editable — verify against a contract note</span></div>';
+    // the itemisation is the point of the panel — show it whether the book is open or flat
+    const src = fromLog || addCost(addCost(zeroCost(), entry), exit);
+    const biggest = ['brok', 'stt', 'exch', 'sebi', 'stamp', 'gst']
+      .reduce((b, k) => (src[k] || 0) > (src[b] || 0) ? k : b, 'brok');
+    const NAME = { brok: 'BROKERAGE', stt: 'STT', exch: 'EXCH', sebi: 'SEBI', stamp: 'STAMP', gst: 'GST' };
+    html += '<div class="cbrk">' +
+      Object.keys(NAME).map(k => '<span' + (k === biggest ? ' style="color:' + C.sub + '"' : '') + '>' +
+        NAME[k] + ' <b>₹' + (src[k] || 0).toFixed(0) + '</b>' +
+        (k === biggest && src.total ? ' (' + Math.round(src[k] / src.total * 100) + '%)' : '') + '</span>').join('') +
+      '<span style="margin-left:auto">' + basis + ' · rates editable, verify against a contract note</span></div>';
     if (ex.amt > 0)
       html += '<div class="cwarn">⚠ LONG ITM INTO EXPIRY — ' + ex.which.join(', ') +
         ' would be auto-exercised, costing roughly ' + money(ex.amt) + ' in exercise STT on intrinsic. Closing avoids it.</div>';
@@ -1745,7 +1773,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
