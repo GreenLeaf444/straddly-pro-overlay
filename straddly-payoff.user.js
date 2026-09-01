@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.7
+// @version      5.8
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -362,17 +362,28 @@
   }
   // When a leg is exited its open P&L vanishes from the book — bank it, so the day curve stays continuous
   // instead of dropping a step. Only ever runs on a genuine Positions-tab read (see posVisible).
+  // A closed trade's charges are real money already gone. Bank them as the leg closes, or a flat book shows
+  // no costs at all while the day's booked P&L quietly overstates what you actually kept.
+  function bankCost(l, fraction){
+    try {
+      const lot = LOTS[l.under] || 0, lots = lot ? Math.abs(l.qty) / lot : Math.abs(l.qty), isSD = l.type === 'SD';
+      const inC = legCost(l.avg, l.qty, lots, l.qty < 0 ? 'SELL' : 'BUY', isSD);
+      const outC = legCost(l.ltp, l.qty, lots, l.qty < 0 ? 'BUY' : 'SELL', isSD);
+      Store.costPaid[l.under] = (Store.costPaid[l.under] || 0) + (inC.total + outC.total) * (fraction == null ? 1 : fraction);
+    } catch (e) {}
+  }
   function reconcileRealised(){
     const cur = {};
-    window.parseOpenPos().forEach(p => { (cur[p.under] = cur[p.under] || {})[p.symbol] = { qty: p.qty, pnl: p.pnl }; });
+    window.parseOpenPos().forEach(p => { (cur[p.under] = cur[p.under] || {})[p.symbol] = p; });
     const books = {}; Object.keys(Store.prevLegs).forEach(b => { books[b] = 1; }); Object.keys(cur).forEach(b => { books[b] = 1; });
     Object.keys(books).forEach(b => {
       const prev = Store.prevLegs[b] || {}, now = cur[b] || {};
       Object.keys(prev).forEach(sym => {
         const o = prev[sym], nw = now[sym];
-        if (!nw){ Store.realised[b] = (Store.realised[b] || 0) + o.pnl; return; }            // fully exited
+        if (!nw){ Store.realised[b] = (Store.realised[b] || 0) + o.pnl; bankCost(o, 1); return; }   // fully exited
         const shut = Math.abs(o.qty) - Math.abs(nw.qty);
-        if (shut > 0 && Math.abs(o.qty) > 0) Store.realised[b] = (Store.realised[b] || 0) + o.pnl * (shut / Math.abs(o.qty)); // partial
+        if (shut > 0 && Math.abs(o.qty) > 0){ const f = shut / Math.abs(o.qty);
+          Store.realised[b] = (Store.realised[b] || 0) + o.pnl * f; bankCost(o, f); }                // partial
       });
     });
     Store.prevLegs = cur;
@@ -445,18 +456,18 @@
   function dayKey(){ const d = new Date(); return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
   function histLoad(){
     try { const raw = localStorage.getItem(HIST_KEY); if (!raw) return; const j = JSON.parse(raw);
-      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; Store.realised = j.r || {}; Store.peak = j.pk || {}; }
+      if (j && j.day === dayKey() && j.h){ Store.hist = j.h; Store.histDay = j.day; Store.realised = j.r || {}; Store.peak = j.pk || {}; Store.costPaid = j.cp || {}; }
       else localStorage.removeItem(HIST_KEY); // new session day → start clean
     } catch (e) {}
   }
   let _lastSave = 0;
   function histSave(force){
     if (!force && Date.now() - _lastSave < HIST_SAVE_MS) return; _lastSave = Date.now();
-    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist, r: Store.realised, pk: Store.peak })); } catch (e) {}
+    try { localStorage.setItem(HIST_KEY, JSON.stringify({ day: Store.histDay || dayKey(), h: Store.hist, r: Store.realised, pk: Store.peak, cp: Store.costPaid })); } catch (e) {}
   }
   function histPush(book, mtm, delta, vega, theta){
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
-    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.prevLegs = {}; }
+    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.costPaid = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
     const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
     a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(Store.realised[book] || 0),
@@ -1557,26 +1568,36 @@
   function renderCosts(){
     const el = $id('spay-costs'); if (!el) return;
     const legs = window._bsLegs(), book = activeBook();
-    if (!legs.length){ if (el.innerHTML){ el.innerHTML = ''; el.__sig = ''; } return; }
-    const entry = costOfEntry(legs), exit = costToClose(legs);
-    const round = entry.total + exit.total;
-    const gross = legs.reduce((a, l) => a + l.pnl, 0) + (Store.realised[book] || 0);
-    const net = gross - round;
-    const drag = Math.abs(gross) > 1 ? (round / Math.abs(gross) * 100) : null;
+    const paid = Store.costPaid[book] || 0, booked = Store.realised[book] || 0;
+    // stay visible on a flat book: the day's closed trades still cost real money
+    if (!legs.length && !paid && !booked){ if (el.innerHTML){ el.innerHTML = ''; el.__sig = ''; } return; }
+    const entry = legs.length ? costOfEntry(legs) : zeroCost();
+    const exit = legs.length ? costToClose(legs) : zeroCost();
+    const round = entry.total + exit.total;          // still to be paid on what is open
+    const totalCost = paid + round;                  // already paid + still to pay
+    const gross = legs.reduce((a, l) => a + l.pnl, 0) + booked;
+    const net = gross - totalCost;
+    const drag = Math.abs(gross) > 1 ? (totalCost / Math.abs(gross) * 100) : null;
     const ex = exerciseRisk(legs, window.getSpot());
     const cell = (lbl, val, cl, sub) =>
       '<div class="cc"><div class="cl">' + lbl + '</div><div class="cv" style="color:' + cl + '">' + val +
       '</div><div class="cs">' + sub + '</div></div>';
     let html = '<div class="cgrid">' +
       cell('Net after costs', money(net), col(net), 'gross ' + money(gross)) +
-      cell('Round trip', money(-round), C.dn, 'in ' + money(-entry.total) + ' · out ' + money(-exit.total)) +
-      cell('Cost to exit now', money(-exit.total), C.dn, 'at the marks on screen') +
+      cell('Charges today', money(-totalCost), C.dn,
+           'paid ' + money(-paid) + (round ? ' · to exit ' + money(-round) : '')) +
+      cell(legs.length ? 'Cost to exit now' : 'Closed trades', legs.length ? money(-exit.total) : money(-paid), C.dn,
+           legs.length ? 'at the marks on screen' : 'charges already incurred') +
       cell('Cost drag', drag == null ? '—' : drag.toFixed(1) + '%', (drag != null && drag > 30) ? C.dn : C.text, 'of gross P&L') +
       '</div>';
-    html += '<div class="cbrk">' +
-      [['BROKERAGE','brok'],['STT','stt'],['EXCH','exch'],['SEBI','sebi'],['STAMP','stamp'],['GST','gst']]
-        .map(([lbl, k]) => '<span>' + lbl + ' <b>₹' + ((entry[k] || 0) + (exit[k] || 0)).toFixed(0) + '</b></span>').join('') +
-      '<span style="margin-left:auto">rates editable — verify against a contract note</span></div>';
+    if (legs.length)
+      html += '<div class="cbrk">' +
+        [['BROKERAGE','brok'],['STT','stt'],['EXCH','exch'],['SEBI','sebi'],['STAMP','stamp'],['GST','gst']]
+          .map(([lbl, k]) => '<span>' + lbl + ' <b>₹' + ((entry[k] || 0) + (exit[k] || 0)).toFixed(0) + '</b></span>').join('') +
+        '<span style="margin-left:auto">open book · rates editable, verify against a contract note</span></div>';
+    else
+      html += '<div class="cbrk"><span>flat book — charges shown are what today’s closed trades cost</span>' +
+        '<span style="margin-left:auto">rates editable — verify against a contract note</span></div>';
     if (ex.amt > 0)
       html += '<div class="cwarn">⚠ LONG ITM INTO EXPIRY — ' + ex.which.join(', ') +
         ' would be auto-exercised, costing roughly ' + money(ex.amt) + ' in exercise STT on intrinsic. Closing avoids it.</div>';
@@ -1724,7 +1745,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}

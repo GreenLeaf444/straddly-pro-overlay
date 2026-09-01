@@ -697,6 +697,31 @@
       var rich =F.exerciseRisk([csLeg(24000,'CE',65,999,300)], 24350).amt;
       return Math.abs(cheap-rich)<1e-9 || 'premium changed the exercise charge'; });
 
+    t('closing a leg banks its round-trip charges', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.realised={}; S.costPaid={}; S.prevLegs={}; S.posVisible=true; S.scrapeGap=0; S.portalOpen=1;
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524200PE',optionType:'PE',strikePrice:24200,quantity:-65,
+                    avgSellPrice:100,bepPrice:100,ltp:60,_pnl:2600,_scraped:true,expiryDate:e.toISOString()}];
+      F.reconcileRealised();
+      S.positions=[]; S.portalOpen=0; F.reconcileRealised();
+      var paid=S.costPaid.NIFTY||0;
+      return (paid>0 && paid<200) || 'banked '+paid+' (expected a realistic round trip for 1 lot)'; });
+    t('a partial exit banks only that fraction of the charges', function(){
+      var e=new Date(Date.now()+2*864e5);
+      S.realised={}; S.costPaid={}; S.prevLegs={}; S.posVisible=true; S.scrapeGap=0;
+      S.positions=[{status:'OPEN',symbol:'NIFTY26082524200PE',optionType:'PE',strikePrice:24200,quantity:-130,
+                    avgSellPrice:100,bepPrice:100,ltp:60,_pnl:5200,_scraped:true,expiryDate:e.toISOString()}];
+      F.reconcileRealised();
+      var full=F.legCost(100,-130,2,'SELL',false).total + F.legCost(60,-130,2,'BUY',false).total;
+      S.positions[0].quantity=-65; S.positions[0]._pnl=2600; F.reconcileRealised();
+      var paid=S.costPaid.NIFTY||0;
+      return Math.abs(paid-full/2)<0.01 || 'banked '+paid.toFixed(2)+' want half of '+full.toFixed(2); });
+    t('banked charges survive a reload with the day history', function(){
+      S.costPaid={NIFTY:123.45}; S.histDay=F.dayKey(); S.hist={NIFTY:[[1,2,3,4,5,6]]};
+      F.histSave(true);                    // bypass the 15s write throttle
+      var raw=JSON.parse(localStorage.getItem('spay_hist_v3')||'{}');
+      return (raw.cp && Math.abs(raw.cp.NIFTY-123.45)<0.01) || JSON.stringify(raw.cp); });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
