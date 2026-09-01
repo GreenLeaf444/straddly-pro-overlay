@@ -647,6 +647,56 @@
       var h=F.hedgeSuggestion('NIFTY');
       return (K.ivBad>0 ? h===null : true) || 'advised a trade with ivBad='+K.ivBad; });
 
+    grp('COSTS');
+    function csLeg(strike,type,qty,avg,ltp){
+      return {strike:strike,type:type,qty:qty,avg:avg,ltp:ltp,under:'NIFTY',symbol:'C'+strike+type,
+              expiry:new Date(Date.now()+2*864e5)};
+    }
+    t('STT is charged on the sell side only', function(){
+      var sell=F.legCost(100,-65,1,'SELL',false), buy=F.legCost(100,65,1,'BUY',false);
+      return (sell.stt>0 && buy.stt===0) || 'sell '+sell.stt+' buy '+buy.stt; });
+    t('stamp duty is charged on the buy side only', function(){
+      var sell=F.legCost(100,-65,1,'SELL',false), buy=F.legCost(100,65,1,'BUY',false);
+      return (buy.stamp>0 && sell.stamp===0) || 'buy '+buy.stamp+' sell '+sell.stamp; });
+    t('GST applies to brokerage and fees, never to STT', function(){
+      var c=F.legCost(100,-65,1,'SELL',false);
+      var expect=(c.brok+c.exch+c.sebi)*F.COSTS.gst/100;
+      return Math.abs(c.gst-expect)<0.01 || 'gst '+c.gst+' expected '+expect; });
+    t('the breakdown sums to the total', function(){
+      var c=F.legCost(100,-65,1,'SELL',false);
+      var sum=c.brok+c.stt+c.exch+c.sebi+c.stamp+c.gst;
+      return Math.abs(sum-c.total)<1e-9 || 'parts '+sum+' vs total '+c.total; });
+    t('brokerage scales with lots, not with premium', function(){
+      var a=F.legCost(100,-65,1,'SELL',false), b=F.legCost(900,-65,1,'SELL',false);
+      return a.brok===b.brok || 'brokerage moved with premium: '+a.brok+' vs '+b.brok; });
+    t('a straddle lot is charged the straddle brokerage', function(){
+      var opt=F.legCost(100,-65,1,'SELL',false), sd=F.legCost(100,-65,1,'SELL',true);
+      return (sd.brok===F.COSTS.brokSdLot && opt.brok===F.COSTS.brokLot) || 'sd '+sd.brok+' opt '+opt.brok; });
+    t('closing a short book is priced as a BUY (no exit STT)', function(){
+      var c=F.costToClose([csLeg(24200,'PE',-65,50,40)]);
+      return c.stt===0 || 'charged sell-side STT to close a short: '+c.stt; });
+    t('closing a long book is priced as a SELL (exit STT applies)', function(){
+      var c=F.costToClose([csLeg(24200,'PE',65,50,40)]);
+      return c.stt>0 || 'no STT on closing a long'; });
+    t('entry cost uses the price actually paid, not the current mark', function(){
+      var a=F.costOfEntry([csLeg(24200,'PE',-65,50,10)]);
+      var b=F.costOfEntry([csLeg(24200,'PE',-65,50,900)]);
+      return Math.abs(a.total-b.total)<1e-9 || 'entry cost moved with the live mark'; });
+    t('a long ITM leg into expiry is flagged for exercise STT', function(){
+      var r=F.exerciseRisk([csLeg(24000,'CE',65,50,300)], 24350);   // 350 intrinsic, long
+      var expect=350*65*F.COSTS.sttExercise/100;
+      return (r.amt>0 && Math.abs(r.amt-expect)<0.01) || 'got '+r.amt+' expected '+expect; });
+    t('a SHORT ITM leg is not charged exercise STT', function(){
+      var r=F.exerciseRisk([csLeg(24000,'CE',-65,50,300)], 24350);
+      return r.amt===0 || 'charged the seller '+r.amt; });
+    t('an OTM long leg carries no exercise risk', function(){
+      var r=F.exerciseRisk([csLeg(24500,'CE',65,50,10)], 24350);
+      return r.amt===0 || 'flagged an OTM leg: '+r.amt; });
+    t('exercise STT is charged on intrinsic, not on premium', function(){
+      var cheap=F.exerciseRisk([csLeg(24000,'CE',65,1,300)], 24350).amt;
+      var rich =F.exerciseRisk([csLeg(24000,'CE',65,999,300)], 24350).amt;
+      return Math.abs(cheap-rich)<1e-9 || 'premium changed the exercise charge'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

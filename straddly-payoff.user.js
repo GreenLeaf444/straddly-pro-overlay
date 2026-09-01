@@ -741,6 +741,18 @@
       .ndel{background:none;border:none;color:${C.dim};cursor:pointer;font-size:14px;line-height:1;padding:0 2px;}
       .ndel:hover{color:${C.dn};}
       .nempty{color:${C.dim};font-size:12px;}
+      .costs{border-top:1px solid ${C.line};}.costs:empty{display:none;border:0;}
+      .cgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));}
+      .cc{padding:10px 14px;border-left:1px solid ${C.line};}
+      .cc:first-child{border-left:none;}
+      .cc .cl{font-size:9px;letter-spacing:.12em;color:${C.muted};text-transform:uppercase;}
+      .cc .cv{font-family:${MONO};font-size:15.5px;margin-top:3px;font-variant-numeric:tabular-nums;}
+      .cc .cs{font-size:10px;color:${C.dim};margin-top:2px;}
+      .cbrk{padding:8px 14px 10px;border-top:1px solid ${C.line};display:flex;flex-wrap:wrap;gap:14px;
+            font-family:${MONO};font-size:10.5px;color:${C.dim};}
+      .cbrk b{color:${C.sub};font-weight:400;}
+      .cwarn{padding:9px 14px;border-top:1px solid ${C.line};border-left:2px solid ${C.warn};
+             background:${C.warnBg};color:${C.warn};font-family:${MONO};font-size:11.5px;}
       .rsz{height:11px;margin:1px 0 0;cursor:ns-resize;display:grid;place-items:center;}
       .rsz span{display:block;width:34px;height:2px;border-radius:1px;background:${C.line2};transition:background .12s;}
       .rsz:hover span{background:${C.accent};}
@@ -867,6 +879,14 @@
           <label class="ck"><input id="a-fls" type="checkbox">flash</label>
           <label class="ck"><input id="a-hl" type="checkbox">feed health</label>
         </div>
+        <div class="cks" style="border-top:1px solid ${C.line};padding-top:10px;">
+          <label>Brokerage/lot <input id="c-brok" type="number" step="1"><i>₹ · straddle <input id="c-broksd" type="number" step="1" style="width:60px"></i></label>
+          <label>STT sell <input id="c-stt" type="number" step="0.005"><i>% of premium</i></label>
+          <label>Exchange <input id="c-exch" type="number" step="0.001"><i>% of premium</i></label>
+          <label>Stamp <input id="c-stamp" type="number" step="0.001"><i>% buy side</i></label>
+          <label>GST <input id="c-gst" type="number" step="1"><i>% on brokerage+fees</i></label>
+          <label>Exercise STT <input id="c-sttx" type="number" step="0.005"><i>% of intrinsic, long ITM</i></label>
+        </div>
         <div class="cfgn">Alerts fire once per crossing and re-arm only after the value pulls back. Nothing fires while the feed is stale or frozen, or outside market hours.</div>
         <div id="spay-log"></div>
       </div>
@@ -898,6 +918,7 @@
         <div class="rc"><div class="rl">Decay left</div><div class="rv" id="r-dl">—</div><div class="rs">theta if pinned here</div></div>
       </div>
       <div id="spay-hedge"></div>
+      <div class="costs" id="spay-costs"></div>
       <div id="spay-orders"></div>
       <div id="spay-legs"></div>`; }
 
@@ -950,6 +971,11 @@
     const bell = $id('spay-bell');
     if (bell) bell.onclick = () => { const c = $id('spay-cfg'); if (!c) return; const show = c.style.display === 'none'; c.style.display = show ? '' : 'none'; if (show){ syncCfg(); renderLog(); } };
     const num = (id, key) => { const e = $id(id); if (!e) return; e.onchange = () => { AL[key] = parseFloat(e.value) || 0; alSave(); Object.keys(ALS).forEach(k => { ALS[k].armed = true; }); }; };
+    const cnum = (id, key) => { const e = $id(id); if (!e) return;
+      e.value = COSTS[key];
+      e.onchange = () => { const v = parseFloat(e.value); if (isFinite(v)){ COSTS[key] = v; costsSave(); try { window.refreshAll(); } catch (_) {} } }; };
+    cnum('c-brok', 'brokLot'); cnum('c-broksd', 'brokSdLot'); cnum('c-stt', 'sttSell');
+    cnum('c-exch', 'exch'); cnum('c-stamp', 'stamp'); cnum('c-gst', 'gst'); cnum('c-sttx', 'sttExercise');
     num('a-be', 'be'); num('a-tgt', 'tgt'); num('a-stop', 'stop'); num('a-give', 'give'); num('a-dlt', 'dlt');
     const chk = (id, key) => { const e = $id(id); if (!e) return; e.onchange = () => {
       AL[key] = e.checked; alSave();
@@ -1160,6 +1186,72 @@
     }
   };
 
+
+  // ══ COSTS ═══════════════════════════════════════════════════════════════════
+  // Indian F&O charges change (STT was raised, exchange fees were re-based under true-to-label). So these
+  // are DEFAULTS, editable, and shown broken down — never a black box. Check them against a contract note
+  // before trusting the net figure: a cost model that is quietly wrong is worse than none, because it makes
+  // a losing trade look profitable.
+  const COST_KEY = 'spay_costs_v1';
+  const COSTS = {
+    brokLot: 8,        // brokerage per lot, options
+    brokSdLot: 16,     // brokerage per lot, straddle
+    sttSell: 0.10,     // % of premium, SELL side only
+    sttExercise: 0.125,// % of INTRINSIC on a long ITM leg auto-exercised at expiry
+    exch: 0.03503,     // % of premium, exchange transaction charge
+    sebi: 0.0001,      // % of premium
+    stamp: 0.003,      // % of premium, BUY side only
+    gst: 18            // % on (brokerage + exchange + sebi)
+  };
+  function costsLoad(){ try { const j = JSON.parse(localStorage.getItem(COST_KEY) || '{}'); Object.keys(COSTS).forEach(k => { if (isFinite(j[k])) COSTS[k] = j[k]; }); } catch (e) {} }
+  function costsSave(){ try { localStorage.setItem(COST_KEY, JSON.stringify(COSTS)); } catch (e) {} }
+
+  // One side of one leg. `qty` is in units (not lots); `prem` is the per-unit premium.
+  function legCost(prem, qty, lots, side, isSD){
+    const turn = Math.abs(prem * qty);
+    const brok = Math.abs(lots) * (isSD ? COSTS.brokSdLot : COSTS.brokLot);
+    const stt = side === 'SELL' ? turn * COSTS.sttSell / 100 : 0;
+    const exch = turn * COSTS.exch / 100;
+    const sebi = turn * COSTS.sebi / 100;
+    const stamp = side === 'BUY' ? turn * COSTS.stamp / 100 : 0;
+    const gst = (brok + exch + sebi) * COSTS.gst / 100;
+    return { brok, stt, exch, sebi, stamp, gst, total: brok + stt + exch + sebi + stamp + gst, turn };
+  }
+  const addCost = (a, b) => { Object.keys(b).forEach(k => { a[k] = (a[k] || 0) + b[k]; }); return a; };
+  const zeroCost = () => ({ brok: 0, stt: 0, exch: 0, sebi: 0, stamp: 0, gst: 0, total: 0, turn: 0 });
+
+  // What it costs to get out of the book right now, at the marks on screen.
+  function costToClose(legs){
+    const out = zeroCost();
+    (legs || []).forEach(l => {
+      const lot = LOTS[l.under] || 0, lots = lot ? Math.abs(l.qty) / lot : Math.abs(l.qty) / 1;
+      // closing a short means BUYING it back; closing a long means SELLING (which carries STT)
+      addCost(out, legCost(l.ltp, l.qty, lots, l.qty < 0 ? 'BUY' : 'SELL', l.type === 'SD'));
+    });
+    return out;
+  }
+  // What entering the book already cost, at the prices actually paid.
+  function costOfEntry(legs){
+    const out = zeroCost();
+    (legs || []).forEach(l => {
+      const lot = LOTS[l.under] || 0, lots = lot ? Math.abs(l.qty) / lot : Math.abs(l.qty) / 1;
+      addCost(out, legCost(l.avg, l.qty, lots, l.qty < 0 ? 'SELL' : 'BUY', l.type === 'SD'));
+    });
+    return out;
+  }
+  // The trap: a LONG leg left ITM at expiry is auto-exercised and charged STT on its INTRINSIC value,
+  // which dwarfs the premium-based charge. Selling it beforehand avoids it entirely.
+  function exerciseRisk(legs, spot){
+    let amt = 0; const which = [];
+    (legs || []).forEach(l => {
+      if (l.qty <= 0) return;                       // only a long leg is exercised against you
+      const intr = l.type === 'CE' ? Math.max(0, spot - l.strike) : Math.max(0, l.strike - spot);
+      if (intr <= 0) return;
+      const c = intr * Math.abs(l.qty) * COSTS.sttExercise / 100;
+      amt += c; which.push(l.strike + ' ' + l.type);
+    });
+    return { amt, which };
+  }
 
   // ══ NOTES ═══════════════════════════════════════════════════════════════════
   // Timestamped, kept per trading day, pruned to the last 30 days. Written next to the position they refer
@@ -1462,6 +1554,34 @@
       '<div class="hw">Selling more premium flattens delta but increases short gamma and vega — it treats the symptom and thickens the tail. The futures leg is the risk-neutral one.</div>';
     if (el.__sig === html) return; el.__sig = html; el.className = 'on'; el.innerHTML = html;
   }
+  function renderCosts(){
+    const el = $id('spay-costs'); if (!el) return;
+    const legs = window._bsLegs(), book = activeBook();
+    if (!legs.length){ if (el.innerHTML){ el.innerHTML = ''; el.__sig = ''; } return; }
+    const entry = costOfEntry(legs), exit = costToClose(legs);
+    const round = entry.total + exit.total;
+    const gross = legs.reduce((a, l) => a + l.pnl, 0) + (Store.realised[book] || 0);
+    const net = gross - round;
+    const drag = Math.abs(gross) > 1 ? (round / Math.abs(gross) * 100) : null;
+    const ex = exerciseRisk(legs, window.getSpot());
+    const cell = (lbl, val, cl, sub) =>
+      '<div class="cc"><div class="cl">' + lbl + '</div><div class="cv" style="color:' + cl + '">' + val +
+      '</div><div class="cs">' + sub + '</div></div>';
+    let html = '<div class="cgrid">' +
+      cell('Net after costs', money(net), col(net), 'gross ' + money(gross)) +
+      cell('Round trip', money(-round), C.dn, 'in ' + money(-entry.total) + ' · out ' + money(-exit.total)) +
+      cell('Cost to exit now', money(-exit.total), C.dn, 'at the marks on screen') +
+      cell('Cost drag', drag == null ? '—' : drag.toFixed(1) + '%', (drag != null && drag > 30) ? C.dn : C.text, 'of gross P&L') +
+      '</div>';
+    html += '<div class="cbrk">' +
+      [['BROKERAGE','brok'],['STT','stt'],['EXCH','exch'],['SEBI','sebi'],['STAMP','stamp'],['GST','gst']]
+        .map(([lbl, k]) => '<span>' + lbl + ' <b>₹' + ((entry[k] || 0) + (exit[k] || 0)).toFixed(0) + '</b></span>').join('') +
+      '<span style="margin-left:auto">rates editable — verify against a contract note</span></div>';
+    if (ex.amt > 0)
+      html += '<div class="cwarn">⚠ LONG ITM INTO EXPIRY — ' + ex.which.join(', ') +
+        ' would be auto-exercised, costing roughly ' + money(ex.amt) + ' in exercise STT on intrinsic. Closing avoids it.</div>';
+    if (el.__sig === html) return; el.__sig = html; el.innerHTML = html;
+  }
   function renderOrders(){
     const el = $id('spay-orders'); if (!el) return;
     const live = Store.orders.filter(isWorking);
@@ -1582,7 +1702,7 @@
     try { evalAlerts(); Store.alertBeat = Date.now(); Store.alertErr = null; }
     catch (e) { Store.alertErr = (e && e.message) || String(e); engineAlarm('evaluation failed: ' + Store.alertErr); }
     const bl = $id('spay-bell'); if (bl) bl.classList.toggle('act', !!AL.on);
-    renderAlertStatus(); renderRefs(); renderHedge(); renderOrders(); renderLegs();
+    renderAlertStatus(); renderRefs(); renderHedge(); renderCosts(); renderOrders(); renderLegs();
     const pb = $id('spay-pop'); if (pb){ const on = POP && !POP.closed; pb.classList.toggle('act', !!on); pb.title = on ? 'Dock back into the page' : 'Open in its own window'; } // never overwrite the icon markup
     const mAge = Store.markAt ? Date.now() - Store.markAt : -1;
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
@@ -1604,8 +1724,8 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
-    alLoad(); histLoad(); notesLoad();
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
     buildPanel();
