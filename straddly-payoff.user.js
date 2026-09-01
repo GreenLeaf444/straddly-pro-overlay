@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      5.9
+// @version      6.0
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -670,19 +670,24 @@
   const PAYOFF_H_KEY = 'spay_payoff_h';
   function fitCanvas(id, frac, baseH, minW){
     const cv = $id(id); if (!cv) return null;
-    // the floor must not exceed the element's real width, or the backing store is wider than the box and
-    // the drawing is squashed horizontally when the browser scales it down to fit
-    const W = Math.max(Math.round(cv.getBoundingClientRect().width) || 420, minW || 260);
+    const rect = cv.getBoundingClientRect();
+    // The size control applies CSS `zoom`, under which getBoundingClientRect() reports VISUAL pixels while
+    // clientWidth stays in LAYOUT pixels. Mixing the two made the backing store correct horizontally but
+    // short vertically by the zoom factor, so the browser upscaled it and everything blurred as you zoomed in.
+    // Draw in layout px, back the store at devicePixelRatio x zoom.
+    const layoutW = cv.clientWidth || Math.round(rect.width) || 420;
+    const zoom = layoutW > 0 && rect.width > 0 ? (rect.width / layoutW) : 1;
+    const W = Math.max(layoutW, minW || 260);
     let H = baseH || 150;
     if (POP && !POP.closed && frac) H = Math.max(H, Math.min(560, Math.round((POP.innerHeight || 800) * frac)));
-    if (id === 'spay-cv' && Store.payoffH > 0) H = Store.payoffH; // user-dragged height wins
-    const dpr = Math.min(window.devicePixelRatio || 1, 3);
-    if (cv._W !== W || cv._H !== H || cv._dpr !== dpr){
-      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-      cv.style.height = H + 'px'; cv._W = W; cv._H = H; cv._dpr = dpr;
+    if (id === 'spay-cv' && Store.payoffH > 0) H = Store.payoffH;
+    const scale = Math.min(Math.max((window.devicePixelRatio || 1) * zoom, 1), 4);
+    if (cv._W !== W || cv._H !== H || cv._scale !== scale){
+      cv.width = Math.round(W * scale); cv.height = Math.round(H * scale);
+      cv.style.height = H + 'px'; cv._W = W; cv._H = H; cv._scale = scale;
     }
     const ctx = cv.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
     ctx.clearRect(0, 0, W, H);
     return cv; }
   function panelCSS(){ return `
@@ -776,7 +781,7 @@
       .mhdr .mnow{margin-left:auto;color:${C.dim};letter-spacing:.04em;}
 
       /* greeks: one hairline-separated row, no boxes */
-      .minis{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-top:12px;}
+      .minis{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:12px;}
       .minis canvas{background:transparent;border:1px solid ${C.line};border-radius:4px;}
       .grk{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid ${C.line};}
       .grk>div{padding:9px 0 9px 12px;border-left:1px solid ${C.line};}
@@ -913,9 +918,9 @@
         <div class="mhdr"><span class="k k1">Day P&amp;L</span><span class="mnow" id="spay-mnow"></span></div>
         <canvas id="spay-mtm-cv" height="150"></canvas>
         <div class="minis">
-          <canvas id="gm-d" height="84"></canvas>
-          <canvas id="gm-t" height="84"></canvas>
-          <canvas id="gm-v" height="84"></canvas>
+          <canvas id="gm-d" height="132"></canvas>
+          <canvas id="gm-t" height="132"></canvas>
+          <canvas id="gm-v" height="132"></canvas>
         </div>
       </div>
       <div class="grk">
@@ -1487,12 +1492,12 @@
   // Greeks as curves rather than numbers: a delta of +30 means one thing if it has been flat all morning and
   // quite another if it has doubled in ten minutes. Same time axis as the P&L chart above, so they read across.
   function drawMini(id, idx, label, col, fmt){
-    const cv = fitCanvas(id, 0, 84, 90); if (!cv) return;
+    const cv = fitCanvas(id, 0.14, 132, 120); if (!cv) return;
     const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const a = Store.hist[activeBook()] || [];
     ctx.font = '9.5px ' + MONO;
     if (a.length < 2){ ctx.fillStyle = C.dim; ctx.textAlign = 'left'; ctx.fillText(label, 6, 14); return; }
-    const L = 6, R = 6, Tp = 20, B = 6, CW = W - L - R, CH = H - Tp - B;
+    const L = 8, R = 8, Tp = 26, B = 8, CW = W - L - R, CH = H - Tp - B;
     const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
     const X = t => L + ((t - t0) / span) * CW;
     const v = a.map(p => p[idx] || 0);
@@ -1518,9 +1523,9 @@
     });
     const last = v[v.length - 1];
     ctx.beginPath(); ctx.arc(X(a[a.length - 1][0]), Y(last), 2.6, 0, 7); ctx.fillStyle = col; ctx.fill();
-    ctx.fillStyle = C.muted; ctx.textAlign = 'left'; ctx.font = '9px ' + MONO; ctx.fillText(label, L, 11);
-    ctx.fillStyle = C.text; ctx.textAlign = 'right'; ctx.font = '12px ' + MONO;
-    ctx.fillText(fmt(last), W - R, 12);
+    ctx.fillStyle = C.muted; ctx.textAlign = 'left'; ctx.font = '9.5px ' + MONO; ctx.fillText(label, L, 13);
+    ctx.fillStyle = C.text; ctx.textAlign = 'right'; ctx.font = '15px ' + MONO;
+    ctx.fillText(fmt(last), W - R, 15);
   }
   window.drawGreekMinis = function (){
     drawMini('gm-d', 2, 'DELTA', 'rgba(77,155,255,1)', v => (v >= 0 ? '+' : '') + v.toFixed(1));
