@@ -748,6 +748,43 @@
     t('with no order log at all it returns null so the estimate is used', function(){
       S.orders=[]; return F.costFromOrders('NIFTY')===null || 'should be null with no orders'; });
 
+    grp('MULTI-BOOK AFTER GOING FLAT');
+    function clearBooks(){ S.positions=[]; S.hist={}; S.realised={}; S.costPaid={}; S.orders=[]; S.book=''; }
+    t('a book stays listed after its positions are closed', function(){
+      clearBooks();
+      S.hist={NIFTY:[[1,2,3,4,5,6]], SENSEX:[[1,2,3,4,5,6]]};
+      var u=F.underlyings();
+      return (u.indexOf('NIFTY')>=0 && u.indexOf('SENSEX')>=0) || JSON.stringify(u); });
+    t('a book with booked P&L but no history is still listed', function(){
+      clearBooks(); S.realised={SENSEX:1596};
+      return F.underlyings().indexOf('SENSEX')>=0 || JSON.stringify(F.underlyings()); });
+    t('a book appearing only in the order log is listed', function(){
+      clearBooks();
+      S.orders=[{symbol:'SENSEX26090177500PE',side:'SELL',qty:20,lots:1,lotSize:20,fill:50,asked:50,status:'executed'}];
+      return F.underlyings().indexOf('SENSEX')>=0 || JSON.stringify(F.underlyings()); });
+    t('a flat day no longer falls back to a hardcoded NIFTY', function(){
+      clearBooks(); S.realised={SENSEX:1596}; S.hist={SENSEX:[[1,2,3,4,5,6]]};
+      return F.activeBook()==='SENSEX' || 'chose '+F.activeBook(); });
+    t('an open book outranks a closed one when picking the default', function(){
+      clearBooks();
+      S.hist={SENSEX:[[1,2,3,4,5,6],[2,2,3,4,5,6],[3,2,3,4,5,6]]};   // more activity but flat
+      S.positions=[{status:'OPEN',symbol:'NIFTY26090124000PE',optionType:'PE',strikePrice:24000,quantity:-65,
+                    avgSellPrice:50,bepPrice:50,ltp:40,_scraped:true,expiryDate:new Date(Date.now()+864e5).toISOString()}];
+      return F.activeBook()==='NIFTY' || 'chose '+F.activeBook(); });
+    t('an explicit book choice is respected over both', function(){
+      clearBooks(); S.hist={NIFTY:[[1,2,3,4,5,6]], SENSEX:[[1,2,3,4,5,6]]}; S.book='SENSEX';
+      var got=F.activeBook(); S.book='';
+      return got==='SENSEX' || 'chose '+got; });
+    t('charges are reported per book, so a closed book keeps its own', function(){
+      clearBooks();
+      S.orders=[
+        {symbol:'NIFTY26090124000PE',side:'SELL',qty:65,lots:1,lotSize:65,fill:20,asked:20,status:'executed'},
+        {symbol:'SENSEX26090177500PE',side:'SELL',qty:20,lots:1,lotSize:20,fill:50,asked:50,status:'executed'},
+        {symbol:'SENSEX26090177600CE',side:'BUY', qty:20,lots:1,lotSize:20,fill:45,asked:45,status:'executed'}
+      ];
+      var nf=F.costFromOrders('NIFTY'), sx=F.costFromOrders('SENSEX');
+      return (nf.fills===1 && sx.fills===2) || 'nifty '+nf.fills+' sensex '+sx.fills; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

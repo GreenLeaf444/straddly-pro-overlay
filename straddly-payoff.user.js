@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
+// @version      6.1
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -149,8 +149,28 @@
     return 'OPEN';
   }
   // ── multi-book: a screen can hold NIFTY + BANKNIFTY + SENSEX at once. Each needs its OWN spot and its OWN payoff. ──
-  function underlyings(){ const u = []; Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x && u.indexOf(x.underlying) < 0) u.push(x.underlying); }); return u; }
-  function activeBook(){ const u = underlyings(); if (!u.length) return 'NIFTY'; if (Store.book && u.indexOf(Store.book) >= 0) return Store.book; const cnt = {}; Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x) cnt[x.underlying] = (cnt[x.underlying] || 0) + 1; }); return u.slice().sort((a, b) => cnt[b] - cnt[a])[0]; }
+  // Every book TODAY TOUCHED, not just the ones still open. Deriving this from open positions alone meant
+  // that the moment a book was closed out it vanished from the tabs — and once every book was flat the list
+  // was empty, activeBook() fell back to a hardcoded 'NIFTY', and a whole day of trading in another index
+  // (its history, its booked P&L, its charges) became unreachable.
+  function underlyings(){
+    const u = [], add = x => { if (x && u.indexOf(x) < 0) u.push(x); };
+    Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x) add(x.underlying); });
+    Object.keys(Store.hist || {}).forEach(add);        // traded earlier and recorded
+    Object.keys(Store.realised || {}).forEach(add);    // has booked P&L today
+    Object.keys(Store.costPaid || {}).forEach(add);
+    (Store.orders || []).forEach(o => { const x = parseSymbol(o.symbol); if (x) add(x.underlying); });
+    return u;
+  }
+  function activeBook(){
+    const u = underlyings(); if (!u.length) return 'NIFTY';
+    if (Store.book && u.indexOf(Store.book) >= 0) return Store.book;   // an explicit choice always wins
+    // otherwise prefer the book with open legs; if all are flat, the one with the most of today's activity
+    const open = {}, act = {};
+    Store.positions.forEach(p => { const x = parseSymbol(p.symbol); if (x) open[x.underlying] = (open[x.underlying] || 0) + 1; });
+    u.forEach(b => { act[b] = (Store.hist[b] || []).length + ((Store.orders || []).filter(o => (parseSymbol(o.symbol) || {}).underlying === b).length); });
+    return u.slice().sort((a, b) => ((open[b] || 0) - (open[a] || 0)) || ((act[b] || 0) - (act[a] || 0)))[0];
+  }
   // A spot is only credible if it sits near this book's own strikes — that guard stops the portal header's
   // spot for a DIFFERENT index (whatever the user has selected up there) being read as this book's spot.
   function plausibleSpot(under, v){
@@ -1778,7 +1798,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
