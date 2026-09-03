@@ -820,15 +820,36 @@
       t.innerHTML='<thead><tr>'+headers.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+
         rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
       w.appendChild(t); document.body.insertBefore(w,document.body.firstChild); return w; }
-    var OPEN_H=['','Product','Instrument','Qty.','','Avg.','LTP','P&L'];
-    t('the header row is what names the columns', function(){
-      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','60.35','₹4.00']]);
+    // The REAL portal: the Exit button sits in a column with NO header of its own, so the header row is 7
+    // cells wide while every body row is 8. Mapping by absolute header index therefore lands one column left.
+    var OPEN_H=['','Product','Instrument','Qty.','Avg.','LTP','P&L'];          // 7 - as the portal prints it
+    var OPEN_H8=['','Product','Instrument','Qty.','','Avg.','LTP','P&L'];      // 8 - header and body aligned
+    t('the header row is what names the columns when it lines up with the body', function(){
+      var w=tbl(OPEN_H8,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','60.35','₹4.00']]);
       var m=F.colMapOf(w.querySelector('table')); w.remove();
-      return (m && m.qty===3 && m.avg===5 && m.ltp===6 && m.pnl===7) || 'got '+JSON.stringify(m); });
+      return (m && m.qty===3 && m.avg===5 && m.ltp===6 && m.pnl===7 && m.n===8) || 'got '+JSON.stringify(m); });
+    t('a 7-wide header over an 8-wide body does NOT lose the rows', function(){
+      // v6.2 shipped this bug: Avg. mapped onto the Exit cell, parsed as null, and the row was discarded.
+      // The portal then read 0 of 3 rows on a live book.
+      S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
+      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','60.35','₹4.00']]);
+      F.scrapePositions(true); var p=S.positions[0]; w.remove();
+      return (S.positions.length===1 && p.bepPrice===60.55 && p.ltp===60.35 && p._pnl===4)
+        || 'read '+S.positions.length+' rows: '+JSON.stringify(p); });
+    t('a misaligned header still tells us an LTP column EXISTS, so a blank one is not P&L', function(){
+      S.positions=[]; S.posVisible=false;
+      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','','₹4.00']]);
+      F.scrapePositions(true); var p=S.positions[0]; w.remove();
+      return (p && p.bepPrice===60.55 && p.ltp===0 && p._pnl===4) || 'avg '+(p&&p.bepPrice)+' ltp '+(p&&p.ltp)+' pnl '+(p&&p._pnl); });
+    t('diag names which reader the OPEN table used, not the closed one', function(){
+      S.positions=[]; S.posVisible=false;
+      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','60.35','₹4.00']]);
+      F.scrapePositions(true); var got=S.colsFrom; w.remove();
+      return /^position/.test(got) || 'reported '+got; });
     t('a row with a BLANK LTP does not turn P&L into the mark', function(){
       // the trap: compacting the numerics shifts every column left, so ltp became the P&L that greeks are built on
       S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
-      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','','₹4.00']]);
+      var w=tbl(OPEN_H8,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','','₹4.00']]);
       F.scrapePositions(true); var p=S.positions[0]; w.remove();
       return (p && p.ltp===0 && p._pnl===4 && p.bepPrice===60.55) || 'ltp '+(p&&p.ltp)+' pnl '+(p&&p._pnl); });
     t('a Unicode-minus P&L is read, not dropped', function(){
@@ -910,6 +931,12 @@
       for (var i=0;i<4;i++){ body.innerHTML=''; F.scrapePositions(true); body.innerHTML=rows; F.scrapePositions(true); }
       var c=Math.round(S.costPaid.SENSEX||0); w.remove();
       return c===0 || 'charged '+c+' for trades that never happened'; });
+
+    t('the first history push of a session does not wipe the portal-read closed book', function(){
+      // histPush takes its day-rollover branch when histDay is still '' - the first push of every session.
+      freshBook(); S.histDay=''; S.closed={SENSEX:-753}; S.closedGap=0;
+      F.histPush('SENSEX', 100, 1, 0, 0);
+      return (S.closed && S.closed.SENSEX===-753) || 'closed became '+JSON.stringify(S.closed); });
 
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.2
+// @version      6.3
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -292,7 +292,7 @@
     if (hr){ const hc = cellsOf(hr), m = {}; let hits = 0;
       hc.forEach((h, i) => { const t = h.textContent.replace(/\s+/g, ' ').trim();
         Object.keys(COL_RE).forEach(k => { if (m[k] == null && COL_RE[k].test(t)){ m[k] = i; hits++; } }); });
-      if (hits >= 3 && m.qty != null && m.pnl != null) map = m; }
+      if (hits >= 3 && m.qty != null && m.pnl != null){ m.n = hc.length; map = m; } }
     _colCache.set(tbl, map); return map;
   }
   // A row under the portal's own "Closed Positions" heading is a booked trade with the exact P&L printed on it.
@@ -411,21 +411,38 @@
       const rr = tr.getBoundingClientRect(); if (rr.width > 100 && rr.height > 4) rects.push(rr);
       const tbl = (tr.closest && tr.closest('table, mat-table, [role="table"]')) || tr.parentElement; if (tbl && tables.indexOf(tbl) < 0) tables.push(tbl);
       const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
-      // header-driven first; the positional fallback is index-preserving so a blank cell cannot shift columns
+      // Header indexes are only usable when the header row is EXACTLY as wide as the body row. The portal's
+      // Exit button sits in a column with no header of its own, so the header comes back one cell short and
+      // every mapped index lands one column to the left — 'Avg.' reads the Exit button. When the widths
+      // disagree we fall back to reading the numbers positionally, which is what worked before.
       const map = colMapOf(tbl);
-      const at = k => (map && map[k] != null && map[k] > ii && cells[map[k]]) ? parseMoney(cells[map[k]].textContent) : null;
-      let qty = at('qty'), avg = at('avg'), ltp = at('ltp'), pnl = at('pnl');
-      if (qty == null || pnl == null){
+      let qty = null, avg = null, ltp = null, pnl = null, csrc = '';
+      if (map && map.n === cells.length){
+        const at = k => (map[k] != null && map[k] > ii && cells[map[k]]) ? parseMoney(cells[map[k]].textContent) : null;
+        const q = at('qty'), a = at('avg'), l = at('ltp'), p = at('pnl');
+        if (q != null && p != null){ qty = q; avg = a; ltp = l; pnl = p; csrc = 'header'; }
+      }
+      if (qty == null){
         const nn = []; for (let i = ii + 1; i < cells.length; i++){ const v = parseMoney(cells[i].textContent); if (v !== null) nn.push(v); }
         if (nn.length < 3) return;
-        qty = nn[0]; avg = nn[1]; ltp = nn[2]; pnl = nn[nn.length - 1];
-        Store.colsFrom = 'position';
-      } else Store.colsFrom = 'header';
+        qty = nn[0]; pnl = nn[nn.length - 1];
+        // Four numbers is the normal row. Three means one column printed BLANK, and the header — even a
+        // misaligned one — still tells us an LTP column exists, so it is the live mark that is missing and
+        // not the P&L. Reading them in order here is what made ltp := P&L, and every greek is built on ltp.
+        if (nn.length >= 4){ avg = nn[1]; ltp = nn[2]; }
+        else if (map && map.ltp != null){ avg = nn[1]; ltp = null; }
+        else { avg = nn[1]; ltp = nn[2]; }
+        csrc = (map && map.n !== cells.length) ? 'position (header ' + map.n + ' vs row ' + cells.length + ')' : 'position';
+      }
       qty = Math.round(qty || 0);
       const symC = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, '') + (yr % 100) + MON[m[2].toUpperCase()] + day + (+m[3]) + m[4].toUpperCase();
       // qty 0 under the portal's own "Closed Positions" heading = a booked trade, with its P&L printed on it
       if (!qty){ if (tbl && isClosedTable(tbl) && pnl != null && isFinite(pnl)) closedRows.push({ sym: symC, pnl: pnl }); return; }
-      if (avg == null || pnl == null) return;
+      Store.colsFrom = csrc;
+      // Never reject a row the old parser would have taken: a dropped row is read as a position we do not
+      // have. Missing pieces are filled in from the quote feed instead.
+      if (pnl == null) return;
+      if (avg == null) avg = 0;
       if (ltp == null) ltp = 0;
       const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, ''), mo = MON[m[2].toUpperCase()], strike = +m[3], type = m[4].toUpperCase();
       const sym = und + (yr % 100) + mo + day + strike + type;
@@ -590,7 +607,7 @@
   }
   function histPush(book, mtm, delta, vega, theta){
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
-    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.closed = null; Store.peak = {}; Store.costPaid = {}; Store.prevLegs = {}; }
+    const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.costPaid = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
     const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
     a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(bookRealised(book)),
