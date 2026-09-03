@@ -785,6 +785,132 @@
       var nf=F.costFromOrders('NIFTY'), sx=F.costFromOrders('SENSEX');
       return (nf.fills===1 && sx.fills===2) || 'nifty '+nf.fills+' sensex '+sx.fills; });
 
+
+    grp('MONEY PARSING (the portal writes the minus before the ₹)');
+    var PM = F.parseMoney;
+    t('-₹689.00 parses - the sign comes BEFORE the rupee mark', function(){
+      return PM('-₹689.00')===-689 || 'got '+PM('-₹689.00'); });
+    t('₹-689.00 parses too', function(){ return PM('₹-689.00')===-689 || 'got '+PM('₹-689.00'); });
+    t('a Unicode minus parses', function(){ return PM('−753.00')===-753 || 'got '+PM('−753.00'); });
+    t('an accounting negative parses', function(){ return PM('(753.00)')===-753 || 'got '+PM('(753.00)'); });
+    t('thousands separators survive', function(){ return PM('-₹1,23,456.75')===-123456.75 || 'got '+PM('-₹1,23,456.75'); });
+    t('a blank cell is null, not zero', function(){ return PM('')===null && PM('  ')===null || 'got '+PM('')+' / '+PM(' '); });
+    t('a cell that merely CONTAINS a number is refused', function(){
+      return PM('24.00OPEN ORDER')===null && PM('Total 64.00')===null || 'got '+PM('24.00OPEN ORDER')+' / '+PM('Total 64.00'); });
+    t('plain text is null', function(){ return PM('MIS')===null && PM('Exit')===null || 'leaked'; });
+
+    grp('PORTAL TOTAL MTM (this check must never fail quiet)');
+    function pageWith(txt){ var h=document.createElement('div'); h.id='pgt2'; h.textContent=txt; document.body.insertBefore(h,document.body.firstChild); return h; }
+    t('a minus written BEFORE the rupee mark is read - the exact form that blinded v6.1', function(){
+      var h=pageWith('Open Positions (3)  Total MTM : -₹689.00  Closed Positions (1)');
+      F.scrapePortalMTM(); var got=S.portalMTM; h.remove();
+      return got===-689 || 'got '+got; });
+    t('a positive total still reads', function(){
+      var h=pageWith('Total MTM : ₹1,234.50'); F.scrapePortalMTM(); var got=S.portalMTM; h.remove();
+      return got===1234.5 || 'got '+got; });
+    t('a Unicode-minus total reads', function(){
+      var h=pageWith('Total MTM : −₹689.00'); F.scrapePortalMTM(); var got=S.portalMTM; h.remove();
+      return got===-689 || 'got '+got; });
+
+    grp('COLUMN MAPPING (a blank cell must not shift the columns)');
+    function tbl(headers, rows, caption){
+      var w=document.createElement('div'); w.id='coltest';
+      var cap=document.createElement('h3'); cap.textContent=caption||'Open Positions ('+rows.length+')'; w.appendChild(cap);
+      var t=document.createElement('table');
+      t.innerHTML='<thead><tr>'+headers.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+
+        rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
+      w.appendChild(t); document.body.insertBefore(w,document.body.firstChild); return w; }
+    var OPEN_H=['','Product','Instrument','Qty.','','Avg.','LTP','P&L'];
+    t('the header row is what names the columns', function(){
+      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','60.35','₹4.00']]);
+      var m=F.colMapOf(w.querySelector('table')); w.remove();
+      return (m && m.qty===3 && m.avg===5 && m.ltp===6 && m.pnl===7) || 'got '+JSON.stringify(m); });
+    t('a row with a BLANK LTP does not turn P&L into the mark', function(){
+      // the trap: compacting the numerics shifts every column left, so ltp became the P&L that greeks are built on
+      S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
+      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','','₹4.00']]);
+      F.scrapePositions(true); var p=S.positions[0]; w.remove();
+      return (p && p.ltp===0 && p._pnl===4 && p.bepPrice===60.55) || 'ltp '+(p&&p.ltp)+' pnl '+(p&&p._pnl); });
+    t('a Unicode-minus P&L is read, not dropped', function(){
+      S.positions=[]; S.posVisible=false;
+      var w=tbl(OPEN_H,[['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','70.35','−196.00']]);
+      F.scrapePositions(true); var p=S.positions[0]; w.remove();
+      return (p && p._pnl===-196 && p.ltp===70.35) || 'pnl '+(p&&p._pnl)+' ltp '+(p&&p.ltp); });
+
+    grp('CLOSED POSITIONS (read the portal, do not infer it)');
+    function fullPage(open, closed, total){
+      var w=document.createElement('div'); w.id='fullpage';
+      var h1=document.createElement('h3'); h1.textContent='Open Positions ('+open.length+')   Total MTM : '+total; w.appendChild(h1);
+      var t1=document.createElement('table');
+      t1.innerHTML='<thead><tr>'+OPEN_H.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+
+        open.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
+      w.appendChild(t1);
+      var h2=document.createElement('h3'); h2.textContent='Closed Positions ('+closed.length+')'; w.appendChild(h2);
+      var t2=document.createElement('table');
+      t2.innerHTML='<thead><tr><th>Product</th><th>Instrument</th><th>Qty.</th><th>Avg.</th><th>LTP</th><th>P&L</th></tr></thead><tbody>'+
+        closed.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
+      w.appendChild(t2); document.body.insertBefore(w,document.body.firstChild); return w; }
+    var BOOK_OPEN=[
+      ['','MIS','SENSEX SEP 76600 PE 03 Sep','-20','Exit','60.55','60.35','₹4.00'],
+      ['','MIS','SENSEX SEP 76900 SD 03 Sep','-20','Exit','298.60','296.00','₹52.00'],
+      ['','MIS','SENSEX SEP 77000 SD 03 Sep','-20','Exit','315.90','315.50','₹8.00']];
+    var BOOK_CLOSED=[['MIS','SENSEX SEP 77000 CE 03 Sep','0','0.00','','-753.00']];
+    function freshBook(){ S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
+      S.closedGap=0; S.scrapeGap=0; S.costPaid={}; S.hist={}; S.orders=[]; S.book=''; }
+    t('booked P&L comes from the portal table, exactly as printed', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true); w.remove();
+      return (S.closed && S.closed.SENSEX===-753) || 'got '+JSON.stringify(S.closed); });
+    t('a qty-0 closed row is never mistaken for an open position', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true); w.remove();
+      return S.positions.length===3 || 'read '+S.positions.length+' open rows'; });
+    t('open + booked reproduces the portal total to the rupee', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true);
+      var open=window.getOpenMTM(), day=open+F.bookRealised('SENSEX'), pm=S.portalMTM; w.remove();
+      return (open===64 && day===-689 && pm===-689) || 'open '+open+' day '+day+' portal '+pm; });
+    t('a half-rendered closed section is refused, not believed', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true);
+      // portal now says 2 closed rows but only 1 is in the DOM: taking that would UNDERSTATE the loss
+      w.querySelectorAll('h3')[1].textContent='Closed Positions (2)';
+      F.scrapePositions(true); var kept=S.closed.SENSEX, gap=S.closedGap; w.remove();
+      return (kept===-753 && gap===1) || 'kept '+kept+' gap '+gap; });
+    t('the portal reading beats our inference when they disagree', function(){
+      freshBook(); S.realised={SENSEX:-1792};   // what a run of phantom exits had accumulated
+      var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true); w.remove();
+      return (F.bookRealised('SENSEX')===-753 && F.realisedSource()==='portal') || 'used '+F.bookRealised('SENSEX'); });
+    t('with no closed section at all we fall back to inference', function(){
+      freshBook(); S.realised={SENSEX:-500};
+      var w=tbl(OPEN_H,BOOK_OPEN); F.scrapePositions(true); var got=F.bookRealised('SENSEX'); w.remove();
+      return got===-500 || 'got '+got; });
+    t('a book that is only in the closed table still gets a tab', function(){
+      freshBook(); S.closed={SENSEX:-753}; S.closedGap=0;
+      return F.underlyings().indexOf('SENSEX')>=0 || JSON.stringify(F.underlyings()); });
+
+    grp('PHANTOM EXITS (a table blink is not a trade)');
+    t('reading ZERO rows while the portal says 3 is a gap of 3, not 0', function(){
+      // v6.1 computed this as 0 because it required posVisible, which is false precisely when we read nothing
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true);
+      w.querySelector('tbody').innerHTML='';                 // Angular mid-render: rows gone, heading still (3)
+      F.scrapePositions(true); var gap=S.scrapeGap; w.remove();
+      return gap===3 || 'gap '+gap; });
+    t('a blinking table banks nothing and keeps the book', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true);
+      var body=w.querySelector('tbody'), rows=body.innerHTML;
+      for (var i=0;i<6;i++){ body.innerHTML=''; F.scrapePositions(true); body.innerHTML=rows; F.scrapePositions(true); }
+      var inferred=S.realised.SENSEX||0, cost=Math.round(S.costPaid.SENSEX||0), n=S.positions.length; w.remove();
+      return (inferred===0 && cost===0 && n===3) || 'banked '+inferred+' charged '+cost+' held '+n; });
+    t('a real exit IS banked once the portal confirms the book is flat', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true);
+      w.querySelectorAll('h3')[0].textContent='Open Positions (0)   Total MTM : -₹689.00';
+      w.querySelector('tbody').innerHTML='';
+      F.scrapePositions(true); var n=S.positions.length, banked=S.realised.SENSEX||0; w.remove();
+      return (n===0 && banked===64) || 'held '+n+' banked '+banked; });
+    t('charges are not levied again on every blink', function(){
+      freshBook(); var w=fullPage(BOOK_OPEN,BOOK_CLOSED,'-₹689.00'); F.scrapePositions(true);
+      var body=w.querySelector('tbody'), rows=body.innerHTML;
+      for (var i=0;i<4;i++){ body.innerHTML=''; F.scrapePositions(true); body.innerHTML=rows; F.scrapePositions(true); }
+      var c=Math.round(S.costPaid.SENSEX||0); w.remove();
+      return c===0 || 'charged '+c+' for trades that never happened'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
