@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.3
+// @version      6.4
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, closed: null, closedAt: 0, closedGap: 0, colsFrom: '', fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, closed: null, closedAt: 0, closedGap: 0, colsFrom: '', ordersTotal: null, ordersGap: 0, ordersNoLot: 0, ordersDup: 0, ordersFrom: '', fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -363,34 +363,110 @@
   // Match a CELL that is exactly a status, not the row's concatenated text: textContent joins cells with
   // no separator ('22.00OPEN ORDER'), which defeats a word boundary, while an unanchored match would hit 'Open Positions'.
   const ORD_RE = /^(OPEN ORDER|OPEN|PENDING|TRIGGER PENDING|EXECUTED|COMPLETE|COMPLETED|CANCELLED|REJECTED)$/i;
+  // Charges are levied per fill, so this table IS the cost model's input. It gets the same discipline as the
+  // positions table: columns named by the header (with a width check), numbers through parseMoney, and a
+  // completeness check against the count the portal prints.
+  const ORDCOL_RE = { side: /^(type|side|b\s*\/\s*s|buy\s*\/\s*sell|transaction( type)?)$/i,
+                      qty: /^(qty\.?|quantity|filled( qty\.?)?|qty\.? filled)$/i,
+                      price: /^(price|rate|avg\.? price|traded price|fill price|exec\.? price)$/i,
+                      status: /^status$/i };
+  const _ordColCache = new WeakMap();
+  function ordMapOf(tbl){
+    if (!tbl) return null;
+    if (_ordColCache.has(tbl)) return _ordColCache.get(tbl);
+    let hr = tbl.querySelector('thead tr, mat-header-row');
+    if (!hr){ const rs = tbl.querySelectorAll('tr, [role="row"]');
+      for (let i = 0; i < rs.length; i++){ if (rs[i].querySelector('th, mat-header-cell, [role="columnheader"]')){ hr = rs[i]; break; } } }
+    let map = null;
+    if (hr){ const hc = cellsOf(hr), m = {}; let hits = 0;
+      hc.forEach((h, i) => { const t = h.textContent.replace(/\s+/g, ' ').trim();
+        Object.keys(ORDCOL_RE).forEach(k => { if (m[k] == null && ORDCOL_RE[k].test(t)){ m[k] = i; hits++; } }); });
+      if (hits >= 2 && m.qty != null && m.price != null){ m.n = hc.length; map = m; } }
+    _ordColCache.set(tbl, map); return map;
+  }
+  // 'BUY'/'SELL', but also 'B'/'S' and 'Buy Order'. Reading this off the whole ROW text was wrong: any cell
+  // that happens to carry the word decides the side, and STT is charged on SELLs only — so a mis-read side
+  // moves the charge by the largest single component.
+  function sideOf(t){
+    const x = String(t || '').trim().toUpperCase();
+    if (/^(B|BUY|BUY ORDER|LONG)$/.test(x)) return 'BUY';
+    if (/^(S|SELL|SELL ORDER|SHORT)$/.test(x)) return 'SELL';
+    if (/\bBUY\b/.test(x)) return 'BUY';
+    if (/\bSELL\b/.test(x)) return 'SELL';
+    return null;
+  }
+  // '130', '130/130', '130 / 260' — the FILLED quantity is what was charged for.
+  function qtyOf(t){
+    const x = String(t || '').replace(/[₹,\s]/g, '');
+    const sl = x.match(/^(-?\d+)\/(-?\d+)$/); if (sl) return parseFloat(sl[1]);
+    return parseMoney(x);
+  }
   function scrapeOrders(){
     try {
-      const rows = document.querySelectorAll('tr, mat-row, [role="row"]'), out = [];
+      const rows = document.querySelectorAll('tr, mat-row, [role="row"]'), out = [], seen = {};
+      let dup = 0, noLot = 0, from = '';
       rows.forEach(tr => {
         const cells = [...tr.querySelectorAll('td, mat-cell, [role="cell"], th')]; if (cells.length < 5) return;
         const txt = tr.textContent;
-        let st = null;
-        for (let i = 0; i < cells.length; i++){ const t = cells[i].textContent.trim(); if (ORD_RE.test(t)){ st = t; break; } }
+        let st = null, si = -1;
+        for (let i = 0; i < cells.length; i++){ const t = cells[i].textContent.trim(); if (ORD_RE.test(t)){ st = t; si = i; break; } }
         if (!st) return;
         let ii = -1, m = null;
         for (let i = 0; i < cells.length; i++){ const mm = cells[i].textContent.match(INSTR_RE); if (mm){ ii = i; m = mm; break; } }
         if (ii < 0) return;
+        const tbl = (tr.closest && tr.closest('table, mat-table, [role="table"]')) || tr.parentElement;
         const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
-        const nums = cells.slice(ii + 1).map(c => { const t = c.textContent.replace(/[₹,\s]/g, ''); return /^-?\d+(\.\d+)?$/.test(t) ? parseFloat(t) : null; }).filter(v => v !== null);
-        if (!nums.length) return;
+        const map = ordMapOf(tbl);
+        let qty = null, price = null, side = null;
+        if (map && map.n === cells.length){
+          const q = map.qty != null && cells[map.qty] ? qtyOf(cells[map.qty].textContent) : null;
+          const p = map.price != null && cells[map.price] ? parseMoney(cells[map.price].textContent) : null;
+          if (q != null && p != null){ qty = q; price = p; from = 'header';
+            if (map.side != null && cells[map.side]) side = sideOf(cells[map.side].textContent); }
+        }
+        if (qty == null){
+          const nn = []; for (let i = ii + 1; i < cells.length; i++){ const v = parseMoney(cells[i].textContent); if (v !== null) nn.push(v); }
+          if (!nn.length) return;
+          qty = nn[0]; price = nn.length > 1 ? nn[1] : 0;
+          from = (map && map.n !== cells.length) ? 'position (header ' + map.n + ' vs row ' + cells.length + ')' : 'position';
+        }
+        // side: the dedicated cell first; the row text only as a last resort, and never from the
+        // instrument or status cells, which is where a stray 'BUY'/'SELL' would come from
+        if (!side){
+          for (let i = 0; i < cells.length && !side; i++){ if (i === ii || i === si) continue; side = sideOf(cells[i].textContent); }
+        }
+        if (!side) side = /\bBUY\b/i.test(txt) ? 'BUY' : /\bSELL\b/i.test(txt) ? 'SELL' : null;
+        if (!side) return;                       // a fill whose side we cannot read cannot be costed
         const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, '');
         const yr = new Date().getFullYear(), mo = MON[m[2].toUpperCase()];
         const sym = und + (yr % 100) + mo + day + (+m[3]) + m[4].toUpperCase();
-        const qty = Math.round(nums[0]) || 0, lot = LOTS[und] || 0;
-        out.push({ id: sym + ':' + nums.join('_'), symbol: sym, side: /BUY/i.test(txt) ? 'BUY' : 'SELL',
-          qty: Math.abs(qty), lots: lot ? Math.round(Math.abs(qty) / lot) : 0, lotSize: lot,
+        const q = Math.round(qty) || 0, lot = LOTS[und] || 0;
+        if (!lot) noLot++;
+        const timeM = (cells[0] ? cells[0].textContent : '').match(/\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?/i);
+        // Identity must include the TIME, or two identical fills minutes apart collapse into one and the
+        // day's charges come out short. It must not include the table, or the same order listed twice is
+        // charged twice — which is how the number moved about when switching tabs.
+        const id = sym + '|' + side + '|' + q + '|' + price + '|' + st.toLowerCase() + '|' + (timeM ? timeM[0] : '');
+        if (seen[id]){ dup++; return; } seen[id] = 1;
+        out.push({ id: id, symbol: sym, side: side,
+          qty: Math.abs(q), lots: lot ? Math.round(Math.abs(q) / lot) : 0, lotSize: lot,
           rateType: /market/i.test(txt) ? 'market' : 'limit',
-          asked: nums.length > 1 ? nums[1] : 0,
+          asked: price || 0,
           // for an executed row the Price column IS the fill, and that is what charges are levied on
-          fill: /execut|complet/i.test(st) && nums.length > 1 ? nums[1] : 0, trigger: 0,
-          status: st.toLowerCase(), kind: '', margin: 0, time: null, _dom: true });
+          fill: /execut|complet/i.test(st) ? (price || 0) : 0, trigger: 0,
+          status: st.toLowerCase(), kind: '', margin: 0, time: timeM ? timeM[0] : null, _dom: true });
       });
-      if (out.length){ Store.orders = out; Store.ordersAt = Date.now(); }
+      // The portal prints how many executed orders it has. Charges built from a paginated or half-rendered
+      // table are simply wrong, and wrong quietly — so count, and say when the two disagree.
+      const bodyTxt = document.body ? document.body.innerText : '';
+      const em = bodyTxt.match(/Executed\s+Orders?\s*\((\d+)\)/i);
+      if (out.length){
+        Store.orders = out; Store.ordersAt = Date.now();
+        Store.ordersDup = dup; Store.ordersNoLot = noLot; Store.ordersFrom = from;
+        if (em){ Store.ordersTotal = parseInt(em[1], 10);
+          Store.ordersGap = Math.max(0, Store.ordersTotal - out.length); }
+        else { Store.ordersTotal = null; Store.ordersGap = 0; }
+      }
     } catch (e) { if (!scrapeOrders._warned){ scrapeOrders._warned = 1; console.warn('[spay] order scrape failed:', e); } }
   }
   function scrapePositions(full){
@@ -662,8 +738,12 @@
       const usable = cL > 0 && pL > 0 && p.ltp > 0 && Math.abs((cL + pL) - p.ltp) <= Math.max(2, p.ltp * 0.05);
       const c = usable ? cL : p.ltp / 2, pp = usable ? pL : p.ltp / 2, sum = (c + pp) || 1;
       const wCE = c / sum, cA = p.avg * wCE;
-      out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: p.pnl * wCE, _est: !usable }));
-      out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: p.pnl * (1 - wCE), _est: !usable }));
+      // When the split is a guess, carry the straddle's OWN mark on both halves so the greeks can solve the
+      // pair jointly instead of trusting the halves. The 50/50 split then only affects how the premium is
+      // attributed for display — both halves still sum to the printed mark and the printed P&L.
+      const sdM = usable ? 0 : p.ltp;
+      out.push(Object.assign({}, p, { type: 'CE', ltp: c, avg: cA, pnl: p.pnl * wCE, _est: !usable, _sdMark: sdM }));
+      out.push(Object.assign({}, p, { type: 'PE', ltp: pp, avg: p.avg - cA, pnl: p.pnl * (1 - wCE), _est: !usable, _sdMark: sdM }));
     });
     return out;
   }
@@ -715,6 +795,23 @@
   const allowedMargin = () => (Store.user && Store.user.marginAllowed) || (Store.margin && Store.margin.allowedMargin) || DEFAULT_ALLOWED_MARGIN;
   const marginUsed = () => (Store.margin && Store.margin.totalMarginUsed) || 0;
   window.BS = { norm(x){const a1=.254829592,a2=-.284496736,a3=1.421413741,a4=-1.453152027,a5=1.061405429,p=.3275911;const s=x<0?-1:1;x=Math.abs(x)/Math.sqrt(2);const t=1/(1+p*x);const y=1-(((((a5*t+a4)*t)+a3)*t+a2)*t+a1)*t*Math.exp(-x*x);return .5*(1+s*y);}, d1(S,K,T,r,v){return(Math.log(S/K)+(r+.5*v*v)*T)/(v*Math.sqrt(T));}, price(S,K,T,r,v,t){if(T<=0)return t==='CE'?Math.max(0,S-K):Math.max(0,K-S);const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T);return t==='CE'?S*this.norm(d1)-K*Math.exp(-r*T)*this.norm(d2):K*Math.exp(-r*T)*this.norm(-d2)-S*this.norm(-d1);}, iv(S,K,T,r,mkt,t){if(!(T>0)||!(mkt>0)||!(S>0)||!(K>0))return 0;const intr=t==='CE'?Math.max(0,S-K*Math.exp(-r*T)):Math.max(0,K*Math.exp(-r*T)-S);if(mkt<=intr+1e-6)return 0;let v=.3;for(let i=0;i<100;i++){const p=this.price(S,K,T,r,v,t),d1=this.d1(S,K,T,r,v),vega=S*Math.sqrt(T)*Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),diff=p-mkt;if(Math.abs(diff)<.001)break;if(vega<1e-10)break;v-=diff/vega;if(!isFinite(v))return 0;if(v<.001)v=.001;if(v>5)v=5;}if(!isFinite(v)||v<IV_MIN||v>IV_MAX)return 0;if(Math.abs(this.price(S,K,T,r,v,t)-mkt)>Math.max(.05,mkt*.02))return 0;return v;}, greeks(S,K,T,r,v,t,qty){if(T<=0||v<=0)return{delta:0,gamma:0,theta:0,vega:0};const d1=this.d1(S,K,T,r,v),d2=d1-v*Math.sqrt(T),nd1=Math.exp(-.5*d1*d1)/Math.sqrt(2*Math.PI),sg=qty<0?-1:1,aq=Math.abs(qty);const delta=t==='CE'?this.norm(d1):this.norm(d1)-1;const gamma=nd1/(S*v*Math.sqrt(T));const theta=t==='CE'?(-S*nd1*v/(2*Math.sqrt(T))-r*K*Math.exp(-r*T)*this.norm(d2))/365:(-S*nd1*v/(2*Math.sqrt(T))+r*K*Math.exp(-r*T)*this.norm(-d2))/365;const vega=S*nd1*Math.sqrt(T)/100;return{delta:sg*delta*aq,gamma:sg*gamma*aq,theta:sg*theta*aq,vega:sg*vega*aq};} };
+  // A straddle row prints ONE mark for the pair. Solving a vol from it directly needs no component quotes
+  // and is exactly what that mark implies — far better than halving the premium and solving two vols off
+  // the halves, which gets worse the further the strike sits from spot.
+  window.BS.straddle76 = function (F, K, T, r, v){ return this.price76(F, K, T, r, v, 'CE') + this.price76(F, K, T, r, v, 'PE'); };
+  window.BS.ivStraddle76 = function (F, K, T, r, mkt){
+    if (!(T > 0) || !(mkt > 0) || !(F > 0) || !(K > 0)) return 0;
+    const df = Math.exp(-r * T), intr = df * (Math.abs(F - K));   // a straddle is worth at least |F-K|
+    if (mkt <= intr + 1e-6) return 0;
+    let lo = IV_MIN, hi = IV_MAX;
+    if (this.straddle76(F, K, T, r, hi) < mkt) return 0;
+    for (let i = 0; i < 80; i++){ const m = (lo + hi) / 2;
+      if (this.straddle76(F, K, T, r, m) < mkt) lo = m; else hi = m; }
+    const v = (lo + hi) / 2;
+    if (!isFinite(v) || v < IV_MIN || v > IV_MAX) return 0;
+    if (Math.abs(this.straddle76(F, K, T, r, v) - mkt) > Math.max(0.05, mkt * 0.02)) return 0;
+    return v;
+  };
   window.BS.d1F = function (F, K, T, v){ return (Math.log(F / K) + 0.5 * v * v * T) / (v * Math.sqrt(T)); };
   window.BS.price76 = function (F, K, T, r, v, t){
     if (!(T > 0) || !(v > 0)) return t === 'CE' ? Math.max(0, F - K) : Math.max(0, K - F);
@@ -757,10 +854,22 @@
     const under = (pos[0] && pos[0].under) || activeBook();
     const fwd = fwdFor(under, spot) || spot, basis = fwd - spot;
     const raw = pos.map((p, j) => window.BS.iv76(fwd, p.strike, legT[j], r, p.ltp || p.avg, p.type));
+    // Straddle halves came from a guessed split, so their individual vols are guesses too. Re-solve each pair
+    // ONCE from the mark the portal actually printed and give both halves that vol: the net delta of the pair
+    // is then exact, and a book of straddles no longer counts as 'estimated greeks'.
+    const sdIdx = {}; let sdPairs = 0, sdSolved = 0;
+    pos.forEach((p, j) => { if (p._sdMark > 0) (sdIdx[p.symbol] = sdIdx[p.symbol] || []).push(j); });
+    Object.keys(sdIdx).forEach(sym => {
+      const idx = sdIdx[sym]; if (idx.length !== 2) return;
+      sdPairs++;
+      const p = pos[idx[0]];
+      const v = window.BS.ivStraddle76(fwd, p.strike, legT[idx[0]], r, p._sdMark);
+      if (v > 0){ sdSolved++; idx.forEach(k => { raw[k] = v; }); }
+    });
     const ok = raw.filter(v => v > 0).sort((a, b) => a - b);
     const fb = ok.length ? ok[Math.floor(ok.length / 2)] : 0.15; // fall back to the median leg that DID solve
     const legIVs = raw.map(v => v > 0 ? v : fb), ivBad = raw.length - ok.length;
-    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb, spot, fwd, basis, fwdSrc: Store.fwdSrc[under] }; }
+    return { T, r, dte, legIVs, legT, ivBad, ivFallback: fb, sdPairs, sdSolved, spot, fwd, basis, fwdSrc: Store.fwdSrc[under] }; }
   window._bsPnl = function (pos, s2, K, ivD){
     ivD = ivD || 0; const legT = K.legT || pos.map(() => K.T), b = K.basis || 0;
     // s2 is a hypothetical SPOT; carry the basis across so the model stays on the forward it solved on
@@ -1431,13 +1540,20 @@
     const rows = Store.orders.filter(o => { if (!isFilled(o)) return false;
       const x = parseSymbol(o.symbol); return x && (!book || x.underlying === book); });
     if (!rows.length) return null;
-    const out = zeroCost(); out.fills = rows.length;
+    const out = zeroCost(); out.fills = 0; out.skipped = 0;
     rows.forEach(o => {
       const x = parseSymbol(o.symbol), lot = o.lotSize || LOTS[x.underlying] || 0;
-      const lots = o.lots || (lot ? Math.abs(o.qty) / lot : Math.abs(o.qty));
       const px = o.fill > 0 ? o.fill : o.asked;          // the price actually filled at
+      // Without a lot size, brokerage cannot be computed — and charging the turnover components alone would
+      // print a confident number that is missing its largest part. Skip it and report the skip instead.
+      if (!lot || !(px > 0) || !(Math.abs(o.qty) > 0)){ out.skipped++; return; }
+      // exact, not rounded: a partial fill of less than a lot used to round to ZERO lots and pay no brokerage
+      const lots = Math.abs(o.qty) / lot;
+      out.fills++;
       addCost(out, legCost(px, o.qty, lots, o.side, x.type === 'SD'));
     });
+    if (!out.fills) return null;
+    out.gap = Store.ordersGap || 0; out.total_rows = rows.length;
     return out;
   }
 
@@ -1486,13 +1602,15 @@
     const sp = Store.spots[under] || spotFor(under); if (!sp) return null;
     const lot = LOTS[under]; if (!lot) return null;
     const K = window._getPosCtx(legs, sp);
-    if (K.ivBad > 0 || legs.some(l => l._est)) return null;   // never advise a trade off estimated greeks
+    // Never advise a trade off estimated greeks — but a straddle whose pair vol solved is NOT estimated,
+    // and refusing those meant the hedge never appeared for anyone running straddles, which is most of the book.
+    if (K.ivBad > 0 || K.sdPairs > K.sdSolved) return null;
     const nD = window._netGreeks(legs, sp).nD;
     if (!isFinite(nD) || Math.abs(nD) < 1) return null;
     const F = K.fwd || sp, T = K.T, r = K.r;
     const ivs = K.legIVs.slice().sort((a, b) => a - b), iv = ivs[Math.floor(ivs.length / 2)] || 0.15;
     const type = nD > 0 ? 'CE' : 'PE', step = STRIKE_STEP[under] || 50;
-    let best = null;
+    const cands = [];
     for (let i = 1; i <= 30; i++){
       const strike = Math.round((type === 'CE' ? F + i * step : F - i * step) / step) * step;
       if (strike <= 0) break;
@@ -1501,8 +1619,17 @@
       const lots = Math.round(nD / d / lot);
       if (lots < 1) continue;
       const residual = nD - d * lots * lot;
-      if (!best || Math.abs(residual) < Math.abs(best.residual)) best = { strike, d, lots, residual };
+      cands.push({ strike, d, lots, residual });
     }
+    // Pure residual-minimising picks the WRONG trade. A 0.06-delta wing needs 4 lots to absorb the same
+    // delta 1 lot of a 0.25-delta strike would, and lands a residual of 0.03 against 0.07 — a difference
+    // that means nothing, bought with four times the short gamma and vega. Take every candidate that
+    // neutralises the delta well enough, then prefer the SMALLEST position.
+    const tol = Math.max(0.25, Math.abs(nD) * 0.03);
+    const good = cands.filter(c => Math.abs(c.residual) <= tol);
+    const pool = good.length ? good : cands;
+    pool.sort((a, b) => (a.lots - b.lots) || (Math.abs(a.residual) - Math.abs(b.residual)));
+    const best = pool[0] || null;
     if (!best) return null;
     const qty = -best.lots * lot;                              // negative: we are SELLING
     const add = window.BS.greeks76(F, best.strike, T, r, iv, type, qty);
@@ -1620,7 +1747,7 @@
         if (pk > 0 && back >= AL.give) fire(u + ':give', 'warn', u + ' GIVING BACK', money(back) + ' off the day high of ' + money(pk) + ' — now ' + money(day));
         else rearm(u + ':give', back < AL.give * 0.6); }
       const Kb = window._getPosCtx(lg, sp);
-      const greeksEstimated = Kb.ivBad > 0 || lg.some(l => l._est);
+      const greeksEstimated = Kb.ivBad > 0 || Kb.sdPairs > Kb.sdSolved;
       if (AL.dlt > 0 && !greeksEstimated){ const nd = window._netGreeks(lg, sp).nD;
         if (Math.abs(nd) >= AL.dlt){
           const h = hedgeSuggestion(u);
@@ -1748,7 +1875,19 @@
     const booked = bookRealised(book);
     const fromLog = costFromOrders(book);                     // preferred: every fill, at its fill price
     const paid = fromLog ? fromLog.total : (Store.costPaid[book] || 0);
-    const basis = fromLog ? (fromLog.fills + ' fills from the order log') : 'estimated from closes seen';
+    // Say exactly what this number is built from. A charge figure with no stated basis is the one number
+    // on this panel you cannot sanity-check by eye, so it has to carry its own provenance.
+    let basis, warn = '';
+    if (fromLog){
+      basis = fromLog.fills + ' fill' + (fromLog.fills === 1 ? '' : 's') + ' from the order log';
+      const parts = [];
+      if (fromLog.gap) parts.push('READ ' + (Store.ordersTotal - fromLog.gap) + ' OF ' + Store.ordersTotal + ' EXECUTED ORDERS');
+      if (fromLog.skipped) parts.push(fromLog.skipped + ' FILL' + (fromLog.skipped === 1 ? '' : 'S') + ' NOT COSTED (NO LOT SIZE)');
+      warn = parts.join(' · ');
+    } else {
+      basis = 'estimated from the closes this panel saw';
+      if (booked || legs.length) warn = 'ORDER LOG NOT READ — OPEN THE ORDERS TAB FOR EXACT CHARGES';
+    }
     // stay visible on a flat book: the day's closed trades still cost real money
     if (!legs.length && !paid && !booked){ if (el.innerHTML){ el.innerHTML = ''; el.__sig = ''; } return; }
     const entry = legs.length ? costOfEntry(legs) : zeroCost();
@@ -1769,7 +1908,8 @@
       cell(legs.length ? 'Cost to exit now' : 'Fills today',
            legs.length ? money(-exit.total) : String((fromLog && fromLog.fills) || 0),
            legs.length && exit.total ? C.dn : C.text,
-           legs.length ? 'at the marks on screen' : 'executed orders charged') +
+           legs.length ? 'at the marks on screen'
+                       : (fromLog && Store.ordersTotal ? 'of ' + Store.ordersTotal + ' executed orders' : 'executed orders charged')) +
       cell('Cost drag', drag == null ? '—' : drag.toFixed(1) + '%', (drag != null && drag > 30) ? C.dn : C.text, 'of gross P&L') +
       '</div>';
     // the itemisation is the point of the panel — show it whether the book is open or flat
@@ -1782,6 +1922,7 @@
         NAME[k] + ' <b>₹' + (src[k] || 0).toFixed(0) + '</b>' +
         (k === biggest && src.total ? ' (' + Math.round(src[k] / src.total * 100) + '%)' : '') + '</span>').join('') +
       '<span style="margin-left:auto">' + basis + ' · rates editable, verify against a contract note</span></div>';
+    if (warn) html += '<div class="cwarn">⚠ ' + warn + '</div>';
     if (ex.amt > 0)
       html += '<div class="cwarn">⚠ LONG ITM INTO EXPIRY — ' + ex.which.join(', ') +
         ' would be auto-exercised, costing roughly ' + money(ex.amt) + ' in exercise STT on intrinsic. Closing avoids it.</div>';
@@ -1885,8 +2026,8 @@
     const tot = $id('spay-tot'); if (tot){ const multi = underlyings().length > 1; tot.style.display = multi ? '' : 'none'; if (multi){ tot.textContent = 'all books ' + money(total); tot.style.color = col(total); } }
     if (pos.length && spot){ const K = window._getPosCtx(pos, spot), dte = K.dte; set('spay-dte', dte < 1 ? Math.floor(dte * 24) + 'h ' + Math.round((dte * 24 % 1) * 60) + 'm to expiry' : dte.toFixed(1) + 'd to expiry');
       const iw = $id('spay-iv');
-      const estSplit = pos.filter(l => l._est).length;
-      if (iw){ const msg = K.ivBad ? K.ivBad + ' LEG IV ESTIMATED' : (estSplit ? 'STRADDLE SPLIT ESTIMATED' : '');
+      const estSplit = K.sdPairs - K.sdSolved;
+      if (iw){ const msg = K.ivBad ? K.ivBad + ' LEG IV ESTIMATED' : (estSplit ? estSplit + ' STRADDLE MARK WOULD NOT SOLVE' : '');
         iw.style.display = msg ? '' : 'none'; if (msg) iw.textContent = msg; }
       const G = window._netGreeks(pos, spot); set('g-d', G.nD.toFixed(1), col(G.nD)); set('g-g', G.nG.toFixed(3), C.dn); set('g-t', '₹' + Math.abs(G.nT / 6.25).toFixed(0), C.up); set('g-v', G.nV.toFixed(0), C.dn);
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
@@ -1935,7 +2076,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}

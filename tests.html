@@ -938,6 +938,141 @@
       F.histPush('SENSEX', 100, 1, 0, 0);
       return (S.closed && S.closed.SENSEX===-753) || 'closed became '+JSON.stringify(S.closed); });
 
+
+    grp('STRADDLE GREEKS (one mark, one vol - no guessed split)');
+    t('a straddle price implies a vol, and it round-trips', function(){
+      var F0=76900, K0=76900, T=5/365, r=0.065, v=0.12;
+      var mkt=window.BS.straddle76(F0,K0,T,r,v);
+      var got=window.BS.ivStraddle76(F0,K0,T,r,mkt);
+      return Math.abs(got-v)<0.0005 || 'wanted '+v+' got '+got; });
+    t('a mark at or below |F-K| refuses to solve', function(){
+      var got=window.BS.ivStraddle76(77200,76900,5/365,0.065,100);   // intrinsic alone is ~300
+      return got===0 || 'solved '+got+' on an impossible mark'; });
+    // NOTE: a distinct name. A second `function sdBook(){}` in this scope would HOIST over the one the
+    // earlier straddle tests use and silently break them - which is exactly what happened once.
+    function sdStrikeBook(strike, mark, avg){
+      var e=new Date(Date.now()+5*864e5); e.setHours(15,40,0,0);
+      S.positions=[{status:'OPEN',symbol:'SENSEX2609'+'03'+strike+'SD',optionType:'SD',strikePrice:strike,
+        quantity:-20,avgSellPrice:avg,bepPrice:avg,ltp:mark,_pnl:(avg-mark)*20,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.spots={SENSEX:76874}; S.spot=76874; S.ltpBySym={SENSEX:76874}; S.fwd={}; S.fwdSrc={}; S.book='SENSEX';
+    }
+    t('a straddle with no component quotes still solves ONE vol for the pair', function(){
+      sdStrikeBook(76900, 298.60, 298.60);
+      var legs=window._allLegs(), K=window._getPosCtx(legs,76874);
+      return (K.sdPairs===1 && K.sdSolved===1 && K.ivBad===0 && Math.abs(K.legIVs[0]-K.legIVs[1])<1e-9)
+        || 'pairs '+K.sdPairs+' solved '+K.sdSolved+' ivBad '+K.ivBad+' ivs '+K.legIVs; });
+    t('that vol reprices the pair back to the printed mark', function(){
+      sdStrikeBook(76900, 298.60, 298.60);
+      var legs=window._allLegs(), K=window._getPosCtx(legs,76874);
+      var back=window.BS.straddle76(K.fwd||76874, 76900, K.legT[0], K.r, K.legIVs[0]);
+      return Math.abs(back-298.60)<0.5 || 'repriced to '+back.toFixed(2)+' from a 298.60 mark'; });
+    // Build the fixture FROM the model at a known vol, so the assertion is against arithmetic rather than
+    // against a mark I invented. A straddle is worth at least |F-K|; a made-up mark below that solves to
+    // nothing, which is what a first draft of this test got wrong.
+    function sdAtVol(strike, vol){
+      sdStrikeBook(strike, 100, 100);                       // placeholder, just to get a context
+      var K0=window._getPosCtx(window._allLegs(),76874);
+      var mark=window.BS.straddle76(K0.fwd||76874, strike, K0.legT[0], K0.r, vol);
+      sdStrikeBook(strike, +mark.toFixed(2), +mark.toFixed(2));
+      return { mark:+mark.toFixed(2), fwd:K0.fwd||76874, T:K0.legT[0], r:K0.r };
+    }
+    t('the pair vol recovered from a straddle mark is the vol it was priced at', function(){
+      var f=sdAtVol(77400, 0.12);
+      var K=window._getPosCtx(window._allLegs(),76874);
+      return Math.abs(K.legIVs[0]-0.12)<0.002 || 'priced at 0.12, recovered '+K.legIVs[0].toFixed(4)+' from a mark of '+f.mark; });
+    t('and the net delta matches the closed form for that vol', function(){
+      var f=sdAtVol(77400, 0.12);
+      var d1=window.BS.d1F(f.fwd, 77400, f.T, 0.12);
+      var want=-20*(2*window.BS.norm(d1)-1);                // short 20 of each half
+      var got=window._netGreeks(window._allLegs(),76874).nD;
+      return Math.abs(got-want)<0.2 || 'closed form '+want.toFixed(2)+' vs engine '+got.toFixed(2); });
+    t('the hedge picks the smallest position that neutralises, not the tightest residual', function(){
+      // a 0.06-delta wing hits residual 0.03 with 4 lots; a 0.25-delta strike hits 0.07 with 1. The second
+      // is the trade - four times less short gamma and vega for a difference in delta that means nothing.
+      sdAtVol(77400, 0.12);
+      var h=F.hedgeSuggestion('SENSEX');
+      return (h && h.lots<=2 && Math.abs(h.optDelta)>0.12)
+        || 'chose '+(h&&h.lots)+' lots of a '+(h&&h.optDelta.toFixed(3))+'-delta '+(h&&h.strike); });
+    t('a delta hedge IS suggested on a straddle book', function(){
+      // v6.3 and earlier refused: expandLegs set _est whenever component quotes were missing, which is the
+      // normal case, so the hedge never appeared for anyone running straddles.
+      sdAtVol(77400, 0.12);                                 // strike well above spot -> a real net delta
+      var h=F.hedgeSuggestion('SENSEX');
+      return (h && h.lots>=1 && (h.type==='CE'||h.type==='PE')) || 'no suggestion: '+JSON.stringify(h); });
+    t('the 50/50 split it used to rely on would have given a different delta', function(){
+      // evidence the joint solve matters: solve each half off half the mark, the old way, and compare
+      var f=sdAtVol(77400, 0.12);
+      var joint=window._netGreeks(window._allLegs(),76874).nD;
+      var half=f.mark/2;
+      var ivC=window.BS.iv76(f.fwd,77400,f.T,f.r,half,'CE'), ivP=window.BS.iv76(f.fwd,77400,f.T,f.r,half,'PE');
+      var old=window.BS.greeks76(f.fwd,77400,f.T,f.r,ivC||0.15,'CE',-20).delta
+             +window.BS.greeks76(f.fwd,77400,f.T,f.r,ivP||0.15,'PE',-20).delta;
+      return Math.abs(joint-old)>0.5 || 'the two agreed ('+joint.toFixed(2)+' vs '+old.toFixed(2)+') - test proves nothing'; });
+
+    grp('ORDER LOG (this table IS the cost model input)');
+    function ordTable(headers, rows){
+      var w=document.createElement('div'); w.id='ordtest';
+      var cap=document.createElement('h3'); cap.textContent='Executed Order ('+rows.length+')'; w.appendChild(cap);
+      var t=document.createElement('table');
+      t.innerHTML='<thead><tr>'+headers.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+
+        rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
+      w.appendChild(t); document.body.insertBefore(w,document.body.firstChild); return w; }
+    var ORD_H=['Time','Ex. Time','Type','Symbol','Order Type','Qty','Price','Status'];
+    var ORD_ROW=function(side,sym,qty,px,st){ return ['11:37 AM','11:37 AM',side,sym,'LIMIT',qty,px,st||'Executed']; };
+    function clearOrders(){ S.orders=[]; S.ordersTotal=null; S.ordersGap=0; S.ordersDup=0; S.ordersNoLot=0; }
+    t('BUY and SELL are read from the Type column, not the row text', function(){
+      clearOrders();
+      var w=ordTable(ORD_H,[ORD_ROW('BUY','SENSEX SEP 76900 PE 03 Sep',20,'60.55'),
+                            ORD_ROW('SELL','SENSEX SEP 77000 CE 03 Sep',20,'40.00')]);
+      F.scrapeOrders(); w.remove();
+      var sides=S.orders.map(function(o){return o.side;}).sort().join(',');
+      return sides==='BUY,SELL' || 'got '+sides; });
+    t('a B / S column is understood too', function(){
+      clearOrders();
+      var w=ordTable(ORD_H,[ORD_ROW('B','SENSEX SEP 76900 PE 03 Sep',20,'60.55')]);
+      F.scrapeOrders(); var side=S.orders[0]&&S.orders[0].side; w.remove();
+      return side==='BUY' || 'got '+side; });
+    t('a filled/total quantity cell reads the FILLED number', function(){
+      return (F.qtyOf('130/260')===130 && F.qtyOf('130')===130) || 'got '+F.qtyOf('130/260'); });
+    t('the same order listed in two tables is charged once', function(){
+      clearOrders();
+      var row=ORD_ROW('SELL','SENSEX SEP 76900 PE 03 Sep',20,'60.55');
+      var a=ordTable(ORD_H,[row]), b=ordTable(ORD_H,[row]);
+      F.scrapeOrders(); var n=S.orders.length, dup=S.ordersDup; a.remove(); b.remove();
+      return (n===1 && dup===1) || 'kept '+n+' rows, dup '+dup; });
+    t('two identical fills at DIFFERENT times are both charged', function(){
+      clearOrders();
+      var r1=['09:30 AM','09:30 AM','SELL','SENSEX SEP 76900 PE 03 Sep','MARKET',20,'60.55','Executed'];
+      var r2=['11:37 AM','11:37 AM','SELL','SENSEX SEP 76900 PE 03 Sep','MARKET',20,'60.55','Executed'];
+      var w=ordTable(ORD_H,[r1,r2]); F.scrapeOrders(); var n=S.orders.length; w.remove();
+      return n===2 || 'collapsed to '+n; });
+    t('a partial fill under one lot still pays brokerage', function(){
+      clearOrders();
+      var w=ordTable(ORD_H,[ORD_ROW('SELL','SENSEX SEP 76900 PE 03 Sep',10,'60.55')]);  // half a 20 lot
+      F.scrapeOrders(); var c=F.costFromOrders('SENSEX'); w.remove();
+      return (c && c.brok>0) || 'brokerage '+(c&&c.brok)+' on a sub-lot fill'; });
+    t('a fill we cannot price is skipped, not half-charged', function(){
+      clearOrders();
+      var w=ordTable(ORD_H,[ORD_ROW('SELL','SENSEX SEP 76900 PE 03 Sep',20,'0.00')]);
+      F.scrapeOrders(); var c=F.costFromOrders('SENSEX'); w.remove();
+      return c===null || 'costed a zero-price fill: '+JSON.stringify(c); });
+    t('cancelled orders are never charged', function(){
+      clearOrders();
+      var w=ordTable(ORD_H,[ORD_ROW('SELL','SENSEX SEP 76900 PE 03 Sep',20,'60.55','Cancelled'),
+                            ORD_ROW('SELL','SENSEX SEP 77000 CE 03 Sep',20,'40.00','Executed')]);
+      F.scrapeOrders(); var c=F.costFromOrders('SENSEX'); w.remove();
+      return (c && c.fills===1) || 'charged '+(c&&c.fills)+' fills'; });
+    t('a half-rendered order table is reported, not silently costed short', function(){
+      clearOrders();
+      var w=ordTable(ORD_H,[ORD_ROW('SELL','SENSEX SEP 76900 PE 03 Sep',20,'60.55')]);
+      w.querySelector('h3').textContent='Executed Order (31)';
+      F.scrapeOrders(); var gap=S.ordersGap, tot=S.ordersTotal; w.remove();
+      return (tot===31 && gap===30) || 'total '+tot+' gap '+gap; });
+    t('STT lands on the SELL side only', function(){
+      var sell=F.legCost(100, -20, 1, 'SELL', false), buy=F.legCost(100, 20, 1, 'BUY', false);
+      return (sell.stt>0 && buy.stt===0 && buy.stamp>0 && sell.stamp===0)
+        || 'sell stt '+sell.stt+' buy stt '+buy.stt+' buy stamp '+buy.stamp; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
