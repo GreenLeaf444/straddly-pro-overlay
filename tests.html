@@ -1073,6 +1073,97 @@
       return (sell.stt>0 && buy.stt===0 && buy.stamp>0 && sell.stamp===0)
         || 'sell stt '+sell.stt+' buy stt '+buy.stt+' buy stamp '+buy.stamp; });
 
+
+    grp('SPOT WITHOUT AN API TOKEN (the book the portal is not showing)');
+    // Unique helper names on purpose - a duplicate `function` in this scope HOISTS over the earlier one.
+    function twoBookTable(rows, headerText){
+      var w=document.createElement('div'); w.id='tbtest';
+      var hdr=document.createElement('div');
+      hdr.innerHTML='<span>NIFTY 50</span> <span>Spot:</span> <span>23,513.50</span>';   // only NIFTY has a header
+      w.appendChild(hdr);
+      var cap=document.createElement('h3'); cap.textContent=headerText||('Open Positions ('+rows.length+')');
+      w.appendChild(cap);
+      var t=document.createElement('table');
+      t.innerHTML='<thead><tr>'+OPEN_H.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+
+        rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
+      w.appendChild(t); document.body.insertBefore(w,document.body.firstChild); return w; }
+    function tbIns(u,strike,kind){
+      var d=new Date(Date.now()+6*864e5);
+      var MN=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+      var MC=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      return u+' '+MN[d.getMonth()]+' '+strike+' '+kind+' '+('0'+d.getDate()).slice(-2)+' '+MC[d.getMonth()]; }
+    function tbRow(u,strike,kind,qty,avg,ltp,pnl){
+      return ['','MIS',tbIns(u,strike,kind),qty,'Exit',avg.toFixed(2),ltp.toFixed(2),'₹'+pnl.toFixed(2)]; }
+    function tbReset(){ S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
+      S.closedGap=0; S.scrapeGap=0; S.costPaid={}; S.hist={}; S.orders=[]; S.book=''; S.spots={}; S.spot=0;
+      S.ltpBySym={};                       // NO captured token: this is the auth-missing session
+      S.fwd={}; S.fwdSrc={}; S.refs={}; }
+    var TB_PAIR=[
+      tbRow('NIFTY', 23800,'CE',-65, 62.00, 55.00,  455.00),
+      tbRow('SENSEX',76900,'SD',-20,905.00,880.00,  500.00),
+      tbRow('SENSEX',76900,'CE',-20,460.00,452.00,  160.00)];
+    var TB_SD_ONLY=[
+      tbRow('NIFTY', 23800,'CE',-65, 62.00, 55.00,  455.00),
+      tbRow('SENSEX',76900,'SD',-20,905.00,880.00,  500.00),
+      tbRow('SENSEX',77300,'SD',-20,780.00,766.80,  264.00)];
+
+    t('marks come from the position table when the quote map is empty', function(){
+      tbReset(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var m=F.markMap('SENSEX'), n=Object.keys(m).length; w.remove();
+      return n===2 || 'saw '+n+' SENSEX marks with no API quotes'; });
+    t('an SD row plus a same-strike CE yields the put by subtraction', function(){
+      tbReset(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var rows=F.parityRows('SENSEX'); w.remove();
+      // SD 880 - CE 452 = PE 428, so C-P = +24 at the 76900 strike
+      return (rows.length===1 && rows[0].k===76900 && Math.abs(rows[0].cp-24)<0.01)
+        || 'got '+JSON.stringify(rows); });
+    t('the book the portal is NOT displaying still gets a spot', function(){
+      // the whole bug: no SENSEX header on the page, no API token, so v6.4 had spot 0 -> no greeks at all
+      tbReset(); F.spotCacheClear(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var sp=F.spotFor('SENSEX'); w.remove();
+      return (sp>76000 && sp<77800) || 'SENSEX spot came out '+sp; });
+    t('and its greeks compute', function(){
+      tbReset(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true); S.book='SENSEX';
+      var legs=window._bsLegs(), sp=window.getSpot(), g=window._netGreeks(legs,sp); S.book=''; w.remove();
+      return (sp>0 && isFinite(g.nD) && isFinite(g.nT) && g.nT!==0) || 'spot '+sp+' delta '+g.nD+' theta '+g.nT; });
+    t('the NIFTY book is still priced off the portal header, not parity', function(){
+      // the DOM scan is throttled to one pass per book per 1.5s; clear it or this reads a stale 0
+      tbReset(); F.spotCacheClear(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var sp=F.spotFor('NIFTY'); w.remove();
+      return Math.abs(sp-23513.50)<0.01 || 'NIFTY spot came out '+sp; });
+    t('parity never prices one book off another book\'s strikes', function(){
+      tbReset(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var rows=F.parityRows('NIFTY'); w.remove();
+      return rows.length===0 || 'NIFTY picked up '+JSON.stringify(rows); });
+    t('both books get a DOM scan in the same tick, not just the first', function(){
+      // one shared scan-cache slot meant recomputeSpot's loop scanned book one and throttled book two to 0
+      tbReset(); F.spotCacheClear(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var a=F.indexSpotDOM('NIFTY'), b=F.indexSpotDOM('SENSEX'); w.remove();
+      return (Math.abs(a-23513.50)<0.01 && b===0) || 'nifty '+a+' sensex '+b; });
+    t('an unnamed Spot: label is never read as another index', function(){
+      // the page prints ONE header; a bare 'Spot:' belongs to whatever is on screen, not to every book
+      tbReset(); F.spotCacheClear(); var w=twoBookTable(TB_PAIR); F.scrapePositions(true);
+      var v=F.indexSpotDOM('SENSEX'); w.remove();
+      return v===0 || 'SENSEX read '+v+' off the NIFTY header'; });
+    t('and it is refused outright on a book with no strikes to check it against', function(){
+      tbReset(); F.spotCacheClear();
+      var w=twoBookTable([tbRow('NIFTY',23800,'CE',-65,62.00,55.00,455.00)]);
+      F.scrapePositions(true);
+      var v=F.indexSpotDOM('SENSEX'); w.remove();   // no SENSEX positions -> plausibleSpot cannot judge it
+      return v===0 || 'accepted '+v+' as SENSEX spot with nothing to validate against'; });
+    t('a straddle-only book with no quote reports no spot rather than inventing one', function(){
+      tbReset(); var w=twoBookTable(TB_SD_ONLY); F.scrapePositions(true); S.book='SENSEX';
+      var sp=F.spotFor('SENSEX'); S.book=''; w.remove();
+      return sp===0 || 'invented a spot of '+sp+' from two straddle marks'; });
+    t('day P&L survives a missing spot - it comes from the portal, not the model', function(){
+      tbReset(); var w=twoBookTable(TB_SD_ONLY); F.scrapePositions(true); S.book='SENSEX';
+      var mtm=window._bookMTM(); S.book=''; w.remove();
+      return Math.abs(mtm-764)<0.01 || 'book MTM '+mtm+' (expected 500+264)'; });
+    t('a book with legs but no spot is a data-trust failure', function(){
+      tbReset(); var w=twoBookTable(TB_SD_ONLY); F.scrapePositions(true); S.book='SENSEX'; S.markAt=Date.now();
+      var why=F.dataTrust().why.join(' | '); S.book=''; w.remove();
+      return /no SENSEX spot/.test(why) || 'trust said: '+(why||'(nothing)'); });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

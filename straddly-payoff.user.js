@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -137,9 +137,94 @@
   const isWorking = o => /open|pending|trigger|placed/.test(o.status) && !/cancel|reject|execut|complet/.test(o.status);
   const IDX = { NIFTY: 'NIFTY', BANKNIFTY: 'NIFTY BANK', SENSEX: 'SENSEX' };
   function detectUnderlying(){ for (const p of Store.positions){ const s = parseSymbol(p.symbol); if (s) return s.underlying; } return 'NIFTY'; }
-  function paritySpot(under){ const byK = {}; for (const sym in Store.ltpBySym){ const p = parseSymbol(sym), l = Store.ltpBySym[sym]; if (!p || p.type === 'SD' || !(l > 0)) continue; if (under && p.underlying !== under) continue; const o = byK[p.strike] = byK[p.strike] || { exp: p.expiry }; o[p.type] = l; } const rows = []; for (const k in byK){ const r = byK[k]; if (r.CE > 0 && r.PE > 0) rows.push({ k: +k, diff: Math.abs(r.CE - r.PE), cp: r.CE - r.PE, exp: r.exp }); } if (!rows.length) return 0; rows.sort((a, b) => a.diff - b.diff); const top = rows.slice(0, 3), rr = 0.065, now = Date.now(); let s = 0; top.forEach(x => { const T = Math.max((x.exp - now) / (365 * 864e5), 1e-5); s += x.k * Math.exp(-rr * T) + x.cp; }); return s / top.length; }
-  const _idx = { under: null, valEl: null, last: 0 };
-  function indexSpotDOM(under){ const numIn = el => { const m = (el && el.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/); if (!m) return 0; const v = parseFloat(m[1].replace(/,/g, '')); return (v > 1000 && v < 200000) ? v : 0; }; try { if (_idx.under === under && _idx.valEl && document.contains(_idx.valEl)){ const v = numIn(_idx.valEl); if (v) return v; } if (Date.now() - _idx.last < 1500) return 0; _idx.last = Date.now(); const wants = under === 'BANKNIFTY' ? ['BANKNIFTY','BANK NIFTY','NIFTY BANK'] : [under, 'SPOT']; const leaves = document.querySelectorAll('span,div,b,strong,td,th,p'); for (let i = 0; i < leaves.length; i++){ const el = leaves[i]; if (el.childElementCount !== 0) continue; const t = el.textContent.trim().toUpperCase().replace(':', ''); if (wants.indexOf(t) < 0) continue; const probes = [el.nextElementSibling, el.previousElementSibling].concat(el.parentElement ? Array.from(el.parentElement.children) : []); for (const c of probes){ if (!c || c === el) continue; const v = numIn(c); if (v){ _idx.under = under; _idx.valEl = c; return v; } } } } catch (e) {} return 0; }
+  // Every option mark we can see, from BOTH sources. Store.ltpBySym comes from the touchline self-fetch,
+  // which needs a captured API token and is simply absent on some sessions (the header then reads auth✗).
+  // The portal's own position table is always readable, and it lists EVERY book — not just the index the
+  // portal happens to be displaying. Leaning on the API map alone is why a SENSEX book went completely dark
+  // (no spot → no greeks, no payoff, and a day P&L that blanked itself) the moment the portal showed NIFTY.
+  // Kept SEPARATE, never merged. Parity subtracts a call from a put, so both sides must be measured at the
+  // same instant by the same source; taking a call from the API chain and a put from the table is the same
+  // cross-source mixing that once put a straddle's components 16 points away from its own mark.
+  function markMap(under, src){
+    const m = {};
+    if (src !== 'dom') for (const sym in Store.ltpBySym){ const q = parseSymbol(sym);
+      if (q && (!under || q.underlying === under) && Store.ltpBySym[sym] > 0) m[sym] = Store.ltpBySym[sym]; }
+    if (src !== 'api') Store.positions.forEach(p => { const q = parseSymbol(p.symbol);
+      if (q && (!under || q.underlying === under) && p.ltp > 0) m[p.symbol] = p.ltp; });
+    return m;
+  }
+  // Strikes where we can see BOTH a call and a put, so put-call parity applies.
+  // An SD row prints C+P at its strike; paired with a plain CE or PE at the SAME strike it gives up the
+  // missing side by subtraction, which turns a straddle book into a parity book for free.
+  // API chain first — it is a full chain and internally consistent. The position table is the fallback for
+  // when there is no captured token at all, which is the session where a book went dark.
+  function parityRows(under){
+    const api = parityRowsFrom(markMap(under, 'api'));
+    return api.length ? api : parityRowsFrom(markMap(under, 'dom'));
+  }
+  function parityRowsFrom(m){
+    const byK = {};
+    for (const sym in m){ const q = parseSymbol(sym); if (!q) continue;
+      const o = byK[q.strike] = byK[q.strike] || { exp: q.expiry }; o[q.type] = m[sym]; }
+    const rows = [];
+    for (const k in byK){ const x = byK[k];
+      let c = x.CE, p = x.PE;
+      if (x.SD > 0){ if (!(c > 0) && p > 0) c = x.SD - p; else if (!(p > 0) && c > 0) p = x.SD - c; }
+      if (c > 0 && p > 0) rows.push({ k: +k, gap: Math.abs(c - p), cp: c - p, exp: x.exp });
+    }
+    rows.sort((a, b) => a.gap - b.gap);      // nearest the money first: parity is most reliable there
+    return rows;
+  }
+  function paritySpot(under){
+    const rows = parityRows(under); if (!rows.length) return 0;
+    const top = rows.slice(0, 3), rr = 0.065, now = Date.now(); let s = 0;
+    top.forEach(x => { const T = Math.max((x.exp - now) / (365 * 864e5), 1e-5); s += x.k * Math.exp(-rr * T) + x.cp; });
+    return s / top.length;
+  }
+  const _idx = {};   // one scan-cache slot PER underlying, keyed by book
+  // _hdr is declared further down; reaching it before initialisation throws, so never let that escape.
+  function spotCacheClear(){ Object.keys(_idx).forEach(k => { delete _idx[k]; }); try { Object.keys(_hdr).forEach(k => { delete _hdr[k]; }); } catch (e) {} }
+  // The scan cache used to be a SINGLE slot shared by every underlying: recomputeSpot() loops the books in
+  // one tick, so the first book scanned and every other book was throttled straight to 0. One slot per book.
+  // Name variants the portal may print for each book. Matching only the bare word 'SPOT' was how a SENSEX
+  // lookup came back with NIFTY's 23,513: the page prints ONE index header, and an unnamed 'Spot:' label
+  // belongs to whichever index is on screen. plausibleSpot() happened to reject it because SENSEX strikes
+  // are three times larger — but it returns TRUE for a book with no positions yet, so on a fresh book that
+  // wrong number would have been accepted as the spot and priced the whole panel off it.
+  const IDX_NAMES = {
+    NIFTY:      ['NIFTY', 'NIFTY 50', 'NIFTY50'],
+    BANKNIFTY:  ['BANKNIFTY', 'BANK NIFTY', 'NIFTY BANK'],
+    SENSEX:     ['SENSEX', 'BSE SENSEX', 'SENSEX 30', 'S&P BSE SENSEX']
+  };
+  function indexSpotDOM(under){
+    const numIn = el => { const m = (el && el.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/);
+      if (!m) return 0; const v = parseFloat(m[1].replace(/,/g, '')); return (v > 1000 && v < 200000) ? v : 0; };
+    const _c = _idx[under] || (_idx[under] = { valEl: null, last: 0 });
+    try {
+      if (_c.valEl && document.contains(_c.valEl)){ const v = numIn(_c.valEl); if (v && plausibleSpot(under, v)) return v; _c.valEl = null; }
+      if (Date.now() - _c.last < 1500) return 0;
+      _c.last = Date.now();
+      const named = IDX_NAMES[under] || [under];
+      // A bare 'SPOT' label is only usable when we can CHECK the number against this book's own strikes.
+      const anchored = Store.positions.some(p => { const x = parseSymbol(p.symbol); return x && x.underlying === under; });
+      const passes = anchored ? [named, ['SPOT']] : [named];
+      const leaves = document.querySelectorAll('span,div,b,strong,td,th,p');
+      for (const wants of passes){
+        for (let i = 0; i < leaves.length; i++){
+          const el = leaves[i]; if (el.childElementCount !== 0) continue;
+          const t = el.textContent.trim().toUpperCase().replace(':', '');
+          if (wants.indexOf(t) < 0) continue;
+          const probes = [el.nextElementSibling, el.previousElementSibling].concat(el.parentElement ? Array.from(el.parentElement.children) : []);
+          for (const c of probes){
+            if (!c || c === el) continue;
+            const v = numIn(c);
+            if (v && plausibleSpot(under, v)){ _c.valEl = c; return v; }   // validate BEFORE caching it
+          }
+        }
+      }
+    } catch (e) {}
+    return 0;
+  }
   // A closed exchange serves a FROZEN feed, not an empty one — a flat, plausible-looking tape.
   // So we check the clock (in IST, regardless of the machine's timezone) AND whether marks are actually moving.
   function istNow(d){ d = d || new Date(); return new Date(d.getTime() + d.getTimezoneOffset() * 60000 + 5.5 * 3600000); }
@@ -218,17 +303,8 @@
   }
   // Independent check: put-call parity on the chain gives F = K + (C - P)*e^{rT} at the most ATM strike.
   function parityFwd(under){
-    const byK = {};
-    for (const sym in Store.ltpBySym){
-      const q = parseSymbol(sym), l = Store.ltpBySym[sym];
-      if (!q || q.type === 'SD' || !(l > 0) || q.underlying !== under) continue;
-      const o = byK[q.strike] = byK[q.strike] || { exp: q.expiry }; o[q.type] = l;
-    }
-    const rows = [];
-    for (const k in byK){ const x = byK[k];
-      if (x.CE > 0 && x.PE > 0) rows.push({ k: +k, gap: Math.abs(x.CE - x.PE), cp: x.CE - x.PE, exp: x.exp }); }
+    const rows = parityRows(under);
     if (!rows.length) return 0;
-    rows.sort((a, b) => a.gap - b.gap);
     const x = rows[0], T = Math.max((x.exp - Date.now()) / (365 * 864e5), 1e-5);
     const F = x.k + x.cp * Math.exp(0.065 * T);
     return plausibleSpot(under, F) ? F : 0;
@@ -573,7 +649,7 @@
       if (tsig !== _tableSig){ _tableSig = tsig; Store.tableAt = Date.now(); }
     }
     const qn = Store.positions.filter(p => Store.ltpBySym[p.symbol] > 0).length;
-    Store.dbg = 'pos ' + Store.positions.length + (Store.posVisible ? '' : ' · q' + qn + '/' + Store.positions.length) + (function(){ const v = Store.spots[activeBook()] || Store.spot; return v ? ' · spot ' + Math.round(v) : ' · spot ?'; })() + (AUTH ? ' · auth✓' : ' · auth✗');
+    Store.dbg = 'pos ' + Store.positions.length + (Store.posVisible ? '' : ' · q' + qn + '/' + Store.positions.length) + (function(){ const b = activeBook(), v = Store.spots[b]; return v ? ' · spot ' + Math.round(v) : ' · ' + b + ' spot ?'; })() + (AUTH ? ' · auth✓' : ' · auth✗');
     return Store.positions.length;
   }
   // When a leg is exited its open P&L vanishes from the book — bank it, so the day curve stays continuous
@@ -1327,7 +1403,19 @@
   window.drawPayoff = function (){
     const cv = fitCanvas('spay-cv', 0.38, 230); if (!cv) return; const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
     const pos = window._bsLegs(), spot = window.getSpot();
-    if (!pos.length || !spot){ ctx.fillStyle = C.muted; ctx.font = '13px ' + MONO; ctx.textAlign = 'center'; ctx.fillText('no open positions', W / 2, H / 2); return; }
+    // 'no open positions' on a book that HAS positions is a lie on a risk panel. Separate the two states:
+    // an empty book, and a book we cannot price because the index quote is missing.
+    if (!pos.length || !spot){
+      ctx.fillStyle = C.muted; ctx.font = '13px ' + MONO; ctx.textAlign = 'center';
+      if (!pos.length) ctx.fillText('no open positions', W / 2, H / 2);
+      else {
+        ctx.fillStyle = C.warn;
+        ctx.fillText('no ' + activeBook() + ' spot — payoff and greeks need the index quote', W / 2, H / 2 - 9);
+        ctx.fillStyle = C.muted; ctx.font = '11px ' + MONO;
+        ctx.fillText(pos.length + ' leg' + (pos.length === 1 ? '' : 's') + ' open · P&L above is still live from the portal', W / 2, H / 2 + 11);
+      }
+      return;
+    }
     const K = window._getPosCtx(pos, spot), dte = K.dte;
     const ks = pos.map(p => p.strike);
     const ivs = K.legIVs.slice().sort((a, b) => a - b), ivM = ivs[Math.floor(ivs.length / 2)] || 0.15;
@@ -1697,6 +1785,7 @@
     else if (age > 30000) why.push('marks stale ' + fmtAge(age));
     if (frozen > 180000) why.push('feed frozen ' + fmtAge(frozen));
     if (Store.scrapeGap > 0) why.push('read ' + Store.positions.length + ' of ' + Store.portalOpen + ' rows');
+    try { if (window._bsLegs().length && !window.getSpot()) why.push('no ' + activeBook() + ' spot — greeks unavailable'); } catch (e) {}
     if (Math.abs(Store.mismatch || 0) > Math.max(5, Math.abs(Store.portalMTM || 0) * 0.01))
       why.push('disagrees with portal by ' + money(Store.mismatch));
     const R = Store.refs[activeBook()];
@@ -2033,7 +2122,13 @@
       const stress = [-0.03, -0.02, -0.01, 0.01, 0.02, 0.03].map(s => window._bsPnl(pos, spot * (1 + s), K, 0)); set('r-ml', money(Math.min(0, ...stress)), C.dn);
       const be = window._breakevens(pos); if (be){ const inside = spot >= be.lower && spot <= be.upper, near = Math.min(Math.abs(be.upper - spot), Math.abs(spot - be.lower)); set('r-be', Math.round(be.lower).toLocaleString('en-IN') + '–' + Math.round(be.upper).toLocaleString('en-IN')); set('r-bes', inside ? near.toFixed(0) + ' pt to edge' : 'OUTSIDE', inside ? C.muted : C.dn); } else { set('r-be', '—'); set('r-bes', ''); }
       const decay = pos.reduce((a, l) => { const it = l.type === 'CE' ? Math.max(0, spot - l.strike) : Math.max(0, l.strike - spot); return a + (l.ltp - it) * (-l.qty); }, 0); set('r-dl', money(decay), decay >= 0 ? C.up : C.dn);
-    } else { ['g-d','g-g','g-t','g-v','r-ml','r-be','r-dl'].forEach(id => set(id, '—', C.muted)); set('spay-dte', ''); set('spay-day', '—', C.muted); }
+    } else {
+      ['g-d','g-g','g-t','g-v','r-ml','r-be','r-dl'].forEach(id => set(id, '—', C.muted));
+      set('spay-dte', pos.length ? 'no ' + book + ' spot — greeks unavailable' : '');
+      // Day P&L comes from the portal's own P&L column and needs no spot whatsoever. Blanking it alongside
+      // the greeks meant a book the portal was not displaying showed a dash for money it had really made.
+      if (!pos.length) set('spay-day', '—', C.muted);
+    }
     const allowed = allowedMargin(), used = marginUsed(), pctm = Math.min(100, allowed ? used / allowed * 100 : 0);
     set('r-mg', pctm.toFixed(0) + '%', pctm > 80 ? C.dn : pctm > 60 ? C.warn : C.up); set('r-mgs', '₹' + Math.round(used / 1000) + 'K / ₹' + Math.round(allowed / 1000) + 'K');
     // Status must describe OUR MARKS, not our network activity. Four honest states, worst-case wins.
@@ -2076,7 +2171,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, spotCacheClear, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
