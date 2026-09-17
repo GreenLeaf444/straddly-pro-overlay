@@ -1244,6 +1244,40 @@
       F.recordAllBooks(hsNow());
       return !(S.histSkip.SENSEX||{}).why || 'still claims: '+S.histSkip.SENSEX.why; });
 
+
+    grp('PAYOFF X AXIS (percent move, not index level)');
+    function pctLabels(spot, halfFrac){
+      return F.pctTicks(spot*(1-halfFrac), spot*(1+halfFrac), spot).map(function(t){ return t.label; }); }
+    t('the axis is labelled in percent move from spot', function(){
+      var l=pctLabels(76900, 0.015);
+      return l.every(function(x){ return /%$/.test(x); }) || 'got '+l.join(' '); });
+    t('spot itself gets a zero tick, on every width', function(){
+      var ok=[0.006,0.010,0.015,0.022,0.035].every(function(h){
+        return F.pctTicks(76900*(1-h),76900*(1+h),76900).filter(function(t){return t.zero;}).length===1; });
+      return ok || 'some width had no 0% line'; });
+    t('a zero tick never prints as -0.00%', function(){
+      var bad=[0.006,0.015,0.035].map(function(h){ return pctLabels(76900,h); })
+        .reduce(function(a,b){ return a.concat(b); },[])
+        .filter(function(x){ return /^-0(\.0+)?%$/.test(x); });
+      return bad.length===0 || 'printed '+bad.join(' '); });
+    t('the widest range still gets a readable number of ticks', function(){
+      // the first cut divided the span by 6 and left +/-3.5% with three labels
+      var l=pctLabels(23500, 0.035);
+      return (l.length>=6 && l.length<=10) || l.length+' ticks: '+l.join(' '); });
+    t('every width lands on round steps', function(){
+      var l=pctLabels(23500, 0.015);
+      return l.join(' ')==='-1.5% -1.0% -0.5% 0.0% +0.5% +1.0% +1.5%' || 'got '+l.join(' '); });
+    t('the same width reads identically on NIFTY and SENSEX', function(){
+      // the point of the change: a 300-point move is not the same trade on two different indices
+      return pctLabels(23500,0.015).join(' ')===pctLabels(76900,0.015).join(' ')
+        || 'NIFTY '+pctLabels(23500,0.015).join(' ')+' vs SENSEX '+pctLabels(76900,0.015).join(' '); });
+    t('ticks stay inside the drawn range', function(){
+      var spot=76900, h=0.015, lo=spot*(1-h), hi=spot*(1+h);
+      var bad=F.pctTicks(lo,hi,spot).filter(function(t){ var v=spot*(1+t.p/100); return v<lo-0.5||v>hi+0.5; });
+      return bad.length===0 || 'ticks outside the axis: '+JSON.stringify(bad); });
+    t('no spot means no ticks rather than a divide by zero', function(){
+      return F.pctTicks(0,0,0).length===0 || 'produced ticks with no spot'; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

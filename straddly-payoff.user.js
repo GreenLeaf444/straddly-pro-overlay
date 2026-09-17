@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.6
+// @version      6.7
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -1405,6 +1405,30 @@
   }
 
   // ══ PAYOFF CHART ════════════════════════════════════════════════════════════
+  // The payoff x axis is PERCENT MOVE FROM SPOT, not index level. A 300-point move means one thing on NIFTY
+  // and quite another on SENSEX, so levels made the same shape read differently per book; percent does not.
+  // Round steps also put a gridline exactly on 0% — spot — which the old six-evenly-spaced-levels never did.
+  const PCT_STEPS = [0.1, 0.2, 0.25, 0.5, 1, 2, 2.5, 5, 10];
+  function pctTicks(lo, hi, spot){
+    if (!(spot > 0) || !(hi > lo)) return [];
+    const pctLo = (lo - spot) / spot * 100, pctHi = (hi - spot) / spot * 100;
+    // Pick the step by the tick COUNT it yields, not by dividing the span: at the widest range the panel
+    // draws (+/-3.5%) 'first step >= span/6' chose 2% and left the axis with three labels.
+    let step = PCT_STEPS[0], best = Infinity;
+    PCT_STEPS.forEach(v => {
+      const cnt = Math.floor(pctHi / v + 1e-9) - Math.ceil(pctLo / v - 1e-9) + 1;
+      if (cnt < 3) return;                                   // too sparse to read
+      const d = Math.abs(cnt - 7);
+      if (d < best){ best = d; step = v; }
+    });
+    const dec = step < 0.5 ? 2 : step < 1 ? 1 : (step % 1 ? 1 : 0), out = [];
+    // walk integer multiples, never accumulate: 0.1 added twenty times is not 2
+    for (let i = Math.ceil(pctLo / step - 1e-9); i <= Math.floor(pctHi / step + 1e-9); i++){
+      const p = i * step, zero = i === 0;
+      out.push({ p: p, zero: zero, label: (p > 0 ? '+' : '') + (zero ? 0 : p).toFixed(dec) + '%' });
+    }
+    return out;
+  }
   function smooth(ctx, p){ for (let i = 1; i < p.length; i++) ctx.lineTo(p[i].x, p[i].y); }
   window.drawPayoff = function (){
     const cv = fitCanvas('spay-cv', 0.38, 230); if (!cv) return; const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
@@ -1443,7 +1467,14 @@
     const L = 58, R = 14, Tp = 14, B = 26, CW = W - L - R, CH = H - Tp - B, X = s => L + ((s - lo) / (hi - lo)) * CW, Y = v => Tp + CH - ((v - yMin) / (yMax - yMin)) * CH;
     ctx.font = '10.5px ' + MONO;
     for (let v = Math.ceil(yMin / yStep) * yStep; v <= yMax; v += yStep){ const y = Y(v); ctx.strokeStyle = (Math.abs(v) < yStep * 0.01) ? C.line2 : C.line; ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke(); ctx.fillStyle = C.muted; ctx.textAlign = 'right'; ctx.fillText(moneyK(v), L - 5, y + 3); }
-    for (let i = 0; i <= 5; i++){ const s = lo + (i / 5) * (hi - lo), x = X(s); ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke(); ctx.fillStyle = C.muted; ctx.textAlign = 'center'; ctx.fillText(Math.round(s).toLocaleString('en-IN'), x, H - 8); }
+    // X axis in PERCENT MOVE FROM SPOT — see pctTicks().
+    pctTicks(lo, hi, spot).forEach(tk => {
+      const x = X(spot * (1 + tk.p / 100));
+      ctx.strokeStyle = tk.zero ? C.line2 : C.line;
+      ctx.beginPath(); ctx.moveTo(x, Tp); ctx.lineTo(x, Tp + CH); ctx.stroke();
+      ctx.fillStyle = tk.zero ? C.dim : C.muted; ctx.textAlign = 'center';
+      ctx.fillText(tk.label, x, H - 8);
+    });
     const z = Y(0); ctx.strokeStyle = C.line2; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(L, z); ctx.lineTo(W - R, z); ctx.stroke(); ctx.setLineDash([]);
     const be = window._breakevens(pos);
     if (be){ [be.lower, be.upper].forEach(v => { if (v < lo || v > hi) return; const bx = X(v); ctx.strokeStyle = C.beLine; ctx.setLineDash([2, 4]); ctx.beginPath(); ctx.moveTo(bx, Tp); ctx.lineTo(bx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = C.warn; ctx.textAlign = 'center'; ctx.fillText(Math.round(v), bx, Tp + 10); }); }
@@ -1485,7 +1516,7 @@
     const ds = dte >= 1 ? dte.toFixed(1) + 'd' : (dte * 24).toFixed(1) + 'h'; ctx.fillStyle = C.muted; ctx.font = '10.5px ' + MONO; ctx.textAlign = 'left'; ctx.fillText('DTE ' + ds, L + 2, Tp + 11);
     ctx.fillStyle = C.dim; ctx.fillText('faint line = at expiry', L + 2, Tp + 23);
     // hover crosshair
-    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const nbi = pN.indexOf(nb); const lbl = Math.round(nb.s).toLocaleString('en-IN') + '  now ' + money(nb.p) + '  exp ' + money(nbi >= 0 ? pE[nbi] : window._expiryPnl(pos, nb.s)); ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
+    if (cv._cur != null){ const sX = lo + ((cv._cur - L) / CW) * (hi - lo); const nb = pN.reduce((b, p) => Math.abs(p.s - sX) < Math.abs(b.s - sX) ? p : b, pN[0]); const cx = X(nb.s); ctx.strokeStyle = C.hair; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(cx, Tp); ctx.lineTo(cx, Tp + CH); ctx.stroke(); ctx.setLineDash([]); ctx.beginPath(); ctx.arc(cx, Y(nb.p), 3, 0, 7); ctx.fillStyle = C.dot; ctx.fill(); const nbi = pN.indexOf(nb); const mv = (nb.s - spot) / spot * 100; const lbl = Math.round(nb.s).toLocaleString('en-IN') + ' (' + (mv > 0 ? '+' : '') + mv.toFixed(2) + '%)  now ' + money(nb.p) + '  exp ' + money(nbi >= 0 ? pE[nbi] : window._expiryPnl(pos, nb.s)); ctx.font = '11.5px ' + MONO; const tw = ctx.measureText(lbl).width + 16; let tx = cx + 8; if (tx + tw > W - 2) tx = cx - tw - 8; tx = Math.max(2, tx); ctx.fillStyle = C.tipBg; ctx.fillRect(tx, Tp + 2, tw, 18); ctx.strokeStyle = C.line2; ctx.strokeRect(tx, Tp + 2, tw, 18); ctx.fillStyle = nb.p >= 0 ? C.up : C.dn; ctx.textAlign = 'left'; ctx.fillText(lbl, tx + 7, Tp + 15); }
   };
 
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
@@ -2221,7 +2252,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, spotCacheClear, recordAllBooks, histStall, histEnd, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, spotCacheClear, recordAllBooks, histStall, histEnd, pctTicks, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
