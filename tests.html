@@ -1164,6 +1164,86 @@
       var why=F.dataTrust().why.join(' | '); S.book=''; w.remove();
       return /no SENSEX spot/.test(why) || 'trust said: '+(why||'(nothing)'); });
 
+
+    grp('HISTORY STALLS (a stopped curve must not look live)');
+    // atIST() is already defined above; reuse it so these do not depend on the wall clock
+    var HS_OPEN = atIST(2026,8,20,12,0);          // a Thursday, mid-session
+    var HS_SHUT = atIST(2026,8,22,12,0);          // a Saturday
+    function hsSeries(startSec, n, stepSec){
+      var a=[]; for (var i=0;i<n;i++) a.push([startSec+i*stepSec, 100+i, 1.5, 0, -50, 900]); return a; }
+    // Each recordAllBooks() call needs its OWN timestamp: the throttle is doing its job, and two tests
+    // sharing one clock value means the second is legitimately skipped.
+    var _hsTick = 0;
+    function hsNow(){ _hsTick++; return new Date(+HS_OPEN + _hsTick*5000); }
+    function hsReset(){ S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
+      S.hist={}; S.histSkip={}; S.peak={}; S.costPaid={}; S.orders=[]; S.book=''; S.spots={}; S.spot=0;
+      S.ltpBySym={}; S.fwd={}; S.fwdSrc={}; S.refs={}; S.scrapeGap=0; S.closedGap=0; }
+
+    t('while the market is open the axis runs to NOW, not to the last sample', function(){
+      // the bug: a book that stopped recording drew its curve to the right edge and looked current
+      var nowS=Math.round(HS_OPEN/1000);
+      var a=hsSeries(nowS-1200, 20, 10);          // 200s of data ending 1000s ago
+      var end=F.histEnd(a, HS_OPEN);
+      return end===nowS || 'axis ended at '+(nowS-end)+'s before now'; });
+    t('after the close the axis stops at the last sample instead', function(){
+      var lastS=Math.round(HS_SHUT/1000)-1200;
+      var a=hsSeries(lastS-200, 20, 10);
+      return F.histEnd(a, HS_SHUT)===a[a.length-1][0] || 'padded a closed-market axis'; });
+    t('a stalled book says how long it has been stalled', function(){
+      hsReset();
+      var nowS=Math.round(HS_OPEN/1000);
+      S.hist.SENSEX=hsSeries(nowS-900, 10, 10);   // last point ~810s ago
+      var msg=F.histStall('SENSEX', S.hist.SENSEX, HS_OPEN);
+      return /^STALLED/.test(msg) || 'said '+JSON.stringify(msg); });
+    t('and names the reason when one was recorded', function(){
+      hsReset();
+      var nowS=Math.round(HS_OPEN/1000);
+      S.hist.SENSEX=hsSeries(nowS-900, 10, 10);
+      S.histSkip.SENSEX={why:'no SENSEX spot', at:HS_OPEN-800000, n:40};
+      var msg=F.histStall('SENSEX', S.hist.SENSEX, HS_OPEN);
+      return /no SENSEX spot/.test(msg) || 'said '+JSON.stringify(msg); });
+    t('a live book is not labelled stalled', function(){
+      hsReset();
+      var nowS=Math.round(HS_OPEN/1000);
+      S.hist.SENSEX=hsSeries(nowS-50, 10, 5);     // last point 5s ago
+      return F.histStall('SENSEX', S.hist.SENSEX, HS_OPEN)==='' || 'cried stall on live data'; });
+    t('nothing is labelled stalled once the market is closed', function(){
+      hsReset();
+      S.hist.SENSEX=hsSeries(Math.round(HS_SHUT/1000)-9000, 10, 10);
+      return F.histStall('SENSEX', S.hist.SENSEX, HS_SHUT)==='' || 'cried stall after hours'; });
+
+    t('a book with no spot records WHY it skipped, instead of going quiet', function(){
+      hsReset();
+      var e=new Date(Date.now()+5*864e5);
+      S.positions=[{status:'OPEN',symbol:'SENSEX26090376900SD',optionType:'SD',strikePrice:76900,quantity:-20,
+        avgSellPrice:900,bepPrice:900,ltp:880,_pnl:400,_scraped:true,expiryDate:e.toISOString()}];
+      S.posVisible=true; S.hist.SENSEX=[];        // no spots, no quotes, nothing to price it with
+      F.recordAllBooks(hsNow());
+      var sk=S.histSkip.SENSEX||{};
+      return /no SENSEX spot/.test(sk.why||'') || 'skip reason was '+JSON.stringify(sk.why); });
+    t('a book that has gone flat keeps its curve going instead of stopping dead', function(){
+      hsReset();
+      var nowS=Math.round(HS_OPEN/1000);
+      S.hist.SENSEX=hsSeries(nowS-600, 5, 10);    // it traded earlier today
+      S.positions=[];                              // and is flat now
+      var before=S.hist.SENSEX.length;
+      F.recordAllBooks(hsNow());
+      var after=S.hist.SENSEX.length, last=S.hist.SENSEX[after-1];
+      return (after===before+1 && last[2]===0 && last[4]===0)
+        || 'points '+before+'->'+after+' last '+JSON.stringify(last); });
+    t('a book that never traded is not padded with a fake flat line', function(){
+      hsReset(); S.positions=[]; S.hist={NIFTY:hsSeries(Math.round(HS_OPEN/1000)-600,5,10)};
+      F.recordAllBooks(hsNow());
+      return !(S.hist.SENSEX||[]).length || 'invented '+S.hist.SENSEX.length+' SENSEX points'; });
+    t('a recording skip clears itself once the book records again', function(){
+      hsReset();
+      var nowS=Math.round(HS_OPEN/1000);
+      S.hist.SENSEX=hsSeries(nowS-600, 5, 10);
+      S.histSkip.SENSEX={why:'no SENSEX spot', at:1, n:9};
+      S.positions=[];
+      F.recordAllBooks(hsNow());
+      return !(S.histSkip.SENSEX||{}).why || 'still claims: '+S.histSkip.SENSEX.why; });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');

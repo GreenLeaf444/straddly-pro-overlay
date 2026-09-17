@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.5
+// @version      6.6
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, closed: null, closedAt: 0, closedGap: 0, colsFrom: '', ordersTotal: null, ordersGap: 0, ordersNoLot: 0, ordersDup: 0, ordersFrom: '', fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, closed: null, closedAt: 0, closedGap: 0, colsFrom: '', histSkip: {}, ordersTotal: null, ordersGap: 0, ordersNoLot: 0, ordersDup: 0, ordersFrom: '', fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -93,6 +93,11 @@
       scrapeGap: Store.scrapeGap, portalClosedRows: Store.portalClosed, closedGap: Store.closedGap,
       booked: { used: allRealised(), source: realisedSource(), fromPortal: Store.closed, fromInference: Store.realised },
       columnsReadFrom: Store.colsFrom,
+      history: (function(){ const o = {}, now = Math.round(Date.now() / 1000);
+        underlyings().forEach(u => { const h = Store.hist[u] || [], sk = Store.histSkip[u] || {};
+          o[u] = { points: h.length, since: h.length ? hhmm(h[0][0]) : null, last: h.length ? hhmm(h[h.length - 1][0]) : null,
+                   ageSec: h.length ? now - h[h.length - 1][0] : null, stalledBecause: sk.why || null, skips: sk.n || 0 }; });
+        return o; })(),
       usingTable: tableTrusted(), posVisible: Store.posVisible,
       quoteMinusTableMs: Store.quoteAt - Store.tableAt, spots: Store.spots };
     try { console.table(rows); } catch (e) {}
@@ -761,7 +766,8 @@
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
     const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.costPaid = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
-    const last = a[a.length - 1]; if (last && now - last[0] * 1000 < HIST_MS) return;
+    const last = a[a.length - 1], gap = last ? now - last[0] * 1000 : Infinity;
+    if (gap >= 0 && gap < HIST_MS) return;      // same rule: a backwards clock must not freeze the series
     a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(bookRealised(book)),
             Math.round(vega || 0), Math.round(theta || 0)]);
     if (a.length > HIST_MAX) a.splice(0, a.length - HIST_MAX);
@@ -1484,6 +1490,20 @@
 
   // ══ MTM CURVE (dual axis: ₹ left, net delta right) ═════════════════════════
   const MIN_SPAN = 1800, GAP_S = 45, Y_FLOOR = 1000; // 30-min minimum frame; don't draw across recording gaps
+  // Both charts used to end their axis at the LAST SAMPLE, so a book that stopped recording drew a curve
+  // running all the way to the right edge - indistinguishable from one that is up to date. While the market
+  // is open the right edge is NOW, so a stall shows as the blank space it actually is.
+  function histEnd(a, nowMs){
+    const last = a[a.length - 1][0], now = Math.round((nowMs || Date.now()) / 1000);
+    return marketState(nowMs) === 'OPEN' ? Math.max(last, now) : last;
+  }
+  function histStall(book, a, nowMs){
+    if (marketState(nowMs) !== 'OPEN' || !a.length) return '';
+    const age = Math.round((nowMs || Date.now()) / 1000) - a[a.length - 1][0];
+    if (age <= Math.max(30, GAP_S)) return '';
+    const sk = (Store.histSkip || {})[book];
+    return 'STALLED ' + fmtAge(age * 1000) + (sk && sk.why ? ' — ' + sk.why : '');
+  }
   window.drawMtm = function (){
     const cv = fitCanvas('spay-mtm-cv', 0.22, 150); if (!cv) return;
     const ctx = cv.getContext('2d'), W = cv._W, H = cv._H;
@@ -1491,7 +1511,7 @@
     if (a.length < 2){ ctx.fillStyle = C.muted; ctx.font = '12px ' + MONO; ctx.textAlign = 'center'; ctx.fillText(a.length ? 'recording…' : 'day P&L starts recording now', W / 2, H / 2); return; }
     const L2 = 60, R = 16, Tp = 12, B = 21, CW = W - L2 - R, CH = H - Tp - B;
     // left-anchored, minimum 30-minute frame so the curve grows into a stable window instead of rescaling every tick
-    const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
+    const t0 = a[0][0], span = Math.max(MIN_SPAN, histEnd(a) - t0);
     const X = t => L2 + ((t - t0) / span) * CW;
     // Raw day P&L is a tick-by-tick series and reads as noise. Smooth it for DISPLAY with a centred moving
     // average — the stored samples and the hover readout stay raw, so no number is ever fabricated.
@@ -1865,7 +1885,7 @@
     ctx.font = '9.5px ' + MONO;
     if (a.length < 2){ ctx.fillStyle = C.dim; ctx.textAlign = 'left'; ctx.fillText(label, 6, 14); return; }
     const L = 8, R = 8, Tp = 26, B = 8, CW = W - L - R, CH = H - Tp - B;
-    const t0 = a[0][0], span = Math.max(MIN_SPAN, a[a.length - 1][0] - t0);
+    const t0 = a[0][0], span = Math.max(MIN_SPAN, histEnd(a) - t0);
     const X = t => L + ((t - t0) / span) * CW;
     const v = a.map(p => p[idx] || 0);
     let lo = Math.min(0, ...v), hi = Math.max(0, ...v);
@@ -1893,6 +1913,9 @@
     ctx.fillStyle = C.muted; ctx.textAlign = 'left'; ctx.font = '9.5px ' + MONO; ctx.fillText(label, L, 13);
     ctx.fillStyle = C.text; ctx.textAlign = 'right'; ctx.font = '15px ' + MONO;
     ctx.fillText(fmt(last), W - R, 15);
+    const stall = histStall(activeBook(), a);
+    if (stall){ ctx.fillStyle = C.warn; ctx.textAlign = 'left'; ctx.font = '8.5px ' + MONO;
+      ctx.fillText(stall.length > 34 ? stall.slice(0, 33) + '…' : stall, L, H - 3); }
   }
   window.drawGreekMinis = function (){
     drawMini('gm-d', 2, 'DELTA', 'rgba(77,155,255,1)', v => (v >= 0 ? '+' : '') + v.toFixed(1));
@@ -2058,19 +2081,44 @@
     const sig = window._allLegs().map(l => l.symbol + ':' + l.ltp).join('|');
     if (sig && sig !== _markSig){ _markSig = sig; Store.tickAt = Date.now(); }
   }
-  function recordAllBooks(){
-    if (marketState() !== 'OPEN') return; // don't pad the curve with a flat after-hours tail
-    if (Date.now() - _histTick < HIST_MS - 250) return; _histTick = Date.now();
+  // Why a book stopped recording. Five different paths used to drop a sample and leave no trace at all -
+  // including a bare catch{} - so one book's curve could die mid-session while the other kept going and
+  // nothing anywhere said so. The chart then showed a stale line that looked perfectly live.
+  function histSkip(u, why){
+    const s = Store.histSkip[u] || (Store.histSkip[u] = { why: '', at: 0, n: 0 });
+    if (!why){ s.why = ''; s.at = 0; s.n = 0; return; }
+    if (s.why !== why){ s.why = why; s.at = Date.now(); s.n = 0; console.warn('[spay] history stalled for ' + u + ': ' + why); }
+    s.n++;
+  }
+  function recordAllBooks(nowMs){
+    if (marketState(nowMs) !== 'OPEN') return; // don't pad the curve with a flat after-hours tail
+    // A clock that moves BACKWARDS (an NTP correction, or an injected one) makes "time since last sample"
+    // negative, and a plain less-than then blocks every tick until real time catches up - recording frozen
+    // with no sign of it. Only a forward gap inside the window may throttle.
+    const _t = +(nowMs || Date.now()), _since = _t - _histTick;
+    if (_since >= 0 && _since < HIST_MS - 250) return;
+    _histTick = _t;
     const all = window._allLegs();
     underlyings().forEach(u => {
-      const lg = all.filter(l => l.under === u); if (!lg.length) return;
-      const sp = Store.spots[u] || spotFor(u); if (!sp) return;
+      const lg = all.filter(l => l.under === u);
+      if (!lg.length){
+        // A book that has gone flat is not missing data, it IS flat - zero greeks, and a day P&L that sits
+        // at whatever was booked. Recording nothing made the curve stop dead mid-session, which reads as a
+        // fault and hides a genuine stall behind an expected one.
+        if (!(Store.hist[u] || []).length){ histSkip(u, 'nothing traded in this book yet'); return; }
+        histPush(u, 0, 0, 0, 0); histSkip(u, '');
+        return;
+      }
+      const sp = Store.spots[u] || spotFor(u);
+      if (!sp){ histSkip(u, 'no ' + u + ' spot'); return; }
       try {
         const mtmU = lg.reduce((s, p) => s + p.pnl, 0), dayU = mtmU + bookRealised(u);
         if (!(Store.peak[u] > dayU)) Store.peak[u] = dayU;   // intraday high-water mark of day P&L
         const G = window._netGreeks(lg, sp);
+        if (!isFinite(G.nD) || !isFinite(mtmU)){ histSkip(u, 'greeks did not solve'); return; }
         histPush(u, mtmU, G.nD, G.nV, G.nT);
-      } catch (e) {}
+        histSkip(u, '');
+      } catch (e){ histSkip(u, 'greeks threw: ' + ((e && e.message) || e)); }
     });
   }
   window.refreshAll = function (){
@@ -2155,7 +2203,9 @@
     set('spay-dbg', (Store.dbg || '') + (mAge >= 0 ? ' · mark ' + fmtAge(mAge) : ''));
     positionPanel();
     const mn = $id('spay-mnow');
-    if (mn){ const h = Store.hist[book] || []; mn.textContent = h.length ? h.length + ' pts · since ' + hhmm(h[0][0]) + ' · smoothed' : ''; }
+    if (mn){ const h = Store.hist[book] || [], st = h.length ? histStall(book, h) : '';
+      mn.textContent = h.length ? (h.length + ' pts · since ' + hhmm(h[0][0]) + (st ? ' · ' + st : ' · smoothed')) : '';
+      mn.style.color = st ? C.warn : ''; }
     window.drawPayoff(); window.drawMtm(); window.drawGreekMinis();
   };
 
@@ -2171,7 +2221,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, spotCacheClear, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, spotCacheClear, recordAllBooks, histStall, histEnd, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
