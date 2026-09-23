@@ -1278,12 +1278,139 @@
     t('no spot means no ticks rather than a divide by zero', function(){
       return F.pctTicks(0,0,0).length===0 || 'produced ticks with no spot'; });
 
+
+    grp('MULTIPLE SCRIPS (one book must never leak into another)');
+    function msIns(u, strike, kind){
+      var d=new Date(Date.now()+6*864e5);
+      var MN=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+      var MC=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+      return u+' '+MN[d.getMonth()]+' '+strike+' '+kind+' '+('0'+d.getDate()).slice(-2)+' '+MC[d.getMonth()]; }
+    function msRow(u,strike,kind,qty,avg,ltp,pnl){
+      return ['','MIS',msIns(u,strike,kind),qty,'Exit',avg.toFixed(2),ltp.toFixed(2),'₹'+pnl.toFixed(2)]; }
+    function msTable(rows){
+      var w=document.createElement('div'); w.id='mstest';
+      var hdr=document.createElement('div');
+      hdr.innerHTML='<span>NIFTY 50</span> <span>Spot:</span> <span>23,513.50</span>';
+      w.appendChild(hdr);
+      var cap=document.createElement('h3'); cap.textContent='Open Positions ('+rows.length+')'; w.appendChild(cap);
+      var t=document.createElement('table');
+      t.innerHTML='<thead><tr>'+OPEN_H.map(function(h){return '<th>'+h+'</th>';}).join('')+'</tr></thead><tbody>'+
+        rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+c+'</td>';}).join('')+'</tr>';}).join('')+'</tbody>';
+      w.appendChild(t); document.body.insertBefore(w,document.body.firstChild); return w; }
+    function msReset(){ S.positions=[]; S.posVisible=false; S.prevLegs={}; S.realised={}; S.closed=null;
+      S.closedGap=0; S.scrapeGap=0; S.costPaid={}; S.hist={}; S.histSkip={}; S.orders=[]; S.book='';
+      S.spots={}; S.spot=0; S.ltpBySym={}; S.fwd={}; S.fwdSrc={}; S.refs={};
+      S.unknownRows=[]; S.noLotBooks=[]; F.spotCacheClear(); }
+
+    t('FINNIFTY is not filed under NIFTY', function(){
+      // the regex had no word boundary, so 'NIFTY' matched the NIFTY inside FI-NIFTY
+      var m=msIns('FINNIFTY',23500,'CE').match(F.INSTR_RE);
+      return (m && F.canonUnder(m[1])==='FINNIFTY') || 'read as '+(m?F.canonUnder(m[1]):'NO MATCH'); });
+    t('MIDCPNIFTY is not filed under NIFTY', function(){
+      var m=msIns('MIDCPNIFTY',12800,'PE').match(F.INSTR_RE);
+      return (m && F.canonUnder(m[1])==='MIDCPNIFTY') || 'read as '+(m?F.canonUnder(m[1]):'NO MATCH'); });
+    t('BANKEX is recognised instead of being dropped', function(){
+      var m=msIns('BANKEX',55000,'CE').match(F.INSTR_RE);
+      return (m && F.canonUnder(m[1])==='BANKEX') || 'read as '+(m?F.canonUnder(m[1]):'NO MATCH'); });
+    t('NIFTY BANK and BANKNIFTY are the same book', function(){
+      return F.canonUnder('NIFTY BANK')==='BANKNIFTY' && F.canonUnder('BANKNIFTY')==='BANKNIFTY'
+        || F.canonUnder('NIFTY BANK')+' vs '+F.canonUnder('BANKNIFTY'); });
+    t('plain NIFTY still reads as NIFTY', function(){
+      var m=msIns('NIFTY',23500,'CE').match(F.INSTR_RE);
+      return (m && F.canonUnder(m[1])==='NIFTY') || 'read as '+(m?F.canonUnder(m[1]):'NO MATCH'); });
+    t('a canonical name carrying digits still parses back out of a symbol', function(){
+      var x=F.parseSymbol('NIFTYNXT50260929'+'68000'+'CE');
+      return (x && x.underlying==='NIFTYNXT50' && x.strike===68000) || 'got '+JSON.stringify(x); });
+
+    t('five scrips give five rows in four books', function(){
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455), msRow('NIFTY',23200,'PE',-65,58,60.2,-143),
+                     msRow('FINNIFTY',23500,'CE',-65,70,66,260), msRow('MIDCPNIFTY',12800,'PE',-120,40,37.5,300),
+                     msRow('BANKEX',55000,'CE',-30,210,198,360)]);
+      F.scrapePositions(true); var nRows=S.positions.length, books=F.underlyings().slice().sort(); w.remove();
+      return (nRows===5 && books.join(',')==='BANKEX,FINNIFTY,MIDCPNIFTY,NIFTY')
+        || nRows+' rows, books '+books.join(','); });
+    t('a FINNIFTY leg cannot collide with a NIFTY leg at the same strike and expiry', function(){
+      // both were rebuilt as the identical symbol, and the de-dupe then threw one away
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455), msRow('FINNIFTY',23500,'CE',-65,70,66,260)]);
+      F.scrapePositions(true); var syms=S.positions.map(function(p){return p.symbol;}); w.remove();
+      return (syms.length===2 && syms[0]!==syms[1]) || 'symbols '+JSON.stringify(syms); });
+    t('a foreign strike never enters another book', function(){
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455), msRow('MIDCPNIFTY',12800,'PE',-120,40,37.5,300)]);
+      F.scrapePositions(true); S.book='NIFTY';
+      var ks=window._bsLegs().map(function(l){return l.strike;}); S.book=''; w.remove();
+      return ks.indexOf(12800)<0 || 'NIFTY book carried strikes '+ks.join(','); });
+    t('and neither does its P&L', function(){
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455), msRow('MIDCPNIFTY',12800,'PE',-120,40,37.5,300)]);
+      F.scrapePositions(true); S.book='NIFTY';
+      var mtm=window._bookMTM(); S.book=''; w.remove();
+      return Math.abs(mtm-455)<0.01 || 'NIFTY book MTM '+mtm+' (expected 455, not 755)'; });
+
+    t('a bare Spot: label is not handed to a book the header does not name', function(){
+      // FINNIFTY and NIFTY trade close enough that every plausibility check passed on the wrong spot
+      msReset(); F.spotCacheClear();
+      var w=msTable([msRow('FINNIFTY',23500,'CE',-65,70,66,260)]);
+      F.scrapePositions(true); var sp=F.spotFor('FINNIFTY'); w.remove();
+      return sp===0 || 'FINNIFTY took '+sp+' off the NIFTY header'; });
+    t('the book the header DOES name still gets it', function(){
+      msReset(); F.spotCacheClear();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455)]);
+      F.scrapePositions(true); var sp=F.spotFor('NIFTY'); w.remove();
+      return Math.abs(sp-23513.50)<0.01 || 'NIFTY spot came out '+sp; });
+    t('a book with no known lot size is NAMED, not costed on a guess', function(){
+      msReset();
+      var w=msTable([msRow('BANKEX',55000,'CE',-30,210,198,360)]);
+      F.scrapePositions(true); var named=S.noLotBooks.slice(); w.remove();
+      return named.join(',')==='BANKEX' || 'named '+JSON.stringify(named); });
+    t('brokerage is not invented when the lot size is unknown', function(){
+      // the old fallback was lots = QUANTITY, which multiplied brokerage by the whole lot factor
+      msReset();
+      var w=msTable([msRow('BANKEX',55000,'CE',-30,210,198,360)]);
+      F.scrapePositions(true); S.book='BANKEX';
+      var c=F.costOfEntry(window._bsLegs()); S.book=''; w.remove();
+      return c.brok===0 || 'charged '+c.brok.toFixed(2)+' brokerage on an unknown lot size'; });
+    t('a known book is still costed normally alongside it', function(){
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455), msRow('BANKEX',55000,'CE',-30,210,198,360)]);
+      F.scrapePositions(true); S.book='NIFTY';
+      var c=F.costOfEntry(window._bsLegs()); S.book=''; w.remove();
+      return c.brok===8 || 'NIFTY brokerage came out '+c.brok; });
+    t('an instrument we cannot identify at all is reported, not dropped in silence', function(){
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455), msRow('RELIANCE',1400,'CE',-500,30,28,1000)]);
+      F.scrapePositions(true); var un=S.unknownRows.slice(); w.remove();
+      return (un.length===1 && /RELIANCE/.test(un[0])) || 'reported '+JSON.stringify(un); });
+    t('a clean book reports nothing unrecognised', function(){
+      msReset();
+      var w=msTable([msRow('NIFTY',23500,'CE',-65,62,55,455)]);
+      F.scrapePositions(true); var un=S.unknownRows.slice(); w.remove();
+      return un.length===0 || 'cried wolf: '+JSON.stringify(un); });
+
     var sum=document.getElementById('sum');
     sum.className = fail ? 'bad' : 'ok';
     sum.textContent = fail ? (fail+' FAILED of '+(pass+fail)+' :: '+failed[0]) : ('ALL '+pass+' TESTS PASSED');
     window.__RESULT={pass:pass, fail:fail, failed:failed};
   }
-  (function wait(){ if(window.BS && window.SPAY && window.SPAY._fn) return run(); setTimeout(wait,40); })();
+  // If the userscript throws on load, SPAY._fn never appears and this poll spun forever showing a blank
+  // page - a boot failure that looked exactly like a slow load. Say so instead. (A TDZ on a lazily-needed
+  // constant did precisely this and cost a debugging round trip.)
+  window.addEventListener('error', function(e){ window.__BOOTERR = (e && e.message) || String(e); });
+  var _waited = 0;
+  (function wait(){
+    if(window.BS && window.SPAY && window.SPAY._fn) return run();
+    _waited += 40;
+    if (_waited > 4000){
+      var box=document.getElementById('sum');
+      box.className='bad';
+      box.textContent='SCRIPT FAILED TO BOOT :: ' + (window.__BOOTERR || 'SPAY._fn never appeared - check the console');
+      window.__RESULT={pass:0, fail:1, failed:['boot: '+(window.__BOOTERR||'SPAY._fn never appeared')]};
+      return;
+    }
+    setTimeout(wait,40);
+  })();
 })();
 </script>
 </body></html>

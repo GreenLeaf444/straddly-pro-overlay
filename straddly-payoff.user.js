@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Straddly Payoff & Risk (mini)
 // @namespace    http://tampermonkey.net/
-// @version      6.7
+// @version      6.8
 // @description  Minimal overlay for the Straddly CloudFront trade page — payoff + greeks + risk. Pops out into its own window for a second monitor. Reads positions from the page + self-fetches touchline for spot.
 // @author       Ansh
 // @match        https://dwbjchneyogha.cloudfront.net/*
@@ -57,7 +57,7 @@
   // The captured Authorization header lives in this closure ONLY. It is deliberately kept off `Store`,
   // because Store is exposed as window.SPAY and anything running on the broker's page could read it there.
   let AUTH = '';
-  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, closed: null, closedAt: 0, closedGap: 0, colsFrom: '', histSkip: {}, ordersTotal: null, ordersGap: 0, ordersNoLot: 0, ordersDup: 0, ordersFrom: '', fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
+  const Store = { positions: [], ltpById: {}, ltpBySym: {}, chain: {}, margin: null, user: null, spot: 0, spots: {}, book: '', hist: {}, histDay: '', realised: {}, costPaid: {}, peak: {}, prevLegs: {}, posVisible: false, lastUpdate: 0, markAt: 0, tickAt: 0, tableAt: 0, quoteAt: 0, portalMTM: null, portalOpen: null, portalClosed: null, scrapeGap: 0, mismatch: 0, closed: null, closedAt: 0, closedGap: 0, colsFrom: '', histSkip: {}, unknownRows: [], noLotBooks: [], ordersTotal: null, ordersGap: 0, ordersNoLot: 0, ordersDup: 0, ordersFrom: '', fwd: {}, fwdSrc: {}, refs: {}, notes: {}, scale: 1.15, alertBeat: 0, alertBlock: [], alertErr: null, orders: [], ordersAt: 0, dbg: '', _l: [], onUpdate(f){ this._l.push(f); }, _emit(){ this.lastUpdate = Date.now(); this._l.forEach(f => { try { f(); } catch (e) {} }); } };
   window.SPAY = Store; // NOTE: intentionally carries no auth token — see AUTH above
   // Run SPAY.diag() in the console to compare, per leg, what we computed against what the portal printed.
   Store.diag = function (){
@@ -103,7 +103,19 @@
     try { console.table(rows); } catch (e) {}
     console.log('[SPAY.diag]', out); return out;
   }; // NOTE: intentionally carries no auth token — see AUTH above
-  function parseSymbol(s){ if (!s) return null; const m = s.match(/^([A-Z]+?)(\d{2})(\d{2})(\d{2})(\d+)(CE|PE|SD)$/); if (!m) return null; return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] }; }
+  // Match the underlying against the KNOWN set rather than a lazy [A-Z]+? run: a canonical name can carry
+  // digits (NIFTYNXT50, SENSEX50), which a letters-only prefix could never capture.
+  // Built LAZILY. parseSymbol sits far above the underlying table, so evaluating this at definition time
+  // reached CANON_UNDER before its declaration and threw on load - the whole panel never booted. Ordering
+  // is not a thing to keep remembering; take the dependency at call time instead.
+  let _symRe = null;
+  const symRe = () => _symRe || (_symRe = new RegExp('^(' + CANON_UNDER.join('|') + ')(\\d{2})(\\d{2})(\\d{2})(\\d+)(CE|PE|SD)$'));
+  function parseSymbol(s){
+    if (!s) return null;
+    const m = String(s).match(symRe());
+    if (!m) return null;
+    return { underlying: m[1], expiry: new Date(2000 + +m[2], +m[3] - 1, +m[4], CLOSE_H, CLOSE_M, 0), strike: +m[5], type: m[6] };
+  }
   // CloudFront build: same-origin /api/data/touchline (live quotes) + getuserdetails. Positions come via socket → we DOM-scrape them.
   function ingest(url, body){ if (!url || !body) return; let j; try { j = JSON.parse(body); } catch (e) { return; } const d = j && j.data !== undefined ? j.data : j; try {
     if (/\/(data\/)?[Tt]ouchline/i.test(url) && Array.isArray(d)) {
@@ -137,7 +149,28 @@
       margin: num(o.marginUsed), time: o.time || o.orderTime || null
     };
   }
+  // LOT SIZES ARE DELIBERATELY INCOMPLETE. Only what has been checked goes in here: a guessed lot size is
+  // silently wrong in brokerage, in margin and in every per-lot number on the panel. A book whose lot size
+  // is missing gets NAMED on screen instead of being costed against a made-up one.
   const LOTS = { NIFTY: 65, BANKNIFTY: 30, SENSEX: 20 };
+  // How the portal spells each underlying, and the canonical name we file it under. ORDER MATTERS: the
+  // alternation is first-match-wins, so every name that CONTAINS a shorter one must come before it.
+  const UNDERLYING_NAMES = [
+    ['NIFTY NEXT 50', 'NIFTYNXT50'], ['NIFTYNEXT50', 'NIFTYNXT50'], ['NIFTYNXT50', 'NIFTYNXT50'],
+    ['NIFTY MIDCAP SELECT', 'MIDCPNIFTY'], ['MIDCPNIFTY', 'MIDCPNIFTY'], ['MIDCAP NIFTY', 'MIDCPNIFTY'],
+    ['NIFTY FINANCIAL SERVICES', 'FINNIFTY'], ['NIFTY FIN SERVICE', 'FINNIFTY'], ['FINNIFTY', 'FINNIFTY'],
+    ['BANKNIFTY', 'BANKNIFTY'], ['NIFTY BANK', 'BANKNIFTY'],
+    ['SENSEX 50', 'SENSEX50'], ['SENSEX50', 'SENSEX50'], ['BANKEX', 'BANKEX'],
+    ['SENSEX', 'SENSEX'], ['NIFTY', 'NIFTY']
+  ];
+  const CANON_UNDER = (function(){ const seen = {}, out = [];
+    UNDERLYING_NAMES.forEach(p => { if (!seen[p[1]]){ seen[p[1]] = 1; out.push(p[1]); } });
+    return out.sort((a, b) => b.length - a.length); })();   // longest first, for the symbol parser
+  function canonUnder(raw){
+    const t = String(raw || '').toUpperCase().replace(/\s+/g, ' ').trim();
+    for (let i = 0; i < UNDERLYING_NAMES.length; i++) if (UNDERLYING_NAMES[i][0] === t) return UNDERLYING_NAMES[i][1];
+    return t.replace(/\s+/g, '');
+  }
   const STRIKE_STEP = { NIFTY: 50, BANKNIFTY: 100, SENSEX: 100 }; // confirm with the broker before trusting // confirm against the broker before trusting sizing
   const isWorking = o => /open|pending|trigger|placed/.test(o.status) && !/cancel|reject|execut|complet/.test(o.status);
   const IDX = { NIFTY: 'NIFTY', BANKNIFTY: 'NIFTY BANK', SENSEX: 'SENSEX' };
@@ -201,6 +234,25 @@
     BANKNIFTY:  ['BANKNIFTY', 'BANK NIFTY', 'NIFTY BANK'],
     SENSEX:     ['SENSEX', 'BSE SENSEX', 'SENSEX 30', 'S&P BSE SENSEX']
   };
+  // A bare 'Spot:' label belongs to whichever index the page header NAMES. Handing it to any book that
+  // happens to have plausible strikes gave FINNIFTY the NIFTY spot - the two trade close enough that every
+  // sanity check passed, and FINNIFTY's greeks were then built on another index's level.
+  function labelledFor(el, under){
+    let n = el, hops = 0;
+    while (n && hops++ < 4){
+      const t = (n.textContent || '').toUpperCase().replace(/\s+/g, ' ');
+      let mine = false, other = false;
+      for (let i = 0; i < UNDERLYING_NAMES.length; i++){
+        if (t.indexOf(UNDERLYING_NAMES[i][0]) < 0) continue;
+        if (UNDERLYING_NAMES[i][1] === under){ mine = true; break; }   // our own name wins wherever it appears
+        other = true;
+      }
+      if (mine) return true;
+      if (other) return false;
+      n = n.parentElement;
+    }
+    return false;   // nothing named it: do not guess
+  }
   function indexSpotDOM(under){
     const numIn = el => { const m = (el && el.textContent || '').trim().match(/(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{4,6}(?:\.\d+)?)/);
       if (!m) return 0; const v = parseFloat(m[1].replace(/,/g, '')); return (v > 1000 && v < 200000) ? v : 0; };
@@ -213,12 +265,15 @@
       // A bare 'SPOT' label is only usable when we can CHECK the number against this book's own strikes.
       const anchored = Store.positions.some(p => { const x = parseSymbol(p.symbol); return x && x.underlying === under; });
       const passes = anchored ? [named, ['SPOT']] : [named];
+      const bareIdx = passes.length - 1;   // the 'SPOT' pass, if there is one
       const leaves = document.querySelectorAll('span,div,b,strong,td,th,p');
-      for (const wants of passes){
+      for (let pi = 0; pi < passes.length; pi++){
+        const wants = passes[pi], bare = anchored && pi === bareIdx;
         for (let i = 0; i < leaves.length; i++){
           const el = leaves[i]; if (el.childElementCount !== 0) continue;
           const t = el.textContent.trim().toUpperCase().replace(':', '');
           if (wants.indexOf(t) < 0) continue;
+          if (bare && !labelledFor(el, under)) continue;   // that 'Spot:' belongs to another index
           const probes = [el.nextElementSibling, el.previousElementSibling].concat(el.parentElement ? Array.from(el.parentElement.children) : []);
           for (const c of probes){
             if (!c || c === el) continue;
@@ -323,11 +378,14 @@
   }
   // The four levels a trader wants side by side: cash, future, the portal's implied future, and our own
   // parity-implied synthetic. Seeing all four makes the basis explicit and cross-checks IF against parity.
-  let _refsAt = 0;
+  const _refsAt = {};   // per BOOK: one shared timestamp handed book two book one's stale refs
   function refsFor(under){
     const cur = Store.refs[under];
-    if (cur && Date.now() - _refsAt < 1000) return cur;
-    _refsAt = Date.now();
+    // A SINGLE shared timestamp meant that once both books had been seen, whichever was asked for second
+    // inside the same second got the other's throttle and returned its own stale refs. Same single-slot
+    // mistake as the DOM spot scan cache.
+    if (cur && Date.now() - (_refsAt[under] || 0) < 1000) return cur;
+    _refsAt[under] = Date.now();
     const o = { spot: Store.spots[under] || 0, fut: headerNum(/^Fut:?$/i, under),
                 iff: headerNum(/^IF:?$/i, under), synth: parityFwd(under) };
     Store.refs[under] = o; return o;
@@ -394,7 +452,16 @@
     _closedCache.set(t, r); return r;
   }
   const MON = { JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12' };
-  const INSTR_RE = /(NIFTY BANK|BANKNIFTY|SENSEX|NIFTY)\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+(\d{4,6})\s*(CE|PE|SD)/i;
+  // The \b is LOAD-BEARING. Without it the 'NIFTY' alternative matched the NIFTY inside FINNIFTY and
+  // MIDCPNIFTY, so those legs were filed under NIFTY: priced against NIFTY's spot, drawn on NIFTY's payoff,
+  // and - because the symbol is rebuilt as underlying+expiry+strike+type - a FINNIFTY 23500 CE came out
+  // byte-identical to a real NIFTY 23500 CE of the same expiry, where the de-dupe then dropped one of them.
+  const MONTH_ALT = 'JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC';
+  const UND_ALT = UNDERLYING_NAMES.map(p => p[0].replace(/ /g, '\\s+')).join('|');
+  const INSTR_RE = new RegExp('\\b(' + UND_ALT + ')\\s+(' + MONTH_ALT + ')\\s+(\\d{3,6})\\s*(CE|PE|SD)\\b', 'i');
+  // Shaped like an option row, but an underlying we do not know. Skipping these in silence is how a whole
+  // book could fail to exist on the panel while the portal was happily showing it.
+  const OPTLIKE_RE = new RegExp('\\b(' + MONTH_ALT + ')\\s+(\\d{3,6})\\s*(CE|PE|SD)\\b', 'i');
   // MutationObserver beats polling on two counts: it fires the moment the portal writes a new LTP/P&L,
   // and it keeps firing when the portal tab is in the BACKGROUND (timers there get throttled to ~1s by Chrome).
   const OBS = { tables: [], mo: null, last: 0, dirty: false, hits: 0, syncs: 0 }; window.__SPAY_OBS = OBS;
@@ -518,7 +585,7 @@
         }
         if (!side) side = /\bBUY\b/i.test(txt) ? 'BUY' : /\bSELL\b/i.test(txt) ? 'SELL' : null;
         if (!side) return;                       // a fill whose side we cannot read cannot be costed
-        const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, '');
+        const und = canonUnder(m[1]);
         const yr = new Date().getFullYear(), mo = MON[m[2].toUpperCase()];
         const sym = und + (yr % 100) + mo + day + (+m[3]) + m[4].toUpperCase();
         const q = Math.round(qty) || 0, lot = LOTS[und] || 0;
@@ -560,11 +627,16 @@
     try { document.querySelectorAll('table, mat-table, [role="table"]').forEach(t => { if (isClosedTable(t)) closedTbls.push(t); }); } catch (e) {}
     if (scoped) closedTbls.forEach(t => { if (scope.indexOf(t) < 0) scope.push(t); });
     const rows = []; scope.forEach(sc => { rows.push(...sc.querySelectorAll('tr, mat-row, [role="row"]')); });
-    const out = [], rects = [], tables = [], closedRows = []; const yr = new Date().getFullYear();
+    const out = [], rects = [], tables = [], closedRows = [], unknown = []; const yr = new Date().getFullYear();
     rows.forEach(tr => {
       const cells = [...tr.querySelectorAll('td, mat-cell, [role="cell"], th')]; if (cells.length < 4) return;
       let ii = -1, m = null; for (let i = 0; i < cells.length; i++){ const mm = cells[i].textContent.match(INSTR_RE); if (mm){ ii = i; m = mm; break; } }
-      if (ii < 0) return;
+      if (ii < 0){
+        // shaped like an option but an underlying we do not know - record it so the panel can say so
+        for (let i = 0; i < cells.length; i++){ const t = cells[i].textContent.trim();
+          if (OPTLIKE_RE.test(t) && unknown.indexOf(t) < 0 && unknown.length < 6){ unknown.push(t); break; } }
+        return;
+      }
       const rr = tr.getBoundingClientRect(); if (rr.width > 100 && rr.height > 4) rects.push(rr);
       const tbl = (tr.closest && tr.closest('table, mat-table, [role="table"]')) || tr.parentElement; if (tbl && tables.indexOf(tbl) < 0) tables.push(tbl);
       const dayM = cells[ii].textContent.match(/\b(\d{1,2})\s+[A-Za-z]{3}\b/); const day = dayM ? ('0' + dayM[1]).slice(-2) : '01';
@@ -592,7 +664,7 @@
         csrc = (map && map.n !== cells.length) ? 'position (header ' + map.n + ' vs row ' + cells.length + ')' : 'position';
       }
       qty = Math.round(qty || 0);
-      const symC = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, '') + (yr % 100) + MON[m[2].toUpperCase()] + day + (+m[3]) + m[4].toUpperCase();
+      const symC = canonUnder(m[1]) + (yr % 100) + MON[m[2].toUpperCase()] + day + (+m[3]) + m[4].toUpperCase();
       // qty 0 under the portal's own "Closed Positions" heading = a booked trade, with its P&L printed on it
       if (!qty){ if (tbl && isClosedTable(tbl) && pnl != null && isFinite(pnl)) closedRows.push({ sym: symC, pnl: pnl }); return; }
       Store.colsFrom = csrc;
@@ -601,7 +673,7 @@
       if (pnl == null) return;
       if (avg == null) avg = 0;
       if (ltp == null) ltp = 0;
-      const und = m[1].toUpperCase().replace('NIFTY BANK', 'BANKNIFTY').replace(/\s+/g, ''), mo = MON[m[2].toUpperCase()], strike = +m[3], type = m[4].toUpperCase();
+      const und = canonUnder(m[1]), mo = MON[m[2].toUpperCase()], strike = +m[3], type = m[4].toUpperCase();
       const sym = und + (yr % 100) + mo + day + strike + type;
       out.push({ status: 'OPEN', symbol: sym, symbolId: null, optionType: type, strikePrice: strike, quantity: qty, avgSellPrice: qty < 0 ? avg : 0, avgBuyPrice: qty > 0 ? avg : 0, bepPrice: avg, ltp: ltp, _pnl: pnl, _scraped: true, expiryDate: new Date(yr, +mo - 1, +day, CLOSE_H, CLOSE_M, 0).toISOString() });
     });
@@ -619,6 +691,12 @@
       }); } catch (e) {}
       Store.anchor = { left: left + sx, top: bottom + sy, width: right - left, at: Date.now() };
     }
+    if (onPosView) Store.unknownRows = unknown;
+    // A book whose lot size we have never checked cannot be costed or sized. Name it rather than quietly
+    // using a made-up one - every per-lot number on the panel would be wrong by the lot factor.
+    Store.noLotBooks = (function(){ const o = [];
+      uniq.forEach(p => { const x = parseSymbol(p.symbol); if (x && !LOTS[x.underlying] && o.indexOf(x.underlying) < 0) o.push(x.underlying); });
+      return o; })();
     Store.posVisible = uniq.length > 0;
     if (uniq.length){ Store.positions = uniq; Store.lastUpdate = Date.now(); recomputeSpot(); }
     // Blanking the book on a mid-render read is how a phantom 'everything exited' gets manufactured. Angular
@@ -663,7 +741,8 @@
   // no costs at all while the day's booked P&L quietly overstates what you actually kept.
   function bankCost(l, fraction){
     try {
-      const lot = LOTS[l.under] || 0, lots = lot ? Math.abs(l.qty) / lot : Math.abs(l.qty), isSD = l.type === 'SD';
+      const lot = LOTS[l.under] || 0; if (!lot) return;          // no lot size = no honest brokerage figure
+      const lots = Math.abs(l.qty) / lot, isSD = l.type === 'SD';
       const inC = legCost(l.avg, l.qty, lots, l.qty < 0 ? 'SELL' : 'BUY', isSD);
       const outC = legCost(l.ltp, l.qty, lots, l.qty < 0 ? 'BUY' : 'SELL', isSD);
       Store.costPaid[l.under] = (Store.costPaid[l.under] || 0) + (inC.total + outC.total) * (fraction == null ? 1 : fraction);
@@ -766,9 +845,13 @@
     if (!book || !isFinite(mtm) || !isFinite(delta)) return;
     const day = dayKey(); if (Store.histDay !== day){ Store.hist = {}; Store.histDay = day; Store.realised = {}; Store.peak = {}; Store.costPaid = {}; Store.prevLegs = {}; }
     const a = Store.hist[book] || (Store.hist[book] = []), now = Date.now();
+    // The stamp is FLOORED above so it can never sit ahead of now. Math.round put it up to half a second
+    // into the future, which this guard then read as a backwards clock and waved through - a tight loop
+    // wrote a sample per call and the throttle effectively stopped existing. Only a REAL regression
+    // (a clock correction, seconds or more) may bypass it.
     const last = a[a.length - 1], gap = last ? now - last[0] * 1000 : Infinity;
-    if (gap >= 0 && gap < HIST_MS) return;      // same rule: a backwards clock must not freeze the series
-    a.push([Math.round(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(bookRealised(book)),
+    if (gap > -5000 && gap < HIST_MS) return;
+    a.push([Math.floor(now / 1000), Math.round(mtm), +delta.toFixed(1), Math.round(bookRealised(book)),
             Math.round(vega || 0), Math.round(theta || 0)]);
     if (a.length > HIST_MAX) a.splice(0, a.length - HIST_MAX);
     histSave(false);
@@ -1641,7 +1724,10 @@
   function costToClose(legs){
     const out = zeroCost();
     (legs || []).forEach(l => {
-      const lot = LOTS[l.under] || 0, lots = lot ? Math.abs(l.qty) / lot : Math.abs(l.qty) / 1;
+      // Falling back to lots = QUANTITY inflated brokerage by the whole lot factor (65x on a NIFTY-sized
+      // book). An unknown lot size is reported, never guessed at.
+      const lot = LOTS[l.under] || 0; if (!lot) return;
+      const lots = Math.abs(l.qty) / lot;
       // closing a short means BUYING it back; closing a long means SELLING (which carries STT)
       addCost(out, legCost(l.ltp, l.qty, lots, l.qty < 0 ? 'BUY' : 'SELL', l.type === 'SD'));
     });
@@ -1651,7 +1737,10 @@
   function costOfEntry(legs){
     const out = zeroCost();
     (legs || []).forEach(l => {
-      const lot = LOTS[l.under] || 0, lots = lot ? Math.abs(l.qty) / lot : Math.abs(l.qty) / 1;
+      // Falling back to lots = QUANTITY inflated brokerage by the whole lot factor (65x on a NIFTY-sized
+      // book). An unknown lot size is reported, never guessed at.
+      const lot = LOTS[l.under] || 0; if (!lot) return;
+      const lots = Math.abs(l.qty) / lot;
       addCost(out, legCost(l.avg, l.qty, lots, l.qty < 0 ? 'SELL' : 'BUY', l.type === 'SD'));
     });
     return out;
@@ -1836,6 +1925,8 @@
     else if (age > 30000) why.push('marks stale ' + fmtAge(age));
     if (frozen > 180000) why.push('feed frozen ' + fmtAge(frozen));
     if (Store.scrapeGap > 0) why.push('read ' + Store.positions.length + ' of ' + Store.portalOpen + ' rows');
+    if ((Store.unknownRows || []).length) why.push('unrecognised instrument: ' + Store.unknownRows[0]);
+    if ((Store.noLotBooks || []).length) why.push('no lot size for ' + Store.noLotBooks.join(', '));
     try { if (window._bsLegs().length && !window.getSpot()) why.push('no ' + activeBook() + ' spot — greeks unavailable'); } catch (e) {}
     if (Math.abs(Store.mismatch || 0) > Math.max(5, Math.abs(Store.portalMTM || 0) * 0.01))
       why.push('disagrees with portal by ' + money(Store.mismatch));
@@ -2176,6 +2267,13 @@
       } else if (Store.closedGap){
         rec.style.display = ''; Store.mismatch = 0;
         rec.textContent = '⚠ READ ' + (Store.portalClosed - Store.closedGap) + ' OF ' + Store.portalClosed + ' CLOSED ROWS — booked P&L incomplete';
+      } else if ((Store.unknownRows || []).length){
+        rec.style.display = ''; Store.mismatch = 0;
+        rec.textContent = '⚠ INSTRUMENT NOT RECOGNISED — ' + Store.unknownRows[0] +
+          (Store.unknownRows.length > 1 ? ' (+' + (Store.unknownRows.length - 1) + ' more)' : '');
+      } else if ((Store.noLotBooks || []).length){
+        rec.style.display = ''; Store.mismatch = 0;
+        rec.textContent = '⚠ LOT SIZE NOT SET FOR ' + Store.noLotBooks.join(', ') + ' — costs and sizing unavailable';
       } else if (!Store.posVisible){ rec.style.display = 'none'; Store.mismatch = 0; }
       // An unreadable portal total silently DISABLED this check once already: the page prints '-₹689.00' and
       // the old parser could not read a minus in front of the ₹. Never fail quiet again — say it is unverified.
@@ -2252,7 +2350,7 @@
   }
   function boot(){
     // test surface — assigned here, not at declaration time, so every const above is initialised (TDZ)
-    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, spotCacheClear, recordAllBooks, histStall, histEnd, pctTicks, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
+    window.SPAY._fn = { AL, ALS, ALOG, evalAlerts, dataTrust, engineAlarm, COSTS, legCost, costToClose, costOfEntry, exerciseRisk, bankCost, histSave, costFromOrders, isFilled, underlyings, activeBook, renderAlertStatus, hedgeSuggestion, scrapePortalMTM, fwdFor, parityFwd, headerNum, refsFor, allRealised, scrapeOrders, orderDistance, normOrder, isWorking, LOTS, plausibleSpot, spotFor, expandLegs, parseSymbol, marketState, istNow, dayKey, scrapePositions, reconcileRealised, histPush, parseMoney, colMapOf, isClosedTable, bookRealised, realisedSource, ordMapOf, sideOf, qtyOf, markMap, parityRows, paritySpot, indexSpotDOM, labelledFor, spotCacheClear, recordAllBooks, histStall, histEnd, pctTicks, canonUnder, INSTR_RE, OPTLIKE_RE, UNDERLYING_NAMES, marketConsts: { OPEN_H, OPEN_M, CLOSE_H, CLOSE_M, IV_MIN, IV_MAX } };
     alLoad(); histLoad(); notesLoad(); costsLoad();
     try { Store.scale = parseFloat(localStorage.getItem(SCALE_KEY)) || 1.15; } catch (e) {}
     try { Store.payoffH = parseInt(localStorage.getItem(PAYOFF_H_KEY), 10) || 0; } catch (e) {}
